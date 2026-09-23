@@ -85,3 +85,50 @@ def test_replace_varlen_attention_with_tpu_attention():
     assert isinstance(model[1].inner_attention, TPUVarlenAttention)
     # Idempotent when called a second time
     assert replace_varlen_attention_with_tpu_attention([model]) == 0
+
+
+def test_resolve_tpu_topology_bounds_multi_host():
+    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
+
+    # v6e-8 across two hosts: the mesh spans hosts, so the bounds are the host bounds.
+    topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+        total_chips=8, num_nodes=2
+    )
+    assert (topology, host_bounds, chips_per_host_bounds, chips_per_host) == ("2,4,1", "2,4,1", "1,1,1", "4")
+
+    # v6e-16 used to fall through to "1,1,1", which silently trains on one chip.
+    assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4)[:2] == ("4,4,1", "4,4,1")
+
+
+def test_resolve_tpu_topology_bounds_single_host():
+    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
+
+    # A 4-chip slice on one host is addressed inside the host, not across hosts.
+    assert resolve_tpu_topology_bounds(total_chips=4, num_nodes=1) == ("2,2,1", "1,1,1", "2,2,1", "4")
+    # Same chip count spread over two hosts cannot use in-host bounds.
+    assert resolve_tpu_topology_bounds(total_chips=4, num_nodes=2) == ("2,2,1", "1,1,1", "1,1,1", "2")
+
+
+def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
+    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
+
+    # Pod type wins over the chip count: this job holds 8 of a 16-chip slice.
+    assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-16")[0] == "4,4,1"
+
+    # The env var wins over everything, including an unknown chip count.
+    with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "2,3,1"}):
+        assert resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)[0] == "2,3,1"
+
+    with mock.patch.dict(os.environ, {"VERL_TPU_CHIPS_PER_HOST": "2"}):
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2)[3] == "2"
+
+
+def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
+    import pytest
+
+    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
+
+    # Guessing "1,1,1" here would train on a subset of the slice without any error.
+    with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
+        resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+

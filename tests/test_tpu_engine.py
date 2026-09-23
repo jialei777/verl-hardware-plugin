@@ -131,4 +131,3 @@ def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
     # Guessing "1,1,1" here would train on a subset of the slice without any error.
     with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
-

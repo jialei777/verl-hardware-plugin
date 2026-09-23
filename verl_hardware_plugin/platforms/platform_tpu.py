@@ -45,11 +45,8 @@ def _ensure_torch_tpu() -> bool:
 
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
 
-# Base ports for the TPU distributed slice builder mesh; each local rank takes ``base + local_rank``.
-# Rollout and trainer must not share a range: when a rollout worker and a trainer worker land on the
-# same node they would otherwise both try to bind the same port.
-TRAINER_BASE_PORT = 8471
-ROLLOUT_BASE_PORT = 8070
+# Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
+TPU_PROCESS_BASE_PORT = 8471
 
 # TPU chip HBM capacities in bytes
 HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
@@ -65,15 +62,72 @@ TPU_HBM_BYTES_MAP = {
 # Fallback HBM capacity when the chip generation cannot be determined.
 HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
 
-# TPU default 3D mesh topology mappings by pod type or total chips
-TPU_TOPOLOGY_MAP = {
-    "v6e-32": "4,8,1",
-    "v6e-8": "2,4,1",
-    "v6e-4": "2,2,1",
-    32: "4,8,1",
-    8: "2,4,1",
+# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice.
+# Mirrors DEFAULT_TPU_TOPOLOGY_MAP in verl's rollout-side TPU utils so the trainer mesh and
+# the rollout mesh agree on the physical layout of a given slice size.
+DEFAULT_TPU_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
     4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
 }
+
+# Pod types are consulted first: a pod type names the physical slice exactly, whereas the chip
+# count is only the number of chips this job was given and can be a subset of the slice.
+TPU_POD_TYPE_TOPOLOGY_MAP = {
+    "v6e-4": "2,2,1",
+    "v6e-8": "2,4,1",
+    "v6e-16": "4,4,1",
+    "v6e-32": "4,8,1",
+}
+
+# Slices at or below this many chips live on a single host, so the chips are addressed within
+# the host bounds rather than across them.
+TPU_SINGLE_HOST_MAX_CHIPS = 4
+
+
+def resolve_tpu_topology_bounds(
+    total_chips: int,
+    num_nodes: int,
+    pod_type: str = "",
+) -> tuple[str, str, str, str]:
+    """Resolve ``(topology, host_bounds, chips_per_host_bounds, chips_per_host)`` for a TPU slice.
+
+    Resolution order for the topology is: the ``TORCH_TPU_TOPOLOGY`` escape hatch, then the pod
+    type reported by Ray, then the chip count.
+
+    Raises:
+        ValueError: if the topology cannot be determined. Guessing here is worse than failing:
+            a wrong mesh does not error, it silently trains on part of the slice.
+    """
+    topology = (
+        os.environ.get("TORCH_TPU_TOPOLOGY")
+        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
+        or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
+    )
+    if not topology:
+        raise ValueError(
+            f"Cannot determine the TPU topology for total_chips={total_chips} "
+            f"(pod_type={pod_type!r}). Set TORCH_TPU_TOPOLOGY='x,y,z' to override. "
+            f"Known chip counts: {sorted(DEFAULT_TPU_TOPOLOGY_MAP)}."
+        )
+
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS:
+        host_bounds = "1,1,1"
+        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    else:
+        host_bounds = topology
+        chips_per_host_bounds = "1,1,1"
+
+    return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
 def get_tpu_chip_hbm_bytes() -> int:
@@ -413,14 +467,6 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def rollout_env_vars(self) -> dict[str, str]:
-        """Forward the TPU compiler flags to the rollout engine.
-
-        The rollout server actor is created with an explicit ``runtime_env``, which *replaces*
-        inheritance from the job, so anything set on the driver has to be named here to survive.
-        """
-        return {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
-
     def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
         """Pin a resource pool to a TPU slice on multi-slice clusters.
 
@@ -428,9 +474,9 @@ class PlatformTPU(PlatformBase):
         whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
         platform has to provide it.
 
-        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. With two
-        or more slices the generation-side pools go to the second slice and everything else to the
-        first, which is the non-colocated layout the TPU GRPO example assumes.
+        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
+        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
+        it to the first slice.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -445,9 +491,6 @@ class PlatformTPU(PlatformBase):
                                 tpu_slices.add(res)
                 slices = sorted(tpu_slices)
                 if slices:
-                    is_generation_pool = any(k in name_prefix.lower() for k in ("rollout", "reward", "teacher"))
-                    if len(slices) >= 2 and is_generation_pool:
-                        return slices[1]
                     return slices[0]
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
@@ -464,12 +507,14 @@ class PlatformTPU(PlatformBase):
     ) -> None:
         """Shape a placement-group bundle for GKE TPU.
 
-        Rollout bundles deliberately do not request the per-chip resource: vLLM claims the chips
-        itself, and reserving them here deadlocks the placement group. The slice affinity is
-        requested as a fractional amount so it acts as a label rather than a real reservation.
+        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool``
+        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
+        platform has to provide it.
+
+        The slice affinity is requested as a fractional amount so it acts as a label rather
+        than a real reservation.
         """
-        is_generation_pool = any(k in name_prefix.lower() for k in ("rollout", "reward", "teacher"))
-        if use_gpu and not is_generation_pool:
+        if use_gpu:
             bundle[device_name] = 1
         if accelerator_type is not None:
             bundle[accelerator_type] = 1e-4
@@ -519,8 +564,7 @@ class PlatformTPU(PlatformBase):
                 if node_id in node_ip_map:
                     bundle_ips.append(node_ip_map[node_id])
 
-        is_rollout = "rollout" in name_prefix.lower()
-        base_port = ROLLOUT_BASE_PORT if is_rollout else TRAINER_BASE_PORT
+        base_port = TPU_PROCESS_BASE_PORT
         sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
 
         # Extract unique worker hostnames preserving rank order
@@ -535,31 +579,24 @@ class PlatformTPU(PlatformBase):
             "TPU_VISIBLE_CHIPS": str(local_rank),
         }
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
-        topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size,
+            num_nodes=len(unique_hostnames),
+            pod_type=tpu_type,
+        )
 
         env_vars.update(
             {
-                "TORCH_TPU_TOPOLOGY": topo,
-                "TPU_HOST_BOUNDS": topo,
-                "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                "CHIPS_PER_HOST": "4",
+                "TORCH_TPU_TOPOLOGY": topology,
+                "TPU_HOST_BOUNDS": host_bounds,
+                "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+                "CHIPS_PER_HOST": chips_per_host,
             }
         )
-
-        if is_rollout:
-            # The vLLM TPU worker precompiles on its own and drives multi-host itself.
-            env_vars.update(
-                {
-                    "SKIP_JAX_PRECOMPILE": "1",
-                    "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
-                }
-            )
-            if world_size > 1:
-                env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
 
         return env_vars
 

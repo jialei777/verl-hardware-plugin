@@ -45,8 +45,11 @@ def _ensure_torch_tpu() -> bool:
 
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
 
-# Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
-TPU_PROCESS_BASE_PORT = 8471
+# Base ports for the TPU distributed slice builder mesh; each local rank takes ``base + local_rank``.
+# Rollout and trainer must not share a range: when a rollout worker and a trainer worker land on the
+# same node they would otherwise both try to bind the same port.
+TRAINER_BASE_PORT = 8471
+ROLLOUT_BASE_PORT = 8070
 
 # TPU chip HBM capacities in bytes
 HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
@@ -223,12 +226,50 @@ class TPUDeviceModuleProxy:
             except Exception as e:
                 logger.warning(f"torch.tpu.synchronize() failed: {e}")
 
+    def manual_seed_all(self, seed: int) -> None:
+        # torch_tpu does not always expose manual_seed_all; the global torch seed is the
+        # right fallback because a TPU process owns exactly one chip.
+        fn = getattr(self._original_module, "manual_seed_all", None)
+        if fn is not None:
+            fn(seed)
+        else:
+            torch.manual_seed(seed)
+
     def empty_cache(self) -> None:
         if hasattr(self._original_module, "_clear_cache"):
             try:
                 self._original_module._clear_cache()
             except Exception as e:
                 logger.warning(f"Failed to clear TPU cache: {e}")
+
+
+def patch_ray_worker() -> None:
+    """Ray ``worker_process_setup_hook`` for GKE TPU pods.
+
+    Runs once in every Ray worker process before any task. It does two things:
+
+    1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
+       resolves the TPU platform.
+    2. Makes Raylet's accelerator-id lookup non-fatal. Each GKE pod is given only its own slice of
+       the host's TPU chips, so a host-level index lookup can run off the end of the visible list
+       and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
+       via ``TPU_VISIBLE_CHIPS``.
+    """
+    os.environ["VERL_PLATFORM"] = "tpu"
+
+    try:
+        original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
+
+        def patched_func(self, resource_name, resource_regex):
+            try:
+                return original_func(self, resource_name, resource_regex)
+            except IndexError as e:
+                logger.debug("Intercepted Ray accelerator lookup IndexError for resource %r: %s", resource_name, e)
+                return []
+
+        ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
+    except Exception as e:
+        logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
 
 @PlatformRegistry.register(platform="tpu")
@@ -363,6 +404,76 @@ class PlatformTPU(PlatformBase):
         # A TPU chip belongs to one process and cannot be shared between colocated WorkerGroups.
         return False
 
+    def get_ray_init_kwargs(self) -> dict[str, Any]:
+        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers."""
+        return {
+            "runtime_env": {
+                "worker_process_setup_hook": patch_ray_worker,
+                "env_vars": {"VERL_PLATFORM": "tpu"},
+            }
+        }
+
+    def rollout_env_vars(self) -> dict[str, str]:
+        """Forward the TPU compiler flags to the rollout engine.
+
+        The rollout server actor is created with an explicit ``runtime_env``, which *replaces*
+        inheritance from the job, so anything set on the driver has to be named here to survive.
+        """
+        return {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+
+    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+        """Pin a resource pool to a TPU slice on multi-slice clusters.
+
+        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
+        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
+        platform has to provide it.
+
+        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. With two
+        or more slices the generation-side pools go to the second slice and everything else to the
+        first, which is the non-colocated layout the TPU GRPO example assumes.
+        """
+        if accelerator_type is not None:
+            return accelerator_type
+
+        try:
+            if ray.is_initialized():
+                tpu_slices = set()
+                for node in ray.nodes():
+                    if node.get("Alive"):
+                        for res in node.get("Resources", {}):
+                            if res.startswith("tpu-group-"):
+                                tpu_slices.add(res)
+                slices = sorted(tpu_slices)
+                if slices:
+                    is_generation_pool = any(k in name_prefix.lower() for k in ("rollout", "reward", "teacher"))
+                    if len(slices) >= 2 and is_generation_pool:
+                        return slices[1]
+                    return slices[0]
+        except Exception as e:
+            logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
+
+        return accelerator_type
+
+    def configure_placement_group_bundle(
+        self,
+        bundle: dict,
+        use_gpu: bool,
+        device_name: str,
+        name_prefix: str,
+        accelerator_type: Optional[str] = None,
+    ) -> None:
+        """Shape a placement-group bundle for GKE TPU.
+
+        Rollout bundles deliberately do not request the per-chip resource: vLLM claims the chips
+        itself, and reserving them here deadlocks the placement group. The slice affinity is
+        requested as a fractional amount so it acts as a label rather than a real reservation.
+        """
+        is_generation_pool = any(k in name_prefix.lower() for k in ("rollout", "reward", "teacher"))
+        if use_gpu and not is_generation_pool:
+            bundle[device_name] = 1
+        if accelerator_type is not None:
+            bundle[accelerator_type] = 1e-4
+
     def get_tpu_env_vars(
         self,
         rank: int,
@@ -408,7 +519,8 @@ class PlatformTPU(PlatformBase):
                 if node_id in node_ip_map:
                     bundle_ips.append(node_ip_map[node_id])
 
-        base_port = TPU_PROCESS_BASE_PORT
+        is_rollout = "rollout" in name_prefix.lower()
+        base_port = ROLLOUT_BASE_PORT if is_rollout else TRAINER_BASE_PORT
         sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
 
         # Extract unique worker hostnames preserving rank order
@@ -437,6 +549,17 @@ class PlatformTPU(PlatformBase):
                 "CHIPS_PER_HOST": "4",
             }
         )
+
+        if is_rollout:
+            # The vLLM TPU worker precompiles on its own and drives multi-host itself.
+            env_vars.update(
+                {
+                    "SKIP_JAX_PRECOMPILE": "1",
+                    "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+                }
+            )
+            if world_size > 1:
+                env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
 
         return env_vars
 

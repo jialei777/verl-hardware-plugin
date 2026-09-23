@@ -131,17 +131,28 @@ class TPUVarlenAttention(torch.nn.Module):
         out_transform: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
-        if (
-            hasattr(attention_masks, "cu_seq_q")
-            or hasattr(attention_masks, "cu_seqlens_q")
-            or hasattr(attention_masks, "cu_seqlens")
-        ):
-            cu_seqs = getattr(
-                attention_masks,
-                "cu_seq_q",
-                getattr(attention_masks, "cu_seqlens_q", getattr(attention_masks, "cu_seqlens", None)),
+        if out_transform is not None:
+            # TorchTitan applies out_transform as an epilogue over (out_BLNH, lse_BLN); see
+            # torchtitan/models/common/attention.py. Attention-sink models such as gpt-oss rely
+            # on it. This module does not produce an LSE, so silently ignoring out_transform
+            # would return numerically wrong attention output.
+            raise NotImplementedError(
+                "TPUVarlenAttention does not support the out_transform epilogue used by "
+                "attention-sink models (e.g. gpt-oss). Supported models must not set it."
             )
+
+        xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
+
+        # Probe the value, not just the attribute name: a mask object can declare the attribute
+        # and still leave it unset, in which case the packed path is not applicable.
+        cu_seqs = None
+        for attr in ("cu_seq_q", "cu_seqlens_q", "cu_seqlens"):
+            candidate = getattr(attention_masks, attr, None)
+            if candidate is not None:
+                cu_seqs = candidate
+                break
+
+        if cu_seqs is not None:
             total_tokens = xq.shape[1]
             positions = torch.arange(total_tokens, device=xq.device)
             seq_indices = (positions.unsqueeze(1) >= cu_seqs.unsqueeze(0)).sum(dim=1) - 1

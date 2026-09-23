@@ -36,6 +36,7 @@ from verl.checkpoint_engine.base import (
     merge_weight_chunks,
     split_weight_chunks,
 )
+from verl.utils.device import set_expandable_segments
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -261,20 +262,18 @@ class CNIXLCheckpointEngine(CheckpointEngine):
         self.is_master = is_master
 
     def prepare(self) -> NixlAgentMetadata:
-        """Prepare send and recv bucket.
-
-        Returns:
-            NixlAgentMetadata: The metadata of the current nixl agent.
-        """
-        # For master process, use cupy instead of torch to avoid memory register error
-        # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
-        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
-        self.send_reg_descs = self.agent.register_memory(self.send_buf)
-        self.recv_reg_descs = self.agent.register_memory(self.recv_buf)
-        self.send_descs = self.agent.get_xfer_descs(self.send_buf)
-        self.recv_descs = self.agent.get_xfer_descs(self.recv_buf)
-
+        # Only register on the first round; reuse in subsequent rounds,
+        # to avoid memory leaks caused by repeated registration and deallocation in each round.
+        # Set set_expandable_segments=False before register buffer to avoid memory register buffer error
+        if getattr(self, "send_buf", None) is None:
+            set_expandable_segments(False)
+            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
+            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self.device)
+            self.send_reg_descs = self.agent.register_memory(self.send_buf)
+            self.recv_reg_descs = self.agent.register_memory(self.recv_buf)
+            self.send_descs = self.agent.get_xfer_descs(self.send_buf)
+            self.recv_descs = self.agent.get_xfer_descs(self.recv_buf)
+            set_expandable_segments(True)
         return self.agent.get_agent_metadata()
 
     @classmethod
@@ -339,21 +338,12 @@ class CNIXLCheckpointEngine(CheckpointEngine):
         )
 
     def finalize(self):
-        """Cleanup communication with the previous and next agent, and deregister the memory."""
+        """Cleanup communication with the previous and next agent. Keep buffers registered for reuse."""
         if self.prev_agent:
             self.agent.remove_remote_agent(self.prev_agent)
         if self.next_agent:
             self.agent.remove_remote_agent(self.next_agent)
-
-        self.agent.deregister_memory(self.send_reg_descs)
-        self.agent.deregister_memory(self.recv_reg_descs)
-        self.send_buf = None
-        self.recv_buf = None
-        self.send_reg_descs = None
-        self.recv_reg_descs = None
-        self.send_descs = None
-        self.recv_descs = None
-
+        # Do not unset send_buf / recv_buf —— reuse in other rounds
         self.rank = None
         self.world_size = None
         self.prev_agent = None

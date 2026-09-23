@@ -1,0 +1,15 @@
+# requirements.txt records the full set of dependencies for development
+# [Notice]:
+#   Before [pip install -r requirements_mlu.txt]
+#   Please [cd PATH/verl && pip install -e . && pip install -r requirements.txt]
+
+
+accelerate==1.14.0
+click==8.2.1
+datasets==4.0.0
+mathruler
+qwen_vl_utils
+transformers==5.15.0 # support Qwen3.5
+peft==0.18.0
+
+# emerging-optimizers # for Muon in py3.12

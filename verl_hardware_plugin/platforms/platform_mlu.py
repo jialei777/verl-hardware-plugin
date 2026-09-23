@@ -24,6 +24,7 @@ Example usage:
     python -m verl.trainer.main --config config.yaml
 """
 
+import importlib.metadata
 import logging
 import os
 from contextlib import contextmanager
@@ -57,6 +58,53 @@ def _ensure_torch_mlu() -> bool:
         return hasattr(torch, "mlu")
     except ImportError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# MLU runtime dependency check
+# ---------------------------------------------------------------------------
+# Verify that apex / fla / megatron-core / megatron-bridge are installed and
+# are MLU builds. Internal MLU wheels carry a PEP 440 '+mlu' local version
+# segment (e.g. 0.1+mlu0.16.0); that is the single detection marker. Any
+# install lacking '+mlu' (upstream PyPI, or an MLU source fork built without
+# the tag) -> warning.
+# WARNING: warnings only, never raise — verl swallows plugin-load exceptions
+# at debug level (verl/verl/__init__.py:75-76).
+_MLU_REQUIRED: dict[str, tuple[str, str]] = {
+    "apex": ("apex", "required by Megatron FusedAdam/FastLayerNorm"),
+    "fla": ("flash-linear-attention", "required only for qwen3.5 linear attention + conv CP"),
+    "megatron-core": ("megatron-core", "required by the Megatron engine"),
+    "megatron-bridge": (
+        "megatron-bridge",
+        "required when use_mbridge=True (default); vanilla_mbridge uses legacy mbridge",
+    ),
+}
+
+
+def check_mlu_runtime_dependencies() -> list[str]:
+    """Check MLU runtime dependencies.
+
+    Returns a list of warning strings (empty = all pass). Detection only, never raises.
+    Each package is checked independently so one failure does not skip the rest.
+    A package passes iff its installed version carries the '+mlu' local segment;
+    anything else (missing, upstream, or an untagged source build) -> warning.
+    """
+    warns: list[str] = []
+    for name, (dist, note) in _MLU_REQUIRED.items():
+        try:
+            installed = importlib.metadata.version(dist)
+            if "+mlu" in installed:
+                logger.info("[env-check] %s MLU build OK (installed='%s')", name, installed)
+                continue
+            warns.append(
+                f"[env-check] {name} not an MLU build (installed='{installed}', no '+mlu' local segment). "
+                f"{note} requires the MLU build."
+            )
+        except importlib.metadata.PackageNotFoundError:
+            warns.append(f"[env-check] {name} not installed (dist='{dist}'). {note}")
+        except Exception as e:
+            warns.append(f"[env-check] {name} check error (dist='{dist}'): {e!r}")
+    return warns
 
 
 @PlatformRegistry.register(platform="cambricon")
@@ -231,3 +279,25 @@ class PlatformMLU(PlatformBase):
 
     def cudart(self) -> Any:
         return None
+
+
+# ---------------------------------------------------------------------------
+# One-shot MLU environment check at startup (MLU platform only, never blocks load)
+# ---------------------------------------------------------------------------
+def _run_mlu_env_check_once() -> None:
+    if not _ensure_torch_mlu():
+        return  # non-MLU environment, skip
+    try:
+        _warns = check_mlu_runtime_dependencies()
+    except Exception as e:  # never block plugin load (verl/__init__.py:75-76 swallows at debug)
+        logger.warning("[env-check] skipped due to error: %s", e)
+        return
+    if _warns:
+        logger.warning("[env-check] MLU runtime dependency check found %d issue(s):", len(_warns))
+        for _w in _warns:
+            logger.warning(_w)
+    else:
+        logger.warning("[env-check] MLU runtime dependency check passed")
+
+
+_run_mlu_env_check_once()

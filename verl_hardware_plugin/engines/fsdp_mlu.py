@@ -32,6 +32,8 @@ class FSDPMLUEngineWithLMHead(FSDPEngineWithLMHead):
 
     def initialize(self):
         super().initialize()
+        from verl_hardware_plugin.utils import linear_cross_entropy  # noqa: F401
+
         logger.info("FSDPMLUEngineWithLMHead initialized for MLU")
 
 
@@ -51,3 +53,4 @@ class FSDPMLUEngineWithValueHead(FSDPEngineWithValueHead):
 
     def initialize(self):
         super().initialize()
+        from verl_hardware_plugin.utils import linear_cross_entropy  # noqa: F401

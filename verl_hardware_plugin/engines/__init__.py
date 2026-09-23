@@ -167,7 +167,7 @@ def register_all_engines():
 
     # Google TPU checkpoint engine (Ray object store + host weight sync)
     try:
-        from verl_hardware_plugin.engines import tpu_checkpoint_engine  # noqa: F401
+        from verl_hardware_plugin.engines import torchtitan_tpu, tpu_checkpoint_engine  # noqa: F401
 
         logger.info("Registered engines: tpu_checkpoint_engine")
     except Exception as e:

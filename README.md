@@ -30,9 +30,15 @@ The platforms and engines in this repository are **reference implementations** �
 | Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 | Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
+<<<<<<< HEAD
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/user_guide_musa/README.md) |
 | Google TPU | v6e | tpu_dist | Platform only (engine pending) | [User Guide](docs/user_guide_tpu/README.md) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_biren/README.md) |
+=======
+| Moore Threads | MUSA (CUDA-compatible) | MCCL | ✅ Supported | [User Guide](docs/user_guide_musa/README.md) |
+| Google TPU | v6e | tpu_dist | developing and testing | [User Guide](docs/user_guide_tpu/README.md) |
+| Biren | SUPA (CUDA-compatible) | BCCL | Platform only (engine pending) | [User Guide](docs/user_guide_biren/README.md) |
+>>>>>>> fa02181 (feat(tpu): add out-of-tree TorchTitan TPU training engine and PlatformTPU support)
 
 
 ## Installation

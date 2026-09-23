@@ -74,9 +74,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
     ):
         if engine_config.tensor_parallel_size > 1:
             logger.warning(
-                "tensor_parallel_size=%d is not supported on TPU: it produces non-finite "
-                "gradients, which optimizer_step() silently skips, so the policy will not "
-                "train. Set tensor_parallel_size=1 and use data_parallel_shard_size instead.",
+                "tensor_parallel_size=%d is not properly tested on TPU; try "
+                "tensor_parallel_size=1 for better performance on TPU.",
                 engine_config.tensor_parallel_size,
             )
 

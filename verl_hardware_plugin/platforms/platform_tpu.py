@@ -23,6 +23,9 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl_hardware_plugin.engines.tpu_utils import extend_torchtitan_engine_config
+
+extend_torchtitan_engine_config()
 
 logger = logging.getLogger(__name__)
 

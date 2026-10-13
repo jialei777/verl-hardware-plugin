@@ -137,15 +137,17 @@ def test_server_worker_extension_defers_to_upstream(tpu_vllm):
     upstream_cls = "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
     server = tpu_vllm.TPUvLLMHttpServer()
     assert server._get_worker_extension_cls() == upstream_cls  # no rollout config
-    server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend="tpu"))
-    assert server._get_worker_extension_cls() == upstream_cls
+    for backend in ("ray-plasma-store", "tpu"):  # "tpu": former name of ray-plasma-store
+        server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend=backend))
+        assert server._get_worker_extension_cls() == upstream_cls
     # No run_server override: vLLM v0.29 has no V0 engine to switch off.
     assert "run_server" not in tpu_vllm.TPUvLLMHttpServer.__dict__
 
 
-def test_server_worker_extension_for_raiden(tpu_vllm):
+@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])  # "raiden": former name of tpu-sync
+def test_server_worker_extension_for_tpu_sync(tpu_vllm, backend):
     server = tpu_vllm.TPUvLLMHttpServer()
-    server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend="raiden"))
+    server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend=backend))
     assert server._get_worker_extension_cls() == tpu_vllm.RAIDEN_WORKER_EXTENSION_CLS
     module_name, cls_name = tpu_vllm.RAIDEN_WORKER_EXTENSION_CLS.rsplit(".", 1)
     assert (module_name, cls_name) == (

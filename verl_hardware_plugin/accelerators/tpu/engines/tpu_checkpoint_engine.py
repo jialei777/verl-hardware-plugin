@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""TPU CheckpointEngine for weight synchronization between TorchTitan trainer and vLLM rollout."""
+"""``ray-plasma-store`` CheckpointEngine: weight sync between the TorchTitan trainer and the vLLM rollout on TPU
+through the Ray object store."""
 
 import asyncio
 import gc
@@ -24,6 +25,11 @@ from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import (
     RAY_WEIGHT_REGISTRY_ACTOR_NAME,
     RAY_WEIGHT_REGISTRY_NAMESPACE,
     get_ray_weight_registry,
+)
+from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import (
+    RAY_PLASMA_STORE_BACKEND,
+    TPU_SYNC_BACKEND,
+    canonical_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -380,9 +386,9 @@ def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
     return num_keys
 
 
-@CheckpointEngineRegistry.register("tpu")
+@CheckpointEngineRegistry.register(RAY_PLASMA_STORE_BACKEND)
 class TPUCheckpointEngine(CheckpointEngine):
-    """Checkpoint engine for transferring model weights from TorchTitan trainer to vLLM rollout on TPU via Ray.
+    """``ray-plasma-store`` checkpoint engine: TorchTitan trainer to vLLM rollout on TPU through the Ray object store.
 
     Trainer rank 0 all-gathers sharded ``DTensor`` parameters, packs them into Ray Plasma
     (``ray.put``), and registers the ``ObjectRef`` in ``RayWeightRegistry``. Rollout ``TPUWorker``
@@ -526,8 +532,12 @@ class TPUCheckpointEngine(CheckpointEngine):
         raise NotImplementedError("Rollout on TPU uses direct load_weights_from_ray_registry via collective_rpc.")
 
 
+# Former name of the backend, still accepted (deprecated, see weight_sync_backends).
+CheckpointEngineRegistry.register("tpu")(TPUCheckpointEngine)
+
+
 async def update_tpu_weights(manager: Any, global_steps: int | None = None) -> dict[str, Any]:
-    """Synchronizes weights from the trainer worker group to vLLM rollout replicas on TPU."""
+    """Synchronizes weights from the trainer worker group to vLLM rollout replicas on TPU (``ray-plasma-store``)."""
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -642,9 +652,10 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
 
             @ckpt_base.auto_await
             async def _patched_mgr_update(self, global_steps: int | None = None):
-                if self.backend == "tpu":
+                backend = canonical_backend(self.backend)
+                if backend == RAY_PLASMA_STORE_BACKEND:
                     return await update_tpu_weights(self, global_steps=global_steps)
-                if self.backend == "raiden":
+                if backend == TPU_SYNC_BACKEND:
                     from verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine import (
                         update_raiden_weights,
                     )

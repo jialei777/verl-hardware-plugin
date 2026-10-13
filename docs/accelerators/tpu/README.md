@@ -7,7 +7,7 @@ This document describes Google TPU support in `verl-hardware-plugin`.
 The plugin registers the TPU platform (`PlatformTPU`: device metadata, Ray resource configuration,
 and the PJRT worker environment), the TorchTitan TPU training engine (`TorchTitanTPUEngineWithLMHead`
 under `verl_hardware_plugin/accelerators/tpu/engines/torchtitan_tpu.py`), a vLLM rollout for TPU, and two checkpoint
-engines that send the trainer's weights to it (`tpu` and `raiden`).
+engines that send the trainer's weights to it (`ray-plasma-store` and `tpu-sync`).
 
 ## Directory Structure
 
@@ -15,11 +15,12 @@ engines that send the trainer's weights to it (`tpu` and `raiden`).
 verl_hardware_plugin/accelerators/tpu/
 ├── platform_tpu.py                  # TPU platform settings
 ├── engines/
-│   ├── raiden_checkpoint_engine.py   # Peer-to-peer weight sync to the vLLM rollout over tpu-sync (Raiden)
+│   ├── raiden_checkpoint_engine.py   # `tpu-sync` weight sync: peer to peer to the vLLM rollout (Raiden)
 │   ├── ray_weight_registry.py        # Ray actor where trainer and rollout exchange weight-sync metadata
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
-│   ├── tpu_checkpoint_engine.py      # Sends the trainer's weights to the vLLM rollout
-│   └── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
+│   ├── tpu_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
+│   ├── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
+│   └── weight_sync_backends.py       # Weight sync backend names and their deprecated aliases
 └── rollout/
     ├── tpu_raiden.py                 # vLLM worker extension that receives Raiden weight syncs
     ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
@@ -32,7 +33,7 @@ docs/accelerators/tpu/
 ├── install_guidance.md               # Installation and environment setup
 ├── quick_start.md                    # Selecting and verifying the platform
 ├── rollout.md                        # Running the vLLM rollout on TPU
-└── weight_sync.md                    # Choosing and configuring the weight sync (tpu / raiden)
+└── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
 ```
 
 ## Getting Started
@@ -40,7 +41,7 @@ docs/accelerators/tpu/
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
 - [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU
-- [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `raiden`
+- [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
 
 ## Platform Summary
 

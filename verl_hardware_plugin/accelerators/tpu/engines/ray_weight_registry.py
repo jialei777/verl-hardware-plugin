@@ -7,7 +7,7 @@ On TPU, trainer and rollout slices hold exclusive ``libtpu`` locks and cannot sh
 communicator, so trainer rank 0 stores weights in Ray Plasma and registers the ``ObjectRef`` here
 for rollout ``TPUWorker`` processes to fetch by training step.
 
-The ``raiden`` checkpoint engine uses the same actor as a rendezvous point instead: the weight-sync
+The ``tpu-sync`` checkpoint engine uses the same actor as a rendezvous point instead: the weight-sync
 orchestrator publishes the address of its Raiden controller, the trainer publishes the full shape of
 every tensor it sends (the rollout workers size their receive buffers from it), and both sides post
 weight statistics for the optional parity check.

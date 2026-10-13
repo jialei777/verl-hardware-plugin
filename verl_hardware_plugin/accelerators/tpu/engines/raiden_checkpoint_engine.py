@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Raiden (tpu-sync) checkpoint engine: peer-to-peer weight sync between TPU slices.
+"""``tpu-sync`` checkpoint engine: peer-to-peer weight sync between TPU slices with Raiden.
 
-The ``tpu`` checkpoint engine stages the whole model through Ray's object store. ``raiden`` instead
+The ``ray-plasma-store`` checkpoint engine stages the whole model through Ray's object store. ``tpu-sync`` instead
 moves the weights over the network from the trainer chips to the rollout chips with the Raiden transfer
 library (``tpu-sync-torch``, https://github.com/google/tpu-sync). Every trainer rank registers the full
 weights that verl gathers for it, and each rollout chip receives only its vLLM tensor-parallel shard::
@@ -41,12 +41,12 @@ import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
+from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import TPU_SYNC_BACKEND
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-RAIDEN_BACKEND = "raiden"
-# Parallel transfer streams per worker, unless engine_kwargs.raiden.parallelism overrides it.
+# Parallel transfer streams per worker, unless engine_kwargs.tpu-sync.parallelism overrides it.
 RAIDEN_DEFAULT_PARALLELISM = 8
 # How long the driver waits for every trainer and rollout worker to register with the controller.
 RAIDEN_REGISTRATION_TIMEOUT_S = 60.0
@@ -266,11 +266,11 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
-@CheckpointEngineRegistry.register(RAIDEN_BACKEND)
+@CheckpointEngineRegistry.register(TPU_SYNC_BACKEND)
 class RaidenCheckpointEngine(CheckpointEngine):
-    """Trainer-side Raiden engine: exposes this rank's weights to the controller-driven P2P transfer.
+    """Trainer-side ``tpu-sync`` engine: exposes this rank's weights to the controller-driven Raiden P2P transfer.
 
-    Engine kwargs (``actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden``):
+    Engine kwargs (``actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync``):
 
     * ``parallelism`` (default 8): parallel transfer streams per worker.
     * ``verify_parity`` (default False): post weight norms after every sync so the driver can check
@@ -542,10 +542,19 @@ class RaidenCheckpointEngine(CheckpointEngine):
         )
 
 
-def _raiden_engine_kwargs(config: Any) -> dict[str, Any]:
-    """Returns ``engine_kwargs.raiden`` of a ``CheckpointEngineConfig`` (empty when unset)."""
+# Former name of the backend, still accepted (deprecated, see weight_sync_backends).
+CheckpointEngineRegistry.register("raiden")(RaidenCheckpointEngine)
+
+
+def _raiden_engine_kwargs(config: Any, backend: Optional[str] = None) -> dict[str, Any]:
+    """Returns the engine kwargs of ``backend`` in a ``CheckpointEngineConfig`` (empty when unset).
+
+    verl hands the trainer-side engine ``engine_kwargs[<configured backend name>]``, so the driver reads the
+    same entry: ``engine_kwargs.tpu-sync``, or ``engine_kwargs.raiden`` with the deprecated ``backend=raiden``.
+    """
     engine_kwargs = getattr(config, "engine_kwargs", None) or {}
-    return dict(engine_kwargs.get(RAIDEN_BACKEND) or {})
+    backend = backend or getattr(config, "backend", None) or TPU_SYNC_BACKEND
+    return dict(engine_kwargs.get(backend) or {})
 
 
 def _rollout_world_size(replica: Any) -> int:
@@ -596,7 +605,7 @@ async def _wait_for_registration(controller: Any, src_units: list, dst_units: li
 async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None) -> dict[str, float]:
     """Sync the trainer's weights to the vLLM rollout over Raiden, coordinated by a controller on the driver.
 
-    Replaces ``CheckpointEngineManager.update_weights`` for ``backend=raiden``.
+    Replaces ``CheckpointEngineManager.update_weights`` for ``backend=tpu-sync``.
 
     Args:
         manager: The ``CheckpointEngineManager`` (trainer worker group, rollout replicas and config).
@@ -605,14 +614,14 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
     Returns:
         Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics.
     """
-    raiden_kwargs = _raiden_engine_kwargs(manager.config)
+    raiden_kwargs = _raiden_engine_kwargs(manager.config, manager.backend)
     verify_parity = _as_bool(raiden_kwargs.get("verify_parity", False))
     parallelism = int(raiden_kwargs.get("parallelism", RAIDEN_DEFAULT_PARALLELISM))
     if len(manager.replicas) != 1:
         # Each rollout replica is a separate vLLM engine whose workers register as "sampler/<rank>"
         # with rank restarting at 0, so the units of several replicas would collide on the controller.
         raise NotImplementedError(
-            f"The raiden checkpoint engine supports a single rollout replica, got {len(manager.replicas)}. "
+            f"The tpu-sync checkpoint engine supports a single rollout replica, got {len(manager.replicas)}. "
             "Set actor_rollout_ref.rollout.tensor_model_parallel_size to the number of rollout chips."
         )
     controller = _get_or_start_controller(manager)

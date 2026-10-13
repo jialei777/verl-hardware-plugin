@@ -7,6 +7,7 @@ import logging
 import sys
 from types import ModuleType
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -34,7 +35,29 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import 
 def test_tpu_checkpoint_engine_registered():
     from verl.checkpoint_engine.base import CheckpointEngineRegistry
 
+    assert CheckpointEngineRegistry.get("ray-plasma-store") is TPUCheckpointEngine
+    # Former name of the backend, still accepted.
     assert CheckpointEngineRegistry.get("tpu") is TPUCheckpointEngine
+
+
+@pytest.mark.parametrize("backend", ["ray-plasma-store", "tpu"])
+def test_manager_hook_routes_ray_plasma_store_backend(monkeypatch, backend):
+    from types import SimpleNamespace
+
+    import verl.checkpoint_engine.base as ckpt_base
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_checkpoint_engine as engine_mod
+
+    calls = []
+
+    async def fake_update_tpu_weights(manager, global_steps=None):
+        calls.append((manager.backend, global_steps))
+        return {"timing_s/update_weights": 1.0}
+
+    monkeypatch.setattr(engine_mod, "update_tpu_weights", fake_update_tpu_weights)
+    assert getattr(ckpt_base, "_verl_tpu_ckpt_patched", False)
+    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend=backend), global_steps=2)
+    assert result == {"timing_s/update_weights": 1.0}
+    assert calls == [(backend, 2)]
 
 
 def test_apply_tpu_checkpoint_engine_hooks_logs_importerror(caplog):
@@ -147,7 +170,7 @@ def test_update_tpu_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
         set_global_steps=SimpleNamespace(remote=MagicMock(side_effect=lambda s: AsyncMock()())),
     )
     fake_manager = SimpleNamespace(
-        backend="tpu",
+        backend="ray-plasma-store",
         actor_wg=SimpleNamespace(update_weights=MagicMock(return_value=None)),
         replicas=[SimpleNamespace(server_handle=fake_server_handle)],
         abort_replicas=AsyncMock(),

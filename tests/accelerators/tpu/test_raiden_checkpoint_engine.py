@@ -37,7 +37,7 @@ for _mod_name in ("uvicorn", "fastapi"):
             sys.modules[_mod_name] = _stub
 
 # Imported up front, so that no test imports (and registers) them a second time. Importing
-# tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=raiden.
+# tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines import ray_weight_registry, tpu_checkpoint_engine  # noqa: E402, F401
@@ -291,12 +291,13 @@ class _FakeTpuSync:
 class _FakeActorWorkerGroup:
     """The trainer worker group: rank ``r`` runs ``engines[r].send_weights(weights_for_rank(r))``."""
 
-    def __init__(self, engines, weights_for_rank, events):
+    def __init__(self, engines, weights_for_rank, events, backend="tpu-sync"):
         self.engines, self.weights_for_rank, self.events = engines, weights_for_rank, events
         self.world_size = len(engines)
+        self.backend = backend
 
     def update_weights(self, global_steps=None, mode=None):
-        assert mode == "raiden"
+        assert mode == self.backend
         self.events.append("update_weights")
 
         def send(engine, rank):
@@ -326,8 +327,11 @@ class _FakeServer:
         self.global_steps = global_steps
 
 
-def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, **raiden_kwargs):
-    """A ``CheckpointEngineManager`` stand-in with ``num_replicas`` handles to one rollout server."""
+def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, backend="tpu-sync", **raiden_kwargs):
+    """A ``CheckpointEngineManager`` stand-in with ``num_replicas`` handles to one rollout server.
+
+    ``raiden_kwargs`` go to ``engine_kwargs[backend]``, where verl reads the engine kwargs of the backend.
+    """
     server = _FakeServer(samplers, events)
 
     async def abort_replicas():
@@ -337,9 +341,9 @@ def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, *
         events.append("resume")
 
     manager = SimpleNamespace(
-        backend="raiden",
-        config=SimpleNamespace(engine_kwargs={"raiden": raiden_kwargs}),
-        actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events),
+        backend=backend,
+        config=SimpleNamespace(backend=backend, engine_kwargs={backend: raiden_kwargs}),
+        actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events, backend=backend),
         replicas=[SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(samplers))] * num_replicas,
         abort_replicas=abort_replicas,
         resume_generation_replicas=resume_generation_replicas,
@@ -463,8 +467,26 @@ def tpu_raiden(fake_tpu_sync, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_raiden_engine_registered():
+def test_tpu_sync_engine_registered():
+    assert ckpt_base.CheckpointEngineRegistry.get("tpu-sync") is raiden.RaidenCheckpointEngine
+    # Former name of the backend, still accepted.
     assert ckpt_base.CheckpointEngineRegistry.get("raiden") is raiden.RaidenCheckpointEngine
+
+
+@pytest.mark.parametrize(
+    ("backend", "engine_kwargs", "expected"),
+    [
+        ("tpu-sync", {"tpu-sync": {"parallelism": 4}}, {"parallelism": 4}),
+        ("raiden", {"raiden": {"parallelism": 2}}, {"parallelism": 2}),
+        # Like verl's trainer-side engine, only the entry of the configured backend counts.
+        ("tpu-sync", {"raiden": {"parallelism": 2}}, {}),
+        ("tpu-sync", {}, {}),
+    ],
+)
+def test_raiden_engine_kwargs_follow_configured_backend(backend, engine_kwargs, expected):
+    config = SimpleNamespace(backend=backend, engine_kwargs=engine_kwargs)
+    assert raiden._raiden_engine_kwargs(config, backend) == expected
+    assert raiden._raiden_engine_kwargs(config) == expected
 
 
 def test_engine_kwargs(monkeypatch):
@@ -853,19 +875,27 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert "MISMATCH" not in caplog.text
 
 
-def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden):
-    """Every trainer rank registers the full tensors; vLLM ranks get TP shards, also of transposed parameters."""
+@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])
+def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden, backend):
+    """Every trainer rank registers the full tensors; vLLM ranks get TP shards, also of transposed parameters.
+
+    Also with the deprecated backend name ``raiden``, whose engine kwargs live under ``engine_kwargs.raiden``.
+    """
     tp, trainer_ranks = 2, 4
     weights = _trainer_weights()
     models = [_FakeVllmModel(tp, flip_o_proj=True) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
         [_trainer_engine(rank) for rank in range(trainer_ranks)],
         lambda rank: iter(weights.items()),
-        [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)],
+        samplers,
         [],
+        backend=backend,
+        parallelism=3,
     )
     asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
 
+    assert [sampler._raiden_ws.parallelism for sampler in samplers] == [3] * tp
     for rank, model in enumerate(models):
         _assert_state(model, _expected_vllm_state(weights, rank, tp, flip_o_proj=True))
     for rank in range(trainer_ranks):
@@ -914,7 +944,8 @@ def test_wait_for_registration_times_out():
     assert "Missing Sampler: [RaidenId(job_name='sampler', job_replica_id='0', data_name='weights')]" in message
 
 
-def test_manager_hook_routes_raiden_backend(monkeypatch):
+@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])
+def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
     calls = []
 
     async def fake_update_raiden_weights(manager, global_steps=None):
@@ -923,9 +954,9 @@ def test_manager_hook_routes_raiden_backend(monkeypatch):
 
     monkeypatch.setattr(raiden, "update_raiden_weights", fake_update_raiden_weights)
     assert getattr(ckpt_base, "_verl_tpu_ckpt_patched", False)
-    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend="raiden"), global_steps=3)
+    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend=backend), global_steps=3)
     assert result == {"timing_s/tpu-sync/total_sync": 1.0}
-    assert calls == [("raiden", 3)]
+    assert calls == [(backend, 3)]
 
 
 # ---------------------------------------------------------------------------

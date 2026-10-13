@@ -6,7 +6,7 @@ stock vLLM rollout.
 
 Training and rollout run on separate TPU slices (a slice is a group of TPU hosts joined by a fast
 chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
-updated weights through the `tpu` or `raiden` checkpoint engine (see [Weight Sync](./weight_sync.md)).
+updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (see [Weight Sync](./weight_sync.md)).
 
 ## Requirements
 
@@ -61,7 +61,7 @@ The rollout settings that matter on TPU (the recipe already sets them):
 | `actor_rollout_ref.rollout.name` | `vllm` |
 | `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `8` on v6e-8 |
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
-| `actor_rollout_ref.rollout.checkpoint_engine.backend` | `tpu`, or `raiden` (see [Weight Sync](./weight_sync.md)) |
+| `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
 
 ## Verify

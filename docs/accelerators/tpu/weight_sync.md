@@ -11,7 +11,7 @@ Pick one with `actor_rollout_ref.rollout.checkpoint_engine.backend`:
 `tpu-sync` is faster: the weights skip the round trip through the object store, and no rollout worker
 receives the whole model.
 
-The former names of the two backends, `tpu` and `raiden`, are still accepted and log a deprecation warning.
+The former names of the two backends, `tpu` and `raiden`, are still accepted and print a deprecation warning (`FutureWarning`).
 
 ## How a `tpu-sync` sync works
 
@@ -37,8 +37,8 @@ for this backend):
 - `tpu-sync-torch` installed on every trainer and rollout host, built for the installed `torch-tpu`.
   The tpu-sync torch extension is ABI-locked to the `torch-tpu` build it was compiled against. A
   mismatched pair crashes in the first transfer. The backend is tested with `torch-tpu`
-  `0.1.2.dev20261006000518` and `tpu-sync-torch` `0.0.1.dev20261006025601` (image
-  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
+  `0.1.2.dev20261006000518` and `tpu-sync-torch` `0.0.1.dev20261006025601` (the versions in the
+  `Dockerfile` of verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)).
   - `WeightSynchronizer.unbind_weights()` needs `tpu-sync-torch` `0.0.1.dev20261006025601` or newer. With
     an older build (e.g. `0.0.1.dev20261001132139`) the trainer logs a warning once and falls back to
     destroying and re-creating its synchronizer every sync, which adds a few seconds per sync for an 8B
@@ -91,8 +91,8 @@ On any host, without tpu-sync, vLLM or a TPU:
 pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 ```
 
-On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars`, as
-in the [vLLM Rollout](./rollout.md) example. Every sync then logs its phase times. For example, from a
+On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars` (see
+[vLLM Rollout](./rollout.md#run)). Every sync then logs its phase times. For example, from a
 Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
 
 ```text

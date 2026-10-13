@@ -11,11 +11,9 @@ updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (
 ## Requirements
 
 - The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.29.0` and
-  vllm-torchtpu `9faafb17`, the versions the rollout is tested with (image
-  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
-- A verl checkout with the TPU rollout changes. Until they are merged into verl, use the
-  `pr34-grpo-0.6b-core-fixes` branch of
-  [jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes).
+  vllm-torchtpu `9faafb17`, the versions the rollout is tested with (see the `Dockerfile` in verl's
+  [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)).
+- A verl checkout with the TPU GRPO examples in `examples/tpu/grpo`.
 - At least two TPU slices, one for training and one for rollout. A TPU chip belongs to a single
   process, so training and rollout cannot share chips.
 - On KubeRay, a TPU worker group named `tpu-group` with one replica per slice. Ray then labels the
@@ -24,42 +22,21 @@ updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (
 
 ## Run
 
-The reference recipe is `examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh` on the verl branch above:
-GRPO on GSM8K with Qwen3-0.6B, on two v6e-8 slices of 2 hosts x 4 chips. Submit it as a Ray job
-from the verl checkout, with the plugin loaded in every Ray worker:
+The reference recipes are in verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo):
+GRPO on GSM8K with Qwen3-0.6B (a 5-step smoke test) and Qwen3-4B, on two TPU v6e-4 slices. Its README walks
+through the image, the KubeRay cluster and the `ray job submit` command, which loads the plugin in every Ray
+worker (`py_modules` and `VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin`).
 
-```bash
-ray job submit --address "${RAY_ADDRESS}" \
-  --working-dir . \
-  --runtime-env-json '{
-    "py_modules": ["/path/to/verl-hardware-plugin/verl_hardware_plugin"],
-    "excludes": [".git", "logs", "*.log", "*.pt", "*.bin"],
-    "env_vars": {
-      "PYTHONPATH": ".",
-      "PYTHONUNBUFFERED": "1",
-      "VERL_PLATFORM": "tpu",
-      "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin",
-      "VERL_LOGGING_LEVEL": "INFO",
-      "SAGEMAKER_CONTAINER_LOG_LEVEL": "INFO",
-      "RAY_memory_monitor_refresh_ms": "0",
-      "RAY_memory_usage_threshold": "0.99",
-      "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
-      "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"
-    }
-  }' \
-  -- bash -c 'SMOKE_TEST=1 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh'
-```
+To keep the plugin's `INFO` and `WARNING` logs from the driver process, such as the weight-sync timings (see
+[Weight Sync](./weight_sync.md#verify)), add `"VERL_LOGGING_LEVEL": "INFO"` and
+`"SAGEMAKER_CONTAINER_LOG_LEVEL": "INFO"` to the job's `env_vars`.
 
-`SMOKE_TEST=1` runs a 5-step bring-up check; drop it for the full 100-step run. Drop `py_modules`
-if the plugin is installed in the image. `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` keeps the plugin's `INFO`
-logs from the driver process, such as the weight-sync timings (see [Weight Sync](./weight_sync.md#verify)).
-
-The rollout settings that matter on TPU (the recipe already sets them):
+The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
 |---------|--------------|
 | `actor_rollout_ref.rollout.name` | `vllm` |
-| `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `8` on v6e-8 |
+| `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `4` on v6e-4 |
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
 | `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
@@ -79,8 +56,8 @@ Registered rollout replica loader: vllm (TPU-aware)
 Reusing 2 verl placement group(s) for TPU rollout
 ```
 
-where `2` is the number of rollout hosts, and the job ends with status `SUCCEEDED`. The rollout is
-tested with Qwen3-0.6B and Qwen3-4B on two v6e-8 slices.
+where the number is the number of rollout hosts, and the job ends with status `SUCCEEDED`. The rollout is
+tested with Qwen3-0.6B and Qwen3-4B on two v6e-4 slices and on two v6e-8 slices.
 
 ## Related Documentation
 

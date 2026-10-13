@@ -8,15 +8,11 @@
 * ``tpu-sync``: the trainer chips send the weights peer to peer to the rollout chips with tpu-sync
   (Raiden); each rollout chip receives only its tensor-parallel shard (``RaidenCheckpointEngine``).
 
-The former names ``tpu`` and ``raiden`` are still accepted and log a deprecation warning.
+The former names ``tpu`` and ``raiden`` are still accepted and emit a ``FutureWarning``.
 """
 
-import logging
-import os
+import warnings
 from typing import Optional
-
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 RAY_PLASMA_STORE_BACKEND = "ray-plasma-store"
 TPU_SYNC_BACKEND = "tpu-sync"
@@ -44,9 +40,11 @@ def canonical_backend(backend: Optional[str]) -> Optional[str]:
     current = DEPRECATED_BACKEND_NAMES[backend]
     if backend not in _warned_deprecated_names:
         _warned_deprecated_names.add(backend)
-        logger.warning(
-            "actor_rollout_ref.rollout.checkpoint_engine.backend=%s is deprecated, use %s instead.",
-            backend,
-            current,
+        # A warning rather than a log message: in verl's driver process the root logger is set to ERROR
+        # (by model_hosting_container_standards, see docs/accelerators/tpu/weight_sync.md), which would hide it.
+        warnings.warn(
+            f"actor_rollout_ref.rollout.checkpoint_engine.backend={backend} is deprecated, use {current} instead.",
+            FutureWarning,
+            stacklevel=2,
         )
     return current

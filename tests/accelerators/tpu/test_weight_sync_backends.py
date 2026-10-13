@@ -3,7 +3,7 @@
 
 """Unit tests for the TPU weight sync backend names and their deprecated aliases."""
 
-import logging
+import warnings
 
 import pytest
 
@@ -27,18 +27,21 @@ def test_backend_names():
 
 
 @pytest.mark.parametrize("backend", ["ray-plasma-store", "tpu-sync", "naive", "nccl", None])
-def test_canonical_backend_keeps_current_and_other_names(backend, caplog):
-    with caplog.at_level(logging.WARNING, logger=weight_sync_backends.__name__):
+def test_canonical_backend_keeps_current_and_other_names(backend):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         assert canonical_backend(backend) == backend
-    assert not caplog.records
 
 
 @pytest.mark.parametrize(("deprecated", "current"), [("tpu", "ray-plasma-store"), ("raiden", "tpu-sync")])
-def test_canonical_backend_maps_deprecated_names_and_warns_once(deprecated, current, caplog):
-    with caplog.at_level(logging.WARNING, logger=weight_sync_backends.__name__):
+def test_canonical_backend_maps_deprecated_names_and_warns_once(deprecated, current):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         assert canonical_backend(deprecated) == current
         assert canonical_backend(deprecated) == current
-    messages = [record.getMessage() for record in caplog.records]
-    assert messages == [
-        f"actor_rollout_ref.rollout.checkpoint_engine.backend={deprecated} is deprecated, use {current} instead."
+    assert [(w.category, str(w.message)) for w in caught] == [
+        (
+            FutureWarning,
+            f"actor_rollout_ref.rollout.checkpoint_engine.backend={deprecated} is deprecated, use {current} instead.",
+        )
     ]

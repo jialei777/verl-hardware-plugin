@@ -40,8 +40,22 @@ TPU_PADDED_VALUES_ATTR = "_tpu_padded_values"
 _DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
 
 
+def _ensure_torchtitan_lr_scheduler_compat() -> None:
+    """Expose ``LRSchedulersContainer`` on ``torchtitan.components.optimizer`` if built on older TorchTitan."""
+    try:
+        import torchtitan.components.optimizer as tt_opt
+
+        if not hasattr(tt_opt, "LRSchedulersContainer"):
+            from torchtitan.components.lr_scheduler import LRSchedulersContainer
+
+            tt_opt.LRSchedulersContainer = LRSchedulersContainer  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def extend_torchtitan_engine_config() -> None:
     """Register TPU-specific optional fields on ``TorchtitanEngineConfig`` for Hydra/OmegaConf."""
+    _ensure_torchtitan_lr_scheduler_compat()
     extras: list[tuple[str, Any, Any]] = [
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),

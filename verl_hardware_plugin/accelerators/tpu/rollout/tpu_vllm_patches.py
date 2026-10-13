@@ -267,7 +267,8 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
         name: os.environ[name]
         for name in get_env_vars_to_copy(
             exclude_vars=WORKER_SPECIFIC_ENV_VARS,
-            additional_vars=set(current_platform.additional_env_vars),
+            additional_vars=set(current_platform.additional_env_vars)
+            | {"XLA_FLAGS", "LIBTPU_INIT_ARGS", "TPU_ACCELERATOR_TYPE", "VERL_PLATFORM", "VERL_USE_EXTERNAL_MODULES"},
             destination="workers",
         )
         if name in os.environ

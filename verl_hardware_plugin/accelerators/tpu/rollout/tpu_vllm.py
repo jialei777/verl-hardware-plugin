@@ -69,6 +69,10 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
         "VERL_TPU_PG_IDS": ",".join(pg.id.hex() for pg in pgs),
     }
+    tpu_hosts = getattr(replica.resource_pool, "tpu_hosts", None)
+    if tpu_hosts:
+        env_vars["VERL_TPU_ROLLOUT_HOSTS"] = ",".join(tpu_hosts)
+        env_vars["VERL_TPU_CHIPS_PER_HOST"] = str(replica.gpus_per_replica_node)
 
     server = replica.server_class.options(
         scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

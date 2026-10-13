@@ -38,17 +38,12 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.model import extract_multi_modal_inputs
-from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_naive
+from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.base import BaseEngineCtx, EngineRegistry
-from verl.workers.engine.torchtitan.transformer_impl import TorchTitanEngine, TorchTitanEngineWithLMHead
-from verl.workers.engine.utils import (
-    detach_tree,
-    postprocess_batch_func,
-    prepare_micro_batches,
-)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
+    _ensure_torchtitan_lr_scheduler_compat,
     align_micro_batch_shapes_across_ranks,
     apply_splash_attention_tpu,
     bucket_length,
@@ -67,7 +62,15 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     unwrap_metadata,
 )
 
+_ensure_torchtitan_lr_scheduler_compat()
 extend_torchtitan_engine_config()
+
+from verl.workers.engine.torchtitan.transformer_impl import TorchTitanEngine, TorchTitanEngineWithLMHead  # noqa: E402
+from verl.workers.engine.utils import (  # noqa: E402
+    detach_tree,
+    postprocess_batch_func,
+    prepare_micro_batches,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -397,7 +400,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             logits_rmpad = logits.squeeze(0) / temperature
 
             if logits_rmpad.device.type == "tpu":
-                log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
+                log_probs = verl_F.gather_from_labels(
+                    torch.nn.functional.log_softmax(logits_rmpad, dim=-1, dtype=torch.float32), labels
+                )
             else:
                 inplace_backward = not calculate_entropy
                 log_probs = logprobs_from_logits(
@@ -446,7 +451,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
             logits_rmpad = torch.cat([t for t in logits.unbind()])
             if logits_rmpad.device.type == "tpu":
-                log_probs = logprobs_from_logits_naive(logits_rmpad, output_args["labels"])
+                log_probs = verl_F.gather_from_labels(
+                    torch.nn.functional.log_softmax(logits_rmpad, dim=-1, dtype=torch.float32), output_args["labels"]
+                )
             else:
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
             log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)

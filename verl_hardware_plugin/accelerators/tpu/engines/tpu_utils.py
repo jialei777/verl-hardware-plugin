@@ -771,11 +771,61 @@ class _TPULossDataProxy:
         return getattr(self._base, name)
 
 
+def _copy_tensordict_without_device(td: TensorDict) -> TensorDict:
+    """Shallow-copy ``td`` (entries shared, host metadata kept) into a TensorDict with no device.
+
+    ``TensorDict(td, batch_size=td.batch_size)`` cannot be used for this: on tensordict >= 0.11 it re-validates
+    every ``NonTensorData`` entry (``dp_size``, ``batch_num_tokens``, ...) as a 0-d value and raises
+    ``batch dimension mismatch``. Without a device, TPU tensors can be stored next to the CPU metadata.
+    """
+    out = td.copy()
+    if out.device is not None:
+        out.clear_device_()
+    return out
+
+
+def _response_gather_index(
+    micro_batch: TensorDict, response_width: int, padded_len: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build, on CPU, the index/mask that gather every response's per-token outputs from a packed sequence.
+
+    Mirrors verl's ``no_padding_2_padding`` convention: response token ``r`` of sequence ``i`` is predicted at packed
+    position ``seq_end_i - resp_len_i - 1 + r``. Returns ``index`` (int64) and ``valid`` (bool), both shaped
+    ``[batch_size, response_width]``; padded slots point at position 0 and are masked out.
+    """
+    prompt_lens = micro_batch["prompts"].offsets().diff().cpu()
+    response_lens = micro_batch["responses"].offsets().diff().cpu()
+    starts = ((prompt_lens + response_lens).cumsum(dim=0) - response_lens - 1).to(torch.int64)
+    cols = torch.arange(response_width, dtype=torch.int64).unsqueeze(0)
+    valid = cols < response_lens.unsqueeze(1)
+    index = torch.where(valid, starts.unsqueeze(1) + cols, torch.zeros_like(cols)).clamp(0, max(0, padded_len - 1))
+    return index, valid
+
+
+def _gather_responses_static_layout(
+    padded_values: torch.Tensor, index: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Gather responses out of the bucket-padded packed tensor into a static ``[bsz * (width + 1)]`` layout.
+
+    Row ``i`` of the ``[bsz, width]`` gather is laid out as one segment of ``width + 1`` slots (responses first,
+    one trailing pad slot), so a sequence with prompt length 1 and response length ``width`` selects exactly that
+    row in ``no_padding_2_padding``. Every shape depends only on the bucketed lengths, never on the token counts.
+    """
+    device = padded_values.device
+    rows = torch.gather(padded_values.unsqueeze(0).expand(index.shape[0], -1), 1, index.to(device=device))
+    rows = rows * valid.to(device=device, dtype=padded_values.dtype)
+    return F.pad(rows, (0, 1)).reshape(-1)
+
+
 def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDict) -> tuple[dict[str, Any], Any]:
     """Adapt differentiable TPU outputs for the unmodified SFT and PPO loss APIs.
 
-    SFT consumes full bucket-padded buffers and a matching loss mask. PPO receives
-    valid packed outputs and a real TensorDict with padded response fields on device.
+    SFT consumes full bucket-padded buffers and a matching loss mask. PPO receives a real TensorDict with padded
+    response fields on device. Its model outputs are gathered (static gather, CPU-built indices) from the full
+    bucket-padded device tensors into a static layout, so ``ppo_loss`` -> ``no_padding_2_padding`` only ever sees
+    shapes that depend on the sequence-length bucket, the micro-batch size and the response-length bucket. Trimming
+    the outputs to the exact token count instead would make every micro-batch with new lengths compile new XLA
+    programs (forward loss and the fused LM-head backward) for the whole run.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)
@@ -783,17 +833,9 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
         return model_output, micro_batch
 
     if "old_log_probs" in micro_batch and "advantages" in micro_batch:
-        loss_model_output = dict(model_output)
-        for key, tensor in model_output.items():
-            padded_values = getattr(tensor, TPU_PADDED_VALUES_ATTR, None)
-            if padded_values is not None:
-                # Trim trailing bucket padding inside the plugin without detaching gradients.
-                valid_count = int(tensor.offsets()[-1].item())
-                loss_model_output[key] = _TPUPaddedJaggedProxy(padded_values[:valid_count], tensor)
-
         # Preserve host sequence metadata while moving response fields independently
         # of the source TensorDict's device setting.
-        loss_data = TensorDict(micro_batch, batch_size=micro_batch.batch_size)
+        loss_data = _copy_tensordict_without_device(micro_batch)
         responses = micro_batch["responses"]
         if micro_batch["prompts"].is_nested:
             response_width = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, "max_response_len", -1)))
@@ -818,6 +860,53 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
             if tensor.shape[1] > response_width:
                 raise ValueError(f"{key} exceeds max_response_len ({tensor.shape[1]} > {response_width})")
             loss_data[key] = F.pad(tensor, (0, response_width - tensor.shape[1])).to(tpu_padded_log_prob.device)
+
+        loss_model_output = dict(model_output)
+        padded_keys = [
+            key for key, value in model_output.items() if getattr(value, TPU_PADDED_VALUES_ATTR, None) is not None
+        ]
+        static_layout = (
+            micro_batch["prompts"].is_nested
+            and getattr(responses, "is_nested", False)
+            and all(getattr(model_output[key], TPU_PADDED_VALUES_ATTR).dim() == 1 for key in padded_keys)
+            # every packed output the loss slices must come with its bucket-padded device tensor
+            and not any(
+                getattr(value, "is_nested", False) and key not in padded_keys for key, value in model_output.items()
+            )
+        )
+        if static_layout:
+            batch_size = int(micro_batch.batch_size[0])
+            segment = response_width + 1
+            index_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            layout = torch.nested.nested_tensor_from_jagged(
+                torch.zeros(batch_size * segment), torch.arange(batch_size + 1, dtype=torch.int64) * segment
+            )
+            for key in padded_keys:
+                padded_values = getattr(model_output[key], TPU_PADDED_VALUES_ATTR)
+                padded_len = int(padded_values.shape[0])
+                if padded_len not in index_cache:
+                    index_cache[padded_len] = _response_gather_index(micro_batch, response_width, padded_len)
+                index, valid = index_cache[padded_len]
+                loss_model_output[key] = _TPUPaddedJaggedProxy(
+                    _gather_responses_static_layout(padded_values, index, valid), layout
+                )
+            # Matching sequence metadata for the static layout: prompt length 1 and response length
+            # `response_width` for every row, so the per-row slices of `no_padding_2_padding` are static too.
+            offsets = torch.arange(batch_size + 1, dtype=torch.int64)
+            loss_data["prompts"] = torch.nested.nested_tensor_from_jagged(
+                torch.zeros(batch_size, dtype=torch.int64), offsets
+            )
+            loss_data["responses"] = torch.nested.nested_tensor_from_jagged(
+                torch.zeros(batch_size * response_width, dtype=torch.int64), offsets * response_width
+            )
+        else:
+            for key in padded_keys:
+                tensor = model_output[key]
+                # Trim trailing bucket padding inside the plugin without detaching gradients.
+                valid_count = int(tensor.offsets()[-1].item())
+                loss_model_output[key] = _TPUPaddedJaggedProxy(
+                    getattr(tensor, TPU_PADDED_VALUES_ATTR)[:valid_count], tensor
+                )
 
         return loss_model_output, loss_data
 

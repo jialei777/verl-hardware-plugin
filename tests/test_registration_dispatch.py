@@ -51,7 +51,7 @@ ENGINES = {
     "enflame": ("fsdp_enflame", "megatron_enflame"),
     "iluvatar": ("fsdp_iluvatar", "megatron_iluvatar"),
     "musa": ("fsdp_musa", "megatron_musa"),
-    "tpu": ("torchtitan_tpu", "tpu_checkpoint_engine", "raiden_checkpoint_engine"),
+    "tpu": ("torchtitan_tpu", "tpu_checkpoint_engine", "tpu_sync_checkpoint_engine"),
     "supa": ("fsdp_supa", "megatron_supa"),
 }
 
@@ -191,7 +191,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         ("profiler:torch", ()),
         ("accelerators.tpu.engines.torchtitan_tpu", ()),
         ("accelerators.tpu.engines.tpu_checkpoint_engine", ()),
-        ("accelerators.tpu.engines.raiden_checkpoint_engine", ()),
+        ("accelerators.tpu.engines.tpu_sync_checkpoint_engine", ()),
         ("rollout:vllm", ()),
     ],
 )

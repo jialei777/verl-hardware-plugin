@@ -656,7 +656,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
                 if backend == RAY_PLASMA_STORE_BACKEND:
                     return await update_tpu_weights(self, global_steps=global_steps)
                 if backend == TPU_SYNC_BACKEND:
-                    from verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine import (
+                    from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_checkpoint_engine import (
                         update_raiden_weights,
                     )
 

@@ -18,12 +18,16 @@ except Exception as exc:
     logger.debug("TPU TorchTitan engine registration failed: %s", exc)
 
 try:
+    # tpu_sync_checkpoint_engine goes first, so that its engine is registered even if tpu_checkpoint_engine
+    # fails to import (the order the isort-sorted raiden_checkpoint_engine had before the rename).
+    # isort: off
     from verl_hardware_plugin.accelerators.tpu.engines import (
-        raiden_checkpoint_engine,  # noqa: F401
+        tpu_sync_checkpoint_engine,  # noqa: F401
         tpu_checkpoint_engine,  # noqa: F401
     )
+    # isort: on
 except Exception as exc:
-    logger.debug("TPU Raiden checkpoint engine registration failed: %s", exc)
+    logger.debug("TPU tpu-sync checkpoint engine registration failed: %s", exc)
 
 
 def register_rollout() -> None:

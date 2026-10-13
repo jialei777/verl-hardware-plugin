@@ -5,7 +5,7 @@
 
 ``TPUvLLMHttpServer`` passes this class to vLLM as ``worker_extension_cls`` when
 ``actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync``. The driver
-(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine``) calls its
+(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_checkpoint_engine``) calls its
 methods on every vLLM worker through ``collective_rpc``:
 
 1. ``init_raiden_sync_on_worker``: allocate TP-sharded receive buffers for the tensors the trainer
@@ -26,7 +26,7 @@ import ray
 import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import (
     _get_parent_module,

@@ -39,8 +39,8 @@ for _mod_name in ("uvicorn", "fastapi"):
 # Imported up front, so that no test imports (and registers) them a second time. Importing
 # tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines import ray_weight_registry, tpu_checkpoint_engine  # noqa: E402, F401
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
 
 TPU_RAIDEN = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden"

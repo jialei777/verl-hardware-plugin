@@ -88,7 +88,7 @@ verl's vLLM server does not yet pass back from `collective_rpc`. Until it does, 
 On any host, without tpu-sync, vLLM or a TPU:
 
 ```bash
-pytest tests/accelerators/tpu/test_raiden_checkpoint_engine.py -v
+pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 ```
 
 On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars`, as
@@ -122,5 +122,5 @@ Errors, such as a parity mismatch, are always logged.
 
 - [User Guide](./README.md)
 - [vLLM Rollout](./rollout.md)
-- For developers: `verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py` (trainer and driver side)
+- For developers: `verl_hardware_plugin/accelerators/tpu/engines/tpu_sync_checkpoint_engine.py` (trainer and driver side)
   and `verl_hardware_plugin/accelerators/tpu/rollout/tpu_raiden.py` (rollout side).

@@ -124,7 +124,14 @@ def apply() -> None:
     original_all_reduce = dist.all_reduce
     original_all_gather_object = getattr(dist, "all_gather_object", None)
 
-    def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+    def _patched_all_reduce(tensor, op=None, group=None, async_op=False):
+        # Forward `op` only when the caller passed one. Under torch.compile, dynamo rewrites the original
+        # `dist.all_reduce` into a functional collective, but it only converts a ReduceOp to its string form when
+        # the traced function is the current `dist.all_reduce` attribute (i.e. this wrapper). A forwarded
+        # `ReduceOp.SUM` default would reach `_functional_collectives.all_reduce` unconverted and fail with
+        # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
+        if op is None:
+            return original_all_reduce(tensor, group=group, async_op=async_op)
         if op != dist.ReduceOp.AVG or async_op or not _is_tpu_all_reduce(tensor, group):
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 

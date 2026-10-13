@@ -97,6 +97,20 @@ def _apply_verl_runtime_helpers() -> None:
     try:
         orig_logprobs = getattr(verl_tf, "logprobs_from_logits", None)
         naive_logprobs = getattr(verl_tf, "logprobs_from_logits_naive", None)
+        if callable(naive_logprobs) and not getattr(naive_logprobs, "_tpu_fp32_patched", False):
+            _orig_naive_logprobs = naive_logprobs
+
+            def _patched_logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+                device = getattr(logits, "device", None)
+                if getattr(device, "type", None) == "tpu":
+                    logp = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
+                    return verl_tf.gather_from_labels(logp, labels)
+                return _orig_naive_logprobs(logits, labels)
+
+            _patched_logprobs_from_logits_naive._tpu_fp32_patched = True  # type: ignore[attr-defined]
+            verl_tf.logprobs_from_logits_naive = _patched_logprobs_from_logits_naive
+            naive_logprobs = _patched_logprobs_from_logits_naive
+
         if callable(orig_logprobs) and callable(naive_logprobs) and not getattr(orig_logprobs, "_tpu_patched", False):
 
             def _patched_logprobs_from_logits(logits, labels, inplace_backward=True):

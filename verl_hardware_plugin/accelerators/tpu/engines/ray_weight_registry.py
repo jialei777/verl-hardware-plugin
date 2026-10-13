@@ -63,6 +63,13 @@ class RayWeightRegistryState:
         for old_step in sorted(self.stats)[: -self.MAX_STATS_STEPS]:
             del self.stats[old_step]
 
+    def set_rank_stats(self, step: int, rank: int, stats: dict[str, Any]) -> None:
+        """Records one trainer rank's partial weight statistics for ``step`` (sharded export)."""
+        entry = self.stats.setdefault(step, {})
+        entry.setdefault("ranks", {})[int(rank)] = stats
+        for old_step in sorted(self.stats)[: -self.MAX_STATS_STEPS]:
+            del self.stats[old_step]
+
     def get_stats(self, step: int) -> dict[str, Any] | None:
         """Returns ``{"master": stats}`` for ``step``, or ``None``."""
         return self.stats.get(step)

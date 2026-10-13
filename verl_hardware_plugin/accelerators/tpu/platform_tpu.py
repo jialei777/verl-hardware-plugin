@@ -25,6 +25,12 @@ from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
+from verl_hardware_plugin.accelerators.tpu.platform_tpu_slices import (
+    plan_resource_pool_placement,
+    resolve_tpu_rollout_layout,
+    slice_chips_for,
+    tpu_replica_rollout_config,
+)
 
 extend_torchtitan_engine_config()
 
@@ -60,6 +66,7 @@ HBM_BYTES_TPU_V7X = 192 * 1024 * 1024 * 1024  # 192 GB
 TPU_HBM_BYTES_MAP = {
     "v5p": HBM_BYTES_TPU_V5P,
     "v6e": HBM_BYTES_TPU_V6E,
+    "tpu7x": HBM_BYTES_TPU_V7X,
     "v7x": HBM_BYTES_TPU_V7X,
 }
 
@@ -81,6 +88,42 @@ DEFAULT_TPU_TOPOLOGY_MAP = {
     256: "16,16,1",
 }
 
+# TPU v5p 3D mesh topology mappings (X, Y, Z) by pod type or total chips (1 logical device per chip in Megacore mode).
+# Each host is 2x2x1 (4 chips = 8 TensorCores); multi-host slices stack along Z then X/Y (2x2x2 = 8 chips,
+# 2x2x4 = 16 chips, 2x4x4 = 32 chips, 4x4x4 = 64 chips, 4x4x8 = 128 chips, 4x8x8 = 256 chips).
+TPU_V5P_TOPOLOGY_MAP = {
+    "v5p-512": "4,8,8",
+    "v5p-256": "4,4,8",
+    "v5p-128": "4,4,4",
+    "v5p-64": "2,4,4",
+    "v5p-32": "2,2,4",
+    "v5p-16": "2,2,2",
+    "v5p-8": "2,2,1",
+    256: "4,8,8",
+    128: "4,4,8",
+    64: "4,4,4",
+    32: "2,4,4",
+    16: "2,2,4",
+    8: "2,2,2",
+    4: "2,2,1",
+    2: "1,2,1",
+    1: "1,1,1",
+}
+
+# TPU 7x (Ironwood) 4D mesh topology mappings (X, Y, Z, CoresPerChip=2), keyed by device count.
+# A host has 4 chips (2x2x1) and 8 devices; the multi-host entries follow the GKE slice shapes
+# (2x2x2 = 2 hosts, 2x2x4 = 4, 2x4x4 = 8, 4x4x4 = 16).
+TPU_V7X_TOPOLOGY_MAP = {
+    128: "4,4,4,2",
+    64: "2,4,4,2",
+    32: "2,2,4,2",
+    16: "2,2,2,2",
+    8: "2,2,1,2",
+    4: "1,2,1,2",
+    2: "1,1,1,2",
+    1: "1,1,1,1",
+}
+
 # Pod types are consulted first: a pod type names the physical slice exactly, whereas the chip
 # count is only the number of chips this job was given and can be a subset of the slice.
 TPU_POD_TYPE_TOPOLOGY_MAP = {
@@ -88,11 +131,28 @@ TPU_POD_TYPE_TOPOLOGY_MAP = {
     "v6e-8": "2,4,1",
     "v6e-16": "4,4,1",
     "v6e-32": "4,8,1",
+    "v5p-8": "2,2,1",
+    "v5p-16": "2,2,2",
+    "v5p-32": "2,2,4",
+    "v5p-64": "2,4,4",
+    "v5p-128": "4,4,4",
+    "v5p-256": "4,4,8",
+    "v5p-512": "4,8,8",
 }
 
 # Slices at or below this many chips live on a single host, so the chips are addressed within
 # the host bounds rather than across them.
 TPU_SINGLE_HOST_MAX_CHIPS = 4
+
+
+def get_tpu_topology_map(pod_type: str = "") -> dict:
+    """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D for v5p/v6e)."""
+    tpu_type = (pod_type or os.environ.get("TPU_ACCELERATOR_TYPE", "v6e")).lower()
+    if any(k in tpu_type for k in ("tpu7x", "v7x")):
+        return TPU_V7X_TOPOLOGY_MAP
+    if "v5p" in tpu_type:
+        return TPU_V5P_TOPOLOGY_MAP
+    return DEFAULT_TPU_TOPOLOGY_MAP
 
 
 def resolve_tpu_topology_bounds(
@@ -109,27 +169,35 @@ def resolve_tpu_topology_bounds(
         ValueError: if the topology cannot be determined. Guessing here is worse than failing:
             a wrong mesh does not error, it silently trains on part of the slice.
     """
+    topo_map = get_tpu_topology_map(pod_type)
+    unit_bounds = topo_map.get(1, "1,1,1")
+    pod_key = pod_type.lower() if pod_type else ""
     topology = (
         os.environ.get("TORCH_TPU_TOPOLOGY")
-        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
-        or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
+        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_key)
+        or topo_map.get(pod_key)
+        or topo_map.get(total_chips)
     )
     if not topology:
         raise ValueError(
             f"Cannot determine the TPU topology for total_chips={total_chips} "
             f"(pod_type={pod_type!r}). Set TORCH_TPU_TOPOLOGY='x,y,z' to override. "
-            f"Known chip counts: {sorted(DEFAULT_TPU_TOPOLOGY_MAP)}."
+            f"Known chip counts: {sorted(k for k in topo_map if isinstance(k, int))}."
         )
 
     inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
-    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+    chips_per_host = str(
+        os.environ.get("VERL_TPU_CHIPS_PER_HOST")
+        or os.environ.get("VLLM_TPU_CHIPS_PER_HOST")
+        or inferred_chips_per_host
+    )
 
-    if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS:
-        host_bounds = "1,1,1"
-        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS and unit_bounds == "1,1,1":
+        host_bounds = unit_bounds
+        chips_per_host_bounds = topology if num_nodes == 1 else unit_bounds
     else:
         host_bounds = topology
-        chips_per_host_bounds = "1,1,1"
+        chips_per_host_bounds = unit_bounds
 
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
@@ -144,7 +212,12 @@ def get_tpu_chip_hbm_bytes() -> int:
             tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
             if tpu_nodes:
                 labels = tpu_nodes[0].get("Labels", {})
-                tpu_type = (labels.get("ray.io/accelerator-type") or labels.get("ray.io/tpu-pod-type") or "").lower()
+                tpu_type = (
+                    labels.get("ray.io/accelerator-type")
+                    or labels.get("ray.io/tpu-pod-type")
+                    or labels.get("cloud.google.com/gke-tpu-accelerator")
+                    or ""
+                ).lower()
     except Exception as e:
         logger.warning(f"Unable to query Ray node labels for TPU chip type: {e}")
 
@@ -193,6 +266,9 @@ class DummyTpuDeviceModule:
     def manual_seed_all(self, seed: int) -> None:
         torch.manual_seed(seed)
 
+    def get_device_name(self, device: Any = None) -> str:
+        return os.environ.get("TPU_ACCELERATOR_TYPE", "v6e")
+
 
 class TPUDeviceModuleProxy:
     """Proxy wrapper for torch.tpu to emulate the PyTorch NVIDIA memory management APIs.
@@ -222,6 +298,8 @@ class TPUDeviceModuleProxy:
             return lambda *args, **kwargs: 0
         elif name == "reset_peak_memory_stats":
             return lambda *args, **kwargs: None
+        elif name == "get_device_name":
+            return lambda *args, **kwargs: os.environ.get("TPU_ACCELERATOR_TYPE", "v6e")
         elif name == "get_device_properties":
 
             class DummyDeviceProperties:
@@ -299,6 +377,16 @@ class TPUDeviceModuleProxy:
                 self._original_module._clear_cache()
             except Exception as e:
                 logger.warning(f"Failed to clear TPU cache: {e}")
+
+
+def _ensure_slicebuilder_insecure_grpc(raw_args: str) -> str:
+    """Ensure LIBTPU_INIT_ARGS enables insecure SliceBuilder gRPC to avoid GKE ALTS handshake hangs."""
+    tokens = raw_args.split()
+    if not any(t.startswith("--slicebuilder_use_insecure_grpc") for t in tokens):
+        tokens.append("--slicebuilder_use_insecure_grpc=true")
+    if not any(t.startswith("--undefok=") and "slicebuilder_use_insecure_grpc" in t for t in tokens):
+        tokens.append("--undefok=slicebuilder_use_insecure_grpc")
+    return " ".join(tokens)
 
 
 def patch_ray_worker() -> None:
@@ -539,6 +627,37 @@ class PlatformTPU(PlatformBase):
         # A TPU chip belongs to one process and cannot be shared between colocated WorkerGroups.
         return False
 
+    def rollout_env_vars(self) -> dict[str, str]:
+        """Return env vars to inject into the rollout engine.
+
+        The rollout server actor is created with an explicit ``runtime_env``, which replaces
+        inheritance from the job, so compiler/runtime flags set on the driver must be named
+        to survive. Also merges ``VERL_TPU_EXTRA_<VAR>`` overrides and sets
+        ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`` so vLLM forwards them to its worker actors.
+        """
+        env_vars: dict[str, str] = {}
+        copied: list[str] = []
+        for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+            base = os.environ.get(var, "")
+            extra = os.environ.get(f"VERL_TPU_EXTRA_{var}", "")
+            combined = " ".join(part for part in (base, extra) if part).strip()
+            if combined:
+                env_vars[var] = combined
+                copied.append(var)
+        if "LIBTPU_INIT_ARGS" in env_vars:
+            env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(env_vars["LIBTPU_INIT_ARGS"])
+        if os.environ.get("TPU_ACCELERATOR_TYPE"):
+            env_vars["TPU_ACCELERATOR_TYPE"] = os.environ["TPU_ACCELERATOR_TYPE"]
+            copied.append("TPU_ACCELERATOR_TYPE")
+        if os.environ.get("VERL_USE_EXTERNAL_MODULES"):
+            env_vars["VERL_USE_EXTERNAL_MODULES"] = os.environ["VERL_USE_EXTERNAL_MODULES"]
+            copied.append("VERL_USE_EXTERNAL_MODULES")
+        if copied:
+            existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+            extra_copy = [k.strip() for k in existing.split(",") if k.strip()] + copied
+            env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(dict.fromkeys(extra_copy))
+        return env_vars
+
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Install the GKE TPU worker setup hook and pin the platform inside Ray workers.
 
@@ -547,10 +666,28 @@ class PlatformTPU(PlatformBase):
         EngineCore calls ``ray.init`` again with the runtime env it captured from the server actor,
         and Ray rejects that name as conflicting with the key. A module path round-trips unchanged.
         """
+        env_vars = {
+            "VERL_PLATFORM": "tpu",
+            "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+            "LIBTPU_INIT_ARGS": _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", "")),
+        }
+        for key in (
+            "VERL_USE_EXTERNAL_MODULES",
+            "WANDB_API_KEY",
+            "WANDB_BASE_URL",
+            "WANDB_ENTITY",
+            "WANDB_PROJECT",
+            "WANDB_MODE",
+            "VERL_FILE_LOGGER_ROOT",
+            "VERL_FILE_LOGGER_PATH",
+            "TENSORBOARD_DIR",
+        ):
+            if os.environ.get(key):
+                env_vars[key] = os.environ[key]
         return {
             "runtime_env": {
                 "worker_process_setup_hook": f"{patch_ray_worker.__module__}.{patch_ray_worker.__qualname__}",
-                "env_vars": {"VERL_PLATFORM": "tpu"},
+                "env_vars": env_vars,
             }
         }
 
@@ -568,6 +705,10 @@ class PlatformTPU(PlatformBase):
         """
         if accelerator_type is not None:
             return accelerator_type
+
+        planned_slice, _ = self.plan_resource_pool_placement(name_prefix)
+        if planned_slice is not None:
+            return planned_slice
 
         try:
             if ray.is_initialized():
@@ -588,6 +729,44 @@ class PlatformTPU(PlatformBase):
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
         return accelerator_type
+
+    def resolve_rollout_layout(self, config: Any) -> Optional[dict]:
+        """Resolve TPU trainer/rollout slice layout and populate rollout nnodes/n_gpus_per_node."""
+        return resolve_tpu_rollout_layout(config)
+
+    def replica_rollout_config(self, rollout_config: Any) -> Any:
+        """Return a per-replica copy of ``rollout_config`` with ``data_parallel_size=1``."""
+        return tpu_replica_rollout_config(rollout_config)
+
+    def plan_resource_pool_placement(
+        self, name_prefix: str, process_on_nodes: Optional[list[int]] = None
+    ) -> tuple[Optional[str], Optional[list[str]]]:
+        """Slice resource and per-placement-group host pins for a resource pool.
+
+        Trainer pools get the trainer slice; ``rollout_pool_<idx>`` pools get the slice and the hosts
+        of rollout replica ``idx`` from the slice plan (see ``platform_tpu_slices``), so that several
+        replicas on one multi-host slice occupy distinct hosts instead of racing for the same one.
+        """
+        try:
+            return plan_resource_pool_placement(name_prefix, process_on_nodes)
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(f"TPU slice assignment failed for {name_prefix}: {e}")
+            return None, None
+
+    def pin_placement_group_scheme(self, pg_scheme: list[list[dict]], hosts: Optional[list[str]]) -> None:
+        """Pin each placement group of ``pg_scheme`` to the host planned for it."""
+        if not hosts:
+            return
+        if len(hosts) != len(pg_scheme):
+            logger.warning(
+                f"TPU host pins {hosts} do not match the {len(pg_scheme)} placement group(s); leaving them unpinned"
+            )
+            return
+        for bundles, ip in zip(pg_scheme, hosts, strict=True):
+            for bundle in bundles:
+                bundle[f"node:{ip}"] = 1e-4
 
     def configure_placement_group_bundle(
         self,
@@ -619,6 +798,7 @@ class PlatformTPU(PlatformBase):
         local_world_size: int,
         name_prefix: str,
         pgs: list,
+        accelerator_type: Optional[str] = None,
     ) -> dict[str, str]:
         """Generate TPU-specific distributed environment variables for PJRT mesh initialization.
 
@@ -654,16 +834,21 @@ class PlatformTPU(PlatformBase):
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
             "TPU_VISIBLE_CHIPS": str(local_rank),
+            "LIBTPU_INIT_ARGS": _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", "")),
         }
 
         # Derive the mesh from the pod type Ray reports, falling back to the chip count.
+        # If this worker group uses only part of a slice (e.g. one TP=4 replica per host of a 2-host
+        # slice), resolve the mesh from world_size rather than the full slice's pod_type label.
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
+        slice_chips = slice_chips_for(accelerator_type)
+        effective_pod_type = "" if (slice_chips is not None and world_size != slice_chips) else tpu_type
 
         topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
             total_chips=world_size,
             num_nodes=len(unique_hostnames),
-            pod_type=tpu_type,
+            pod_type=effective_pod_type,
         )
 
         env_vars.update(
@@ -688,7 +873,9 @@ class PlatformTPU(PlatformBase):
         device_name: str,
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
-        env_vars = {}
+        env_vars = {
+            "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+        }
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
         for var in self.ray_noset_envvars():
@@ -701,6 +888,7 @@ class PlatformTPU(PlatformBase):
             local_world_size=local_world_size,
             name_prefix=name_prefix,
             pgs=pgs,
+            accelerator_type=getattr(resource_pool, "accelerator_type", None),
         )
         env_vars.update(tpu_env)
         return env_vars

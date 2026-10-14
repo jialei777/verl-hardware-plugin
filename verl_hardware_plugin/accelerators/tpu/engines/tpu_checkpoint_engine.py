@@ -26,6 +26,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import (
     RAY_WEIGHT_REGISTRY_NAMESPACE,
     get_ray_weight_registry,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import (
     RAY_PLASMA_STORE_BACKEND,
     TPU_SYNC_BACKEND,
@@ -42,16 +43,6 @@ _FUSED_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
-
-
-def _synchronize_tpu() -> None:
-    """Synchronizes pending device operations on TPU when ``torch_tpu`` is active."""
-    try:
-        import torch_tpu
-
-        torch_tpu._internal.sync.synchronize(wait=True)
-    except Exception:
-        pass
 
 
 def get_clean_name(name: str) -> str:
@@ -294,7 +285,7 @@ def load_weights_on_worker(
                 target_device=target_device,
             )
 
-    _synchronize_tpu()
+    tpu_synchronize()
     del temp_tpu_tensors
     gc.collect()
 
@@ -488,12 +479,12 @@ class TPUCheckpointEngine(CheckpointEngine):
     ) -> None:
         """All-gathers and packs weights on trainer rank 0, publishing the ``ObjectRef`` to ``RayWeightRegistry``."""
         t_start = time.perf_counter()
-        _synchronize_tpu()
+        tpu_synchronize()
 
         if not self.is_master:
             for _key, tensor in weights:
                 del tensor
-            _synchronize_tpu()
+            tpu_synchronize()
             gc.collect()
             return
 
@@ -502,7 +493,7 @@ class TPUCheckpointEngine(CheckpointEngine):
 
         t_offload_start = time.perf_counter()
         state_dict = self.pack_weights_to_grouped_dict(weights)
-        _synchronize_tpu()
+        tpu_synchronize()
         t_offload = time.perf_counter() - t_offload_start
 
         t_put_start = time.perf_counter()

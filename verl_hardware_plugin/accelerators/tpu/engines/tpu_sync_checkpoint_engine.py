@@ -41,6 +41,7 @@ import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import TPU_SYNC_BACKEND
 
 logger = logging.getLogger(__name__)
@@ -52,22 +53,6 @@ RAIDEN_DEFAULT_PARALLELISM = 8
 RAIDEN_REGISTRATION_TIMEOUT_S = 60.0
 # Raiden reads and writes device buffers in place, so the tensors it is given must live on this device.
 RAIDEN_DEVICE = "tpu"
-
-
-def tpu_synchronize(strict: bool = False) -> None:
-    """Waits for pending TPU work, so Raiden reads final device buffers.
-
-    Args:
-        strict: Raise if ``torch_tpu`` cannot synchronize instead of logging a warning.
-    """
-    try:
-        from torch_tpu._internal import sync as torch_tpu_sync
-
-        torch_tpu_sync.synchronize(wait=True)
-    except Exception as e:
-        if strict:
-            raise RuntimeError(f"TPU synchronization failed: {e}") from e
-        logger.warning(f"Could not synchronize via torch_tpu: {e}")
 
 
 def compute_tensor_stats(items: list) -> dict:

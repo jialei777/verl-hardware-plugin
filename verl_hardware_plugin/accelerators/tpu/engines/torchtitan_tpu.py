@@ -61,8 +61,8 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
-    synchronize_tpu_loss,
     tpu_eager_mode_context,
+    tpu_synchronize,
     tpu_torchtitan_config_overrides,
     unwrap_metadata,
 )
@@ -226,8 +226,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
                     if not forward_only:
                         if self._simple_fsdp_loss_scale is not None:
                             loss = loss * self._simple_fsdp_loss_scale
-                        synchronize_tpu_loss(loss)
+                        tpu_synchronize(loss, wait=False)
                         loss.backward()
+                        del loss
+                        tpu_synchronize(wait=True)
+                    else:
+                        del loss
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)

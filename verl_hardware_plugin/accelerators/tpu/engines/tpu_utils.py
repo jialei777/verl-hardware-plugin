@@ -369,7 +369,9 @@ def tpu_torchtitan_config_overrides(*, use_simple_fsdp: bool = False):
 
     import verl.workers.engine.torchtitan.transformer_impl as tt_impl
 
-    default_spmd_backend = getattr(getattr(tt_impl, "ParallelismConfig", None), "spmd_backend", "partial_dtensor")
+    parallelism_cls = getattr(tt_impl, "ParallelismConfig", None)
+    spmd_field = getattr(parallelism_cls, "__dataclass_fields__", {}).get("spmd_backend")
+    default_spmd_backend = getattr(spmd_field, "default", getattr(parallelism_cls, "spmd_backend", "partial_dtensor"))
     if not isinstance(default_spmd_backend, str):
         default_spmd_backend = "partial_dtensor"
 

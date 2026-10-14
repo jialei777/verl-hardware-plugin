@@ -108,6 +108,7 @@ def _hf_entry_row_slots(name, spec, place, lidx, lval):
     row_numel = max(_prodshape(spec.full_shape[1:]), 1)
     gidx = translate_flat_indices(lidx, place)
     edges = torch.arange(n_slots + 1, device=gidx.device, dtype=gidx.dtype) * row_numel
+    # One D2H for the run lengths; the diff's nonzero already synced this stream.
     counts = torch.searchsorted(gidx, edges).diff().cpu()
     return slots, dtype_str, counts, (gidx % row_numel).to(torch.int32), lval
 
@@ -126,6 +127,8 @@ class TPUEngineEvalModeCtx(BaseEngineCtx):
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, TorchTitanTPUEngine)
+
+        # Reshard the FSDP2 modules. SimpleFSDP modules are not FSDPModule and keep no unsharded copy.
         if self.engine.engine_config.data_parallel_shard_size > 1:
             for module in self.engine.module:
                 for submodule in module.modules():
@@ -163,6 +166,17 @@ class TorchTitanTPUEngine(BaseEngine):
         optimizer_config: TorchtitanOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        """
+        Initialize the TorchTitanTPUEngine.
+
+        Sets up distributed device meshes for tensor and data parallelism, LoRA, and offload policies.
+
+        Args:
+            model_config: Configuration for HuggingFace model.
+            engine_config: Configuration for FSDP/TorchTitan engine (uses FSDP2 or SimpleFSDP).
+            optimizer_config: Configuration for optimizer.
+            checkpoint_config: Configuration for checkpointing.
+        """
         from torchtitan.components.checkpointer import CheckpointManager
         from torchtitan.components.loss import CrossEntropyLoss
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
@@ -193,7 +207,10 @@ class TorchTitanTPUEngine(BaseEngine):
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
 
+        # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
+
+        # Get ModelSpec from model registry
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(
             torchtitan_flavor,
@@ -260,18 +277,25 @@ class TorchTitanTPUEngine(BaseEngine):
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
         training = TrainingConfig(**training_kwargs)
 
+        # Pad positions run 0..pad_size-1 (< bucket) and index the RoPE cache sized by max_context_length.
         if self.engine_config.pad_to_length and self.engine_config.pad_to_length_bucket > training.max_context_length:
             raise ValueError(
                 f"pad_to_length_bucket ({self.engine_config.pad_to_length_bucket}) must not exceed the RoPE "
                 f"cache length ({training.max_context_length}); raise engine.max_seq_len or lower the bucket"
             )
 
+        # Activation checkpointing mode. Note: under spmd_backend="spmd_types" with
+        # eager execution (use_torch_compile=False), selective/full AC recompute runs
+        # on the autograd backward thread where the thread-local SPMD mesh is inactive,
+        # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
+        # (or enable torch.compile, which recomputes in-graph) in that configuration.
         activation_checkpoint = {
             "selective": SelectiveAC.Config,
             "full": FullAC.Config,
             "none": lambda: None,
         }[self.engine_config.activation_checkpoint]()
 
+        # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
             model_spec=model_spec,
             hf_assets_path=self.model_config.path,
@@ -282,13 +306,19 @@ class TorchTitanTPUEngine(BaseEngine):
             compile=compile_config,
             training=training,
             activation_checkpoint=activation_checkpoint,
+            # Use a no-op dataloader since verl has its own data loading
             dataloader=create_noop_dataloader_config(),
+            # Provide a concrete loss so Trainer.__init__ can build it;
+            # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
 
+        # Re-enable FSDP's gradient division for verl's loss scaling.
+        # TorchTitan disables gradient division by default (for global token normalization),
+        # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         model_parts = getattr(self.trainer, "model_parts", None)
         if self.engine_config.data_parallel_shard_size > 1 and model_parts is not None:
             dp_size = self.get_data_parallel_size()
@@ -313,6 +343,7 @@ class TorchTitanTPUEngine(BaseEngine):
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
+        # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
@@ -350,12 +381,15 @@ class TorchTitanTPUEngine(BaseEngine):
     def is_mp_src_rank_with_outputs(self) -> bool:
         """Whether the current rank is the first rank in the model-parallel group that holds model outputs."""
         is_collect = True
+        # TP: outputs are on TP rank 0
         if self.parallel_dims.tp > 1:
             tp_mesh = self.parallel_dims.get_optional_mesh("tp")
             is_collect = is_collect and (tp_mesh.get_local_rank() == 0)
+        # PP: outputs are on the last PP rank
         if self.parallel_dims.pp > 1:
             pp_mesh = self.parallel_dims.get_optional_mesh("pp")
             is_collect = is_collect and (pp_mesh.get_local_rank() == self.parallel_dims.pp - 1)
+        # CP: outputs are on CP rank 0
         if self.parallel_dims.cp > 1:
             cp_mesh = self.parallel_dims.get_optional_mesh("cp")
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
@@ -376,6 +410,10 @@ class TorchTitanTPUEngine(BaseEngine):
             world_size=world_size,
         )
         self.device_mesh = self.parallel_dims.build_mesh()
+
+        # Mirror torchtitan's init_distributed (which verl bypasses): disable autograd
+        # multithreading so backward-thread activation-checkpoint recompute can access the
+        # thread-local SPMD mesh / process groups (e.g. current_spmd_mesh().get_group(...)).
         torch.autograd.set_multithreading_enabled(False)
 
     def _drop_checkpoint_state_dict_cache(self) -> None:
@@ -393,6 +431,7 @@ class TorchTitanTPUEngine(BaseEngine):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        # load initial HF weights
         self.checkpointer.load()
 
         if not self.engine_config.forward_only:
@@ -421,11 +460,11 @@ class TorchTitanTPUEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def train_mode(self, **kwargs):
-        """Return a training-mode context manager."""
+        """Return a context manager for training mode."""
         return TPUEngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
-        """Return an evaluation-mode context manager compatible with both FSDP2 and SimpleFSDP."""
+        """Return a context manager for evaluation mode."""
         return TPUEngineEvalModeCtx(self, **kwargs)
 
     def get_data_parallel_rank(self):
@@ -439,6 +478,10 @@ class TorchTitanTPUEngine(BaseEngine):
         mesh = self._get_data_parallel_mesh()
         if mesh is not None:
             return mesh.get_group()
+        # If world_size == dp_size (e.g. single GPU, or all ranks are DP),
+        # return WORLD so that collective ops in _postprocess_output
+        # (allgather_dict_into_dict, all_reduce) still run and produce the
+        # correct metric aggregation format.
         if torch.distributed.get_world_size() == self.get_data_parallel_size():
             return torch.distributed.group.WORLD
         return None
@@ -524,6 +567,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 "Pipeline parallelism is not yet supported in model_forward_step. "
                 "This will be implemented in a follow-up PR."
             )
+        # Non-PP forward. train_context (SPMD mesh) is set by the caller.
         assert len(model_parts) == 1
         pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
         if isinstance(pred, DTensor):
@@ -601,6 +645,7 @@ class TorchTitanTPUEngine(BaseEngine):
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
+        # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
 
@@ -622,14 +667,17 @@ class TorchTitanTPUEngine(BaseEngine):
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
+        # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
 
+        # Extract step number from path (verl uses global_step_N format)
         match = re.search(r"global_step_(\d+)", local_path)
         if match:
             step = int(match.group(1))
             self.checkpointer.load(step=step)
         else:
+            # Fallback to latest
             self.checkpointer.load(step=-1)
 
         torch.distributed.barrier()
@@ -642,10 +690,15 @@ class TorchTitanTPUEngine(BaseEngine):
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Re-key a torchtitan state dict to HuggingFace names, values untouched."""
+        # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
         if sd_adapter is not None:
             params = sd_adapter.to_hf(params)
 
+        # When weight tying is enabled, the sd_adapter skips lm_head.weight during
+        # to_hf() conversion (since it's the same tensor as embed_tokens.weight in
+        # the torchtitan model). But vLLM needs lm_head.weight explicitly, so we
+        # add it back as a reference to embed_tokens.weight.
         if "model.embed_tokens.weight" in params and "lm_head.weight" not in params:
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
         return params
@@ -705,18 +758,20 @@ class TorchTitanTPUEngine(BaseEngine):
         for module in self.module:
             raw.update(module.state_dict())
 
+        # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}
         for name, param in raw.items():
             slots = self._expert_stack_slots(name, param)
             if slots is not None:
                 stacks[name] = slots
         params = self._to_hf_named_params({k: v for k, v in raw.items() if k not in stacks})
-        device = get_device_id()
+        device = get_device_id()  # local shards live on CPU under an offload policy
 
         from verl.workers.engine.spec import ShardSpec
 
         def _shard(param):
             p = param.to(device, non_blocking=True)
+            # The wire speaks bf16, but mixed precision keeps fp32 masters: cast before the diff sees them.
             if p.is_floating_point():
                 p = p.to(torch.bfloat16, non_blocking=True)
             local = p.to_local() if isinstance(p, DTensor) else p
@@ -725,6 +780,7 @@ class TorchTitanTPUEngine(BaseEngine):
         def _gen():
             for name, param in params.items():
                 yield name, _shard(param), ShardSpec.from_param(param)
+            # Keyed by the torchtitan name: the entry is the stack, not any one HF tensor.
             for name, slots in stacks.items():
                 spec = ShardSpec.from_param(raw[name])
                 spec.hf_slots = slots

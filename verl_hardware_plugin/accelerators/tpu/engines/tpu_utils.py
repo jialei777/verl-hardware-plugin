@@ -42,6 +42,10 @@ TPU_PADDED_VALUES_ATTR = "_tpu_padded_values"
 
 _DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
 
+# Mapping from HuggingFace model_type to torchtitan model name.
+# Torchtitan models not mapped here:
+#   - flux: diffusion model, not applicable to verl's RL/SFT workflows
+#   - llama3_ft: fault-tolerant variant of llama3, same HF models (mapped via "llama")
 _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
     "qwen2": "qwen3",
     "qwen3": "qwen3",
@@ -59,6 +63,13 @@ def create_noop_dataloader_config() -> Any:
     from torchtitan.components.data.loader import BaseDataLoader
 
     class NoOpDataLoader(BaseDataLoader):
+        """A no-op dataloader for use when verl manages its own data loading.
+
+        Satisfies the BaseDataLoader interface required by torchtitan's Trainer
+        but does nothing. Its __iter__ yields nothing, and state_dict /
+        load_state_dict are no-ops.
+        """
+
         @dataclass(kw_only=True, slots=True)
         class Config(BaseDataLoader.Config):
             pass
@@ -79,7 +90,21 @@ def create_noop_dataloader_config() -> Any:
 
 
 def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
-    """Derive TorchTitan model name and flavor from a HuggingFace config."""
+    """Derive torchtitan model name and flavor from a HuggingFace config.
+
+    The name is mapped from ``hf_config.model_type``. The flavor is found by
+    matching architecture parameters (dim, n_layers, vocab_size) against the
+    known flavors registered in the torchtitan model package.
+
+    Args:
+        hf_config: A HuggingFace AutoConfig object.
+
+    Returns:
+        A ``(name, flavor)`` tuple.
+
+    Raises:
+        ValueError: If model_type is unsupported or no matching flavor is found.
+    """
     model_type = getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError("HuggingFace config does not have 'model_type' field")
@@ -91,9 +116,13 @@ def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
             f"Supported types: {list(_HF_MODEL_TYPE_TO_TORCHTITAN_NAME.keys())}."
         )
 
+    # Import the model package and use model_registry to build each flavor's config.
+    # model_registry has sensible defaults for all optional params (attn_backend, etc.).
     model_module = importlib.import_module(f"torchtitan.models.{name}")
     model_registry = model_module.model_registry
 
+    # The configs dict name isn't derivable from the model name
+    # (e.g. gpt_oss -> gptoss_configs), so we find it by convention.
     flavor_names = None
     for attr, obj in vars(model_module).items():
         if attr.endswith("_configs") and isinstance(obj, dict):
@@ -135,14 +164,31 @@ def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
 
 
 def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
-    """Re-enable FSDP2 gradient division for verl's loss scaling (``loss * dp_size``)."""
+    """
+    Re-enable FSDP's automatic gradient division.
+
+    TorchTitan calls disable_fsdp_gradient_division() which sets gradient_divide_factor=1.0.
+    This re-enables it by setting the factor to the specified dp_size, so gradients are
+    averaged across FSDP ranks. This is needed for verl's loss scaling (loss * dp_size)
+    to work correctly.
+
+    Args:
+        model: The model (or model part) to enable gradient division on.
+        dp_size: The data parallel size to use as the gradient divide factor.
+    """
+
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(float(dp_size))
 
 
 class ContextParallelGather(torch.autograd.Function):
-    """All-gather along dim 0 whose backward keeps only the local slice."""
+    """All-gather along dim 0 whose backward keeps only the local slice.
+
+    Every CP rank computes the same loss on the gathered tensor, so the upstream gradient is
+    identical across CP ranks and its local slice is already the full gradient of the local shard.
+    Summing it across ranks (the default all-gather backward) would scale gradients by the CP size.
+    """
 
     @staticmethod
     def forward(ctx: Any, tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:

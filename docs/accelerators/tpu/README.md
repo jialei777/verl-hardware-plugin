@@ -42,6 +42,7 @@ docs/accelerators/tpu/
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
 - [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
+- [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
 
 ## Platform Summary
 

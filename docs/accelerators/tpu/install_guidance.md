@@ -5,7 +5,8 @@
 - A Cloud TPU VM or a GKE node pool with TPU v6e chips attached.
 - A container image providing `torch`, `torch_tpu`, and `libtpu`. `torch_tpu` registers both the
   `tpu` device type and the `tpu_dist` distributed backend; `torch.tpu` does not exist until it is
-  imported.
+  imported. The `Dockerfile` in verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) builds a tested image
+  (Ray, `torch_tpu`, JAX/`libtpu`, `tpu-sync`, torchtitan, vLLM + vllm-torchtpu).
 - Network access to download models and datasets.
 - A verl checkout and this plugin checkout.
 

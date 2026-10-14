@@ -25,8 +25,9 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     bucket_length,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
-    force_sum_reduction_on_all_fsdp_modules,
     get_tpu_seq_bucket_size,
+    get_tpu_simple_fsdp_parallelize_fn,
+    init_states_without_simple_fsdp_parametrization,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
@@ -155,6 +156,23 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
     out = model[0].inner_attention(q, q, q)
     assert out.shape == (256, 2, 4)
     assert torch.allclose(out, q * 3)
+
+
+def test_apply_splash_attention_tpu_falls_back_to_tpu_varlen_attention_for_varlen():
+    from torchtitan.models.common.attention import VarlenInnerAttention
+
+    class _AttnBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner_attention = VarlenInnerAttention(VarlenInnerAttention.Config())
+
+    model = torch.nn.Sequential(_AttnBlock())
+    assert apply_splash_attention_tpu([model]) == 1
+    splash = model[0].inner_attention
+    assert isinstance(splash, TPUSplashAttention)
+    # torchtitan's VarlenInnerAttention needs the CUDA flash-attention varlen op; TPU falls back to dense SDPA.
+    assert isinstance(splash.original_module, TPUVarlenAttention)
+    assert splash.local_window_size is None
 
 
 def test_configure_torch_compile_for_tpu():
@@ -296,28 +314,54 @@ def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
         assert get_tpu_seq_bucket_size(cfg_enabled) == 128
 
 
-def test_force_sum_reduction_on_all_fsdp_modules():
-    class _FakeFSDPLayer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.set_force_sum_reduction_for_comms = mock.MagicMock()
+def test_get_tpu_simple_fsdp_parallelize_fn_uses_torchtitan_tpu_recipe():
+    from torchtitan.experiments.graph_trainer import simple_fsdp
 
-    class _FakeFSDPRoot(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer0 = _FakeFSDPLayer()
-            self.layer1 = _FakeFSDPLayer()
-            self.plain = torch.nn.Linear(2, 2)
-            self.set_force_sum_reduction_for_comms = mock.MagicMock()
+    calls = []
+    init_flags = []
 
-    assert force_sum_reduction_on_all_fsdp_modules(None) == 0
-    assert force_sum_reduction_on_all_fsdp_modules([torch.nn.Linear(2, 2)]) == 0
+    class _Model(torch.nn.Module):
+        def init_states(self, *, buffer_device=None):
+            init_flags.append(simple_fsdp._active_parametrization)
 
-    root = _FakeFSDPRoot()
-    assert force_sum_reduction_on_all_fsdp_modules([root]) == 3
-    root.set_force_sum_reduction_for_comms.assert_called_once_with(True)
-    root.layer0.set_force_sum_reduction_for_comms.assert_called_once_with(True)
-    root.layer1.set_force_sum_reduction_for_comms.assert_called_once_with(True)
+    def _recipe(model, **kwargs):
+        calls.append(kwargs)
+        return model
+
+    fake_recipe_module = SimpleNamespace(parallelize_qwen3=_recipe)
+    with mock.patch("importlib.import_module", return_value=fake_recipe_module) as import_module:
+        parallelize_fn = get_tpu_simple_fsdp_parallelize_fn("qwen3")
+    import_module.assert_called_once_with("torchtitan.experiments.tpu.qwen3.infra.parallelize")
+
+    model = parallelize_fn(_Model(), parallel_dims="pd", parallelism="cfg", skip_dp=False)
+    assert calls == [{"parallel_dims": "pd", "parallelism": "cfg", "skip_dp": False}]
+    # torchtitan's Trainer initializes after parallelizing: init must see SimpleFSDP's parametrization disabled.
+    model.init_states(buffer_device=None)
+    assert init_flags == [False]
+    assert simple_fsdp._active_parametrization is True
+
+    with pytest.raises(ValueError, match="use_simple_fsdp=True needs a torchtitan TPU recipe"):
+        get_tpu_simple_fsdp_parallelize_fn("deepseek_v3")
+
+
+def test_init_states_without_simple_fsdp_parametrization_is_reentrant():
+    from torchtitan.experiments.graph_trainer import simple_fsdp
+
+    flags = []
+
+    class _Model(torch.nn.Module):
+        def init_states(self, *, buffer_device=None):
+            flags.append(simple_fsdp._active_parametrization)
+
+    model = _Model()
+    init_states_without_simple_fsdp_parametrization(model)
+    model.init_states(buffer_device=None)
+    # A caller that already disabled the parametrization keeps it disabled after init returns.
+    with simple_fsdp.disable_active_parametrization():
+        model.init_states(buffer_device=None)
+        flags.append(simple_fsdp._active_parametrization)
+    assert flags == [False, False, False]
+    assert simple_fsdp._active_parametrization is True
 
 
 def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():

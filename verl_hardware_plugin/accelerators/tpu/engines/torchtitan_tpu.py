@@ -71,9 +71,8 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     extend_torchtitan_engine_config,
-    force_sum_reduction_on_all_fsdp_modules,
     get_tpu_seq_bucket_size,
-    make_simple_fsdp_parallelize_fn,
+    get_tpu_simple_fsdp_parallelize_fn,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
@@ -220,7 +219,7 @@ class TorchTitanTPUEngine(BaseEngine):
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
-                parallelize_fn=make_simple_fsdp_parallelize_fn(model_spec.parallelize_fn),
+                parallelize_fn=get_tpu_simple_fsdp_parallelize_fn(torchtitan_name),
             )
 
         optimizer = OptimizersContainer.Config(
@@ -258,6 +257,7 @@ class TorchTitanTPUEngine(BaseEngine):
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             spmd_backend=self.engine_config.spmd_backend,
+            use_simple_fsdp=self._use_simple_fsdp,
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -325,7 +325,6 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
-        force_sum_reduction_on_all_fsdp_modules(model_parts)
         if self._use_splash_attention:
             apply_splash_attention_tpu(model_parts)
         else:
@@ -451,7 +450,6 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         self._drop_checkpoint_state_dict_cache()
-        force_sum_reduction_on_all_fsdp_modules(self.module)
         if self._use_splash_attention:
             apply_splash_attention_tpu(self.module)
         else:

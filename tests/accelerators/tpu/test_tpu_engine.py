@@ -116,9 +116,9 @@ def test_pad_packed_inputs_for_tpu_skips_mask_and_honors_aligned_length():
 
     assert orig_seq_len == 5
     assert attention_masks is None
-    assert padded_ids.shape == (1, 16)
-    assert padded_pos.shape == (1, 16)
-    assert padded_labels.shape == (1, 16)
+    assert padded_ids.shape == (16,)
+    assert padded_pos.shape == (16,)
+    assert padded_labels.shape == (16,)
 
 
 def test_splash_block_size_for():
@@ -151,8 +151,9 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
     # Idempotent on repeated calls (e.g. __init__ followed by initialize)
     assert apply_splash_attention_tpu([model]) == 0
 
-    q = torch.ones(1, 256, 2, 4)
+    q = torch.ones(256, 2, 4)
     out = model[0].inner_attention(q, q, q)
+    assert out.shape == (256, 2, 4)
     assert torch.allclose(out, q * 3)
 
 
@@ -472,3 +473,38 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, _ppo_micro_batch(lengths, 16))
     assert loss_model_output["log_probs"].values().shape == torch.Size([int(cu_seqlens[-1])])
     assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
+
+
+def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
+    """TorchTitanTPUEngine subclasses BaseEngine directly without importing verl.workers.engine.torchtitan."""
+    from torch.distributed.fsdp import FSDPModule
+
+    from verl.workers.engine.base import BaseEngine
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        derive_torchtitan_name_and_flavor,
+        enable_fsdp_gradient_division,
+    )
+
+    assert issubclass(torchtitan_tpu.TorchTitanTPUEngine, BaseEngine)
+    assert issubclass(torchtitan_tpu.TorchTitanTPUEngineWithLMHead, torchtitan_tpu.TorchTitanTPUEngine)
+    assert "verl.workers.engine.torchtitan" not in open(torchtitan_tpu.__file__).read().split('"""')[-1]
+
+    hf_cfg = SimpleNamespace(
+        model_type="qwen3",
+        hidden_size=1024,
+        num_hidden_layers=28,
+        vocab_size=151936,
+    )
+    fake_cfg = SimpleNamespace(dim=1024, n_layers=28, vocab_size=151936)
+    fake_qwen3 = SimpleNamespace(
+        model_registry=lambda flavor_name: SimpleNamespace(model=fake_cfg),
+        qwen3_configs={"0.6B": fake_cfg},
+    )
+    with mock.patch("importlib.import_module", return_value=fake_qwen3):
+        assert derive_torchtitan_name_and_flavor(hf_cfg) == ("qwen3", "0.6B")
+
+    fsdp_child = mock.MagicMock(spec=FSDPModule)
+    root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
+    enable_fsdp_gradient_division(root, 4)
+    fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)

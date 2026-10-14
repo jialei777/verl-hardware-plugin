@@ -12,9 +12,11 @@ micro-batch shape alignment, and ``DEFER_AND_FUSE`` eager-mode contexts for
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
-from contextlib import contextmanager, nullcontext
+from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -24,6 +26,7 @@ import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
@@ -38,6 +41,121 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 TPU_PADDED_VALUES_ATTR = "_tpu_padded_values"
 
 _DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
+
+_HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
+    "qwen2": "qwen3",
+    "qwen3": "qwen3",
+    "qwen2_moe": "qwen3",
+    "qwen3_moe": "qwen3",
+    "llama": "llama3",
+    "llama4": "llama4",
+    "deepseek_v3": "deepseek_v3",
+    "gpt_oss": "gpt_oss",
+}
+
+
+def create_noop_dataloader_config() -> Any:
+    """Create a no-op TorchTitan ``BaseDataLoader.Config`` when verl manages its own data loading."""
+    from torchtitan.components.data.loader import BaseDataLoader
+
+    class NoOpDataLoader(BaseDataLoader):
+        @dataclass(kw_only=True, slots=True)
+        class Config(BaseDataLoader.Config):
+            pass
+
+        def __init__(self, **kwargs: Any):
+            pass
+
+        def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+            return iter([])
+
+        def state_dict(self) -> dict[str, Any]:
+            return {}
+
+        def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+            pass
+
+    return NoOpDataLoader.Config()
+
+
+def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
+    """Derive TorchTitan model name and flavor from a HuggingFace config."""
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type is None:
+        raise ValueError("HuggingFace config does not have 'model_type' field")
+
+    name = _HF_MODEL_TYPE_TO_TORCHTITAN_NAME.get(model_type)
+    if name is None:
+        raise ValueError(
+            f"Cannot derive torchtitan model name from HF model_type '{model_type}'. "
+            f"Supported types: {list(_HF_MODEL_TYPE_TO_TORCHTITAN_NAME.keys())}."
+        )
+
+    model_module = importlib.import_module(f"torchtitan.models.{name}")
+    model_registry = model_module.model_registry
+
+    flavor_names = None
+    for attr, obj in vars(model_module).items():
+        if attr.endswith("_configs") and isinstance(obj, dict):
+            flavor_names = list(obj.keys())
+            break
+
+    if flavor_names is None:
+        raise ValueError(
+            f"Could not find model configs dict in torchtitan.models.{name}. "
+            f"Expected a dict attribute ending with '_configs'."
+        )
+
+    hidden_size = hf_config.hidden_size
+    num_layers = hf_config.num_hidden_layers
+    vocab_size = hf_config.vocab_size
+
+    for flavor_name in flavor_names:
+        cfg = model_registry(flavor_name).model
+        n_layers = getattr(cfg, "n_layers", None) or len(getattr(cfg, "layers", []))
+        if (
+            getattr(cfg, "dim", None) == hidden_size
+            and n_layers == num_layers
+            and getattr(cfg, "vocab_size", None) == vocab_size
+        ):
+            logger.info(
+                "Auto-derived torchtitan name=%r, flavor=%r from HF model_type=%r",
+                name,
+                flavor_name,
+                model_type,
+            )
+            return name, flavor_name
+
+    raise ValueError(
+        f"No matching torchtitan flavor found for model_type='{model_type}' "
+        f"(hidden_size={hidden_size}, num_hidden_layers={num_layers}, "
+        f"vocab_size={vocab_size}). "
+        f"Available flavors for '{name}': {flavor_names}."
+    )
+
+
+def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
+    """Re-enable FSDP2 gradient division for verl's loss scaling (``loss * dp_size``)."""
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_gradient_divide_factor(float(dp_size))
+
+
+class ContextParallelGather(torch.autograd.Function):
+    """All-gather along dim 0 whose backward keeps only the local slice."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+        ctx.rank = torch.distributed.get_rank(group)
+        ctx.world_size = torch.distributed.get_world_size(group)
+        tensor = tensor.contiguous()
+        gathered = tensor.new_empty((tensor.size(0) * ctx.world_size, *tensor.shape[1:]))
+        torch.distributed.all_gather_into_tensor(gathered, tensor, group=group)
+        return gathered
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):
+        return grad_output.chunk(ctx.world_size, dim=0)[ctx.rank], None
 
 
 def extend_torchtitan_engine_config() -> None:
@@ -362,54 +480,6 @@ def make_simple_fsdp_parallelize_fn(parallelize_fn: Any, *, spmd_safe_blocks: bo
     return _parallelize
 
 
-@contextmanager
-def tpu_torchtitan_config_overrides(*, use_simple_fsdp: bool = False):
-    """Force the TorchTitan config values that differ on TPU during ``TorchTitanEngine.__init__``."""
-    from torchtitan.components.optimizer import OptimizersContainer
-
-    import verl.workers.engine.torchtitan.transformer_impl as tt_impl
-
-    forced: list[tuple[Any, str, Any]] = [
-        (OptimizersContainer, "Config", {"implementation": "foreach"}),
-        (tt_impl, "ParallelismConfig", {"spmd_backend": "default"}),
-        (tt_impl, "CompileConfig", {"backend": "tpu"}),
-        (tt_impl, "TrainingConfig", {"enable_cpu_offload": False}),
-    ]
-
-    saved: list[tuple[Any, str, Any]] = []
-    try:
-        for owner, name, overrides in forced:
-            original = getattr(owner, name)
-            saved.append((owner, name, original))
-
-            def _make(original=original, overrides=overrides):
-                def _construct(*args: Any, **kwargs: Any):
-                    return original(*args, **{**kwargs, **overrides})
-
-                return _construct
-
-            setattr(owner, name, _make())
-
-        if use_simple_fsdp and hasattr(tt_impl, "Trainer") and hasattr(tt_impl.Trainer, "Config"):
-            orig_trainer_cfg_init = tt_impl.Trainer.Config.__init__
-            saved.append((tt_impl.Trainer.Config, "__init__", orig_trainer_cfg_init))
-
-            def _init_trainer_cfg(self_cfg: Any, *args: Any, **kwargs: Any) -> None:
-                orig_trainer_cfg_init(self_cfg, *args, **kwargs)
-                model_spec = getattr(self_cfg, "model_spec", None)
-                if model_spec is not None and hasattr(model_spec, "parallelize_fn"):
-                    model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(
-                        model_spec.parallelize_fn, spmd_safe_blocks=True
-                    )
-
-            tt_impl.Trainer.Config.__init__ = _init_trainer_cfg  # type: ignore[method-assign]
-
-        yield
-    finally:
-        for owner, name, original in saved:
-            setattr(owner, name, original)
-
-
 class TPUVarlenAttention(torch.nn.Module):
     """Packed-document causal attention module for eager TPU execution."""
 
@@ -434,7 +504,11 @@ class TPUVarlenAttention(torch.nn.Module):
                 "attention-sink models (e.g. gpt-oss). Supported models must not set it."
             )
 
-        xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
+        was_3d = q_BLNH.dim() == 3
+        if was_3d:
+            xq, xk, xv = q_BLNH.unsqueeze(0), k_BLNH.unsqueeze(0), v_BLNH.unsqueeze(0)
+        else:
+            xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
 
         # Probe the value, not just the attribute name: a mask object can declare the attribute
         # and still leave it unset, in which case the packed path is not applicable.
@@ -476,16 +550,17 @@ class TPUVarlenAttention(torch.nn.Module):
             v = v.repeat_interleave(num_repeat, dim=1)
 
         attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-        return attn_out.transpose(1, 2)
+        out = attn_out.transpose(1, 2)
+        return out.squeeze(0) if was_3d else out
 
 
 class TPUSplashAttention(torch.nn.Module):
     """TorchTitan inner attention backed by the TPU splash attention Pallas kernel.
 
-    Same contract as ``torchtitan.experiments.tpu.kernels.splash_attention.SplashAttention``
-    ((B, S, H, D) in and out, causal + packed-document masking from ``segment_ids``), but the
-    block sizes are chosen per call from the (static, bucketed) sequence length instead of
-    being fixed at 512. Falls back to the original module if no block size fits.
+    Accepts 3D ``(T, H, D)`` (folded token stream) or 4D ``(B, S, H, D)`` inputs, applying
+    causal + packed-document masking from ``segment_ids``. Block sizes are chosen per call
+    from the (static, bucketed) sequence length instead of being fixed at 512. Falls back
+    to the original module if no block size fits.
     """
 
     def __init__(self, original_module: torch.nn.Module, local_window_size: int | None = None):
@@ -506,7 +581,8 @@ class TPUSplashAttention(torch.nn.Module):
         segment_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        block = splash_block_size_for(int(q.shape[1]))
+        seq_len = int(q.shape[0] if q.dim() == 3 else q.shape[1])
+        block = splash_block_size_for(seq_len)
         if block == 0 or q.device.type == "cpu":
             return self.original_module(
                 q,
@@ -534,6 +610,12 @@ class TPUSplashAttention(torch.nn.Module):
         if segment_ids is None and positions is not None:
             segment_ids = segment_ids_from_positions(positions)
 
+        was_3d = q.dim() == 3
+        if was_3d:
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        if segment_ids is not None and segment_ids.dim() == 1:
+            segment_ids = segment_ids.unsqueeze(0)
+
         out = splash_sdpa(
             q.transpose(1, 2).contiguous(),
             k.transpose(1, 2).contiguous(),
@@ -551,6 +633,8 @@ class TPUSplashAttention(torch.nn.Module):
             block_kv_dkv=block,
             block_kv_dkv_compute=block,
         ).transpose(1, 2)
+        if was_3d:
+            out = out.squeeze(0)
         if q_mesh is not None:
             out = DTensor.from_local(out, q_mesh, q_placements)
         return out
@@ -664,15 +748,12 @@ def pad_packed_inputs_for_tpu(
     from ``positions``) the dense mask is skipped and ``None`` is returned in its place.
     """
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
-    input_ids_cpu = input_ids.values().detach().cpu().unsqueeze(0)
-    if position_ids.dim() == 3:
-        position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(1)
-    else:
-        position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(0)
+    input_ids_cpu = input_ids.values().detach().cpu()
+    position_ids_cpu = position_ids.values().detach().cpu()
 
-    labels_cpu = torch.roll(input_ids_cpu, shifts=-1, dims=1)
+    labels_cpu = torch.roll(input_ids_cpu, shifts=-1, dims=0)
 
-    orig_seq_len = int(input_ids_cpu.shape[1])
+    orig_seq_len = int(input_ids_cpu.shape[-1])
     # tpu_padded_seq_len: common length across ranks from align_micro_batch_shapes_across_ranks (SimpleFSDP).
     padded_seq_len = max(
         bucket_length(orig_seq_len, step),
@@ -680,7 +761,7 @@ def pad_packed_inputs_for_tpu(
     )
     pad_len = padded_seq_len - orig_seq_len
 
-    pos_2d_cpu = position_ids_cpu[0] if position_ids_cpu.dim() == 3 else position_ids_cpu
+    pos_2d_cpu = position_ids_cpu[0].unsqueeze(0) if position_ids_cpu.dim() == 2 else position_ids_cpu.unsqueeze(0)
     if pad_len > 0:
         input_ids_cpu = F.pad(input_ids_cpu, (0, pad_len), value=0)
         labels_cpu = F.pad(labels_cpu, (0, pad_len), value=0)

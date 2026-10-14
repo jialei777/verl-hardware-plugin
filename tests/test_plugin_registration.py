@@ -75,22 +75,10 @@ def _stub_training_engine_runtimes():
     megatron_transformer.MegatronEngineWithLMHead = _StubEngine
     megatron_transformer.MegatronEngineWithValueHead = _StubEngine
 
-    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
-    torchtitan_transformer.TorchTitanEngine = _StubEngine
-    torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
-
-    torchtitan_utils = ModuleType("verl.workers.engine.torchtitan.utils")
-    torchtitan_utils.NoOpDataLoader = mock.MagicMock()
-    torchtitan_utils.derive_torchtitan_name_and_flavor = mock.MagicMock()
-    torchtitan_utils.enable_fsdp_gradient_division = mock.MagicMock()
-    torchtitan_utils.get_attention_masks = mock.MagicMock()
-
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
-        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
-        "verl.workers.engine.torchtitan.utils": torchtitan_utils,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),

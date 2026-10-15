@@ -335,3 +335,69 @@ def test_report_embeds_payload_into_the_page(make_report, tmp_path):
     assert json.loads((tmp_path / "events.json").read_text()) == payload
     with pytest.raises(ValueError):
         make_report.build_html("<html></html>", payload)
+
+
+def _three_steps() -> tuple[list[dict], dict[int, dict[str, float]]]:
+    """Three 10 s steps (start at 100, 110, 120), each ending with a 1 s weight sync."""
+    events = [
+        {"ph": "M", "name": "rollout_replica", "group": "rollout_replica_0", "lane": "meta", "ts": 50.0},
+        {"ph": "i", "name": "weights", "group": "rollout_replica_0", "lane": "server", "ts": 99.0, "args": {"wv": 0}},
+    ]
+    metrics = {}
+    for step in (1, 2, 3):
+        t0 = 100.0 + 10 * (step - 1)
+        events.append(
+            {"name": "update_weights", "group": "trainer", "lane": "loop", "ts": t0 + 9, "dur": 1.0, "step": step}
+        )
+        events.append({"name": "update_actor", "group": "trainer_workers", "lane": "rank0", "ts": t0 + 4, "dur": 5.0})
+        events.append(
+            {
+                "ph": "i",
+                "name": "weights",
+                "group": "rollout_replica_0",
+                "lane": "server",
+                "ts": t0 + 9.9,
+                "args": {"wv": step},
+            }
+        )
+        metrics[step] = {"timing_s/step": 10.0, "timing_s/update_weights": 1.0}
+    # a request that runs from step 1 into step 2: admitted at 105, first token at 108, done at 115
+    events.append(
+        {
+            "name": "request",
+            "group": "rollout_replica_0",
+            "lane": "requests",
+            "ts": 104.0,
+            "dur": 11.0,
+            "args": {"admit": 1.0, "first": 4.0, "out": 10, "stop": "stop", "wv": 0},
+        }
+    )
+    return events, metrics
+
+
+@pytest.mark.parametrize(("text", "expected"), [("10-20", (10, 20)), ("10:20", (10, 20)), ("15", (15, 15))])
+def test_report_parses_step_ranges(make_report, text, expected):
+    assert make_report.parse_step_range(text) == expected
+    with pytest.raises(ValueError):
+        make_report.parse_step_range("20-10")
+
+
+def test_report_selects_a_step_range(make_report):
+    events, metrics = _three_steps()
+    selected, kept = make_report.select_steps(events, metrics, 2, 3)
+    assert sorted(kept) == [2, 3]
+    names = sorted((e["name"], e.get("step")) for e in selected if e.get("group") == "trainer")
+    assert names == [("update_weights", 2), ("update_weights", 3)]  # step 1's sync is outside the window
+    assert sum(e["name"] == "update_actor" for e in selected) == 2
+    (request,) = [e for e in selected if e["name"] == "request"]
+    # clipped to the window start (110): admit (105) and first token (108) are before it, the end stays at 115
+    assert (request["ts"], request["dur"]) == (110.0, 5.0)
+    assert request["args"] == {"admit": 0.0, "first": 0.0, "out": 10, "stop": "stop", "wv": 0, "clipped": True}
+    weights = sorted((e["ts"], e["args"]["wv"]) for e in selected if e["name"] == "weights")
+    assert weights == [(110.0, 1), (119.9, 2), (129.9, 3)]  # the version served at the window start is carried over
+    (meta,) = [e for e in selected if e.get("ph") == "M"]
+    assert meta["ts"] == 110.0
+    summary = make_report.text_summary(selected, kept)
+    assert [line.split()[0] for line in summary.splitlines()[1:3]] == ["2", "3"]
+    with pytest.raises(ValueError, match="not in the log"):
+        make_report.select_steps(events, metrics, 3, 4)

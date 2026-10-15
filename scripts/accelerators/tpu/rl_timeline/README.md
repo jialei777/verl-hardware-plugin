@@ -46,7 +46,8 @@ python3 scripts/accelerators/tpu/rl_timeline/make_report.py job.log -o report.ht
 ```
 
 `report.html` is self-contained (open it from disk or share it). `index.html` alone also works: open it and drop a job
-log on it. `--summary` prints the per-step table as text.
+log on it. `--summary` prints the per-step table as text. `--steps 10-20` keeps only those steps (their metrics and
+what happened in their time window), e.g. to look at the steady state past compilation and warm-up.
 
 Mouse wheel zooms, drag pans, drag on the time axis zooms to a range, double-click fits, click a step label (or a row
 of the step table) to zoom to one step, arrow keys move between steps; `report.html#steps=3-5` (or `#step=4`) opens

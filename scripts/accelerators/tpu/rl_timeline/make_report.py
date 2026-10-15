@@ -15,6 +15,8 @@ Examples::
     # fetch the log from a Ray dashboard first (e.g. a kubectl port-forward of the head service):
     python3 scripts/accelerators/tpu/rl_timeline/make_report.py --ray-address http://localhost:8265 \\
         --job <submission-id> --save-log job.log -o report.html --summary
+    # only steps 10-20 (e.g. past compilation and warm-up):
+    python3 scripts/accelerators/tpu/rl_timeline/make_report.py job.log --steps 10-20 -o report.html --summary
 
 ``--summary`` prints, for every step, where the trainer loop spends its time, what trainer rank 0 runs on its chips
 (actor update, reference forward, weight sync, idle) and what the rollout replicas do (generating, draining for a
@@ -179,6 +181,63 @@ def step_windows(events: list[dict], metrics: dict[int, dict[str, float]]) -> li
     return steps
 
 
+def parse_step_range(text: str) -> tuple[int, int]:
+    """``"10-20"`` (or ``"10:20"``, ``"15"``) -> ``(first, last)``."""
+    first, sep, last = text.replace(":", "-").partition("-")
+    first_step, last_step = int(first), int(last) if sep else int(first)
+    if last_step < first_step:
+        raise ValueError(f"empty step range {text!r}")
+    return first_step, last_step
+
+
+def select_steps(
+    events: list[dict], metrics: dict[int, dict[str, float]], first: int, last: int
+) -> tuple[list[dict], dict[int, dict[str, float]]]:
+    """Keep only steps ``first``..``last``: their metrics and the events inside their wall-clock window.
+
+    The window runs from the start of step ``first`` to the start of the step after ``last`` (or the end of ``last``).
+    Spans crossing its edges are clipped to it; a request clipped at the start keeps its gate-wait / first-token
+    offsets relative to the new start. Replica metadata is kept, and the weight version a replica serves when the
+    window opens is carried over as a ``weights`` instant at the window start.
+    """
+    windows = {w["step"]: w for w in step_windows(events, metrics)}
+    if first not in windows or last not in windows:
+        raise ValueError(f"steps {first}-{last} not in the log; steps with a weight-sync anchor: {sorted(windows)}")
+    w0, w1 = windows[first]["t0"], windows[last]["t_next"]
+    selected: list[dict] = []
+    weights_before: dict[str, dict] = {}  # group -> last "weights" instant before the window
+    for e in events:
+        ph, ts = e.get("ph", "X"), e.get("ts")
+        if ph == "M":  # the replica is up (at the latest) when the window opens
+            selected.append({**e, "ts": round(max(ts, w0), 6)} if ts is not None else e)
+            continue
+        if ts is None:
+            continue
+        if ph == "i":
+            if w0 <= ts <= w1:
+                selected.append(e)
+            elif ts < w0 and e.get("name") == "weights":
+                prev = weights_before.get(e.get("group"))
+                if prev is None or ts > prev["ts"]:
+                    weights_before[e.get("group")] = e
+            continue
+        end = ts + e.get("dur", 0.0)
+        if (end <= w0 or ts >= w1) if end > ts else not w0 <= ts <= w1:  # no overlap with the window
+            continue
+        if w0 <= ts and end <= w1:
+            selected.append(e)
+            continue
+        start, stop = max(ts, w0), min(end, w1)
+        args = dict(e.get("args") or {})
+        for key in ("admit", "first"):  # offsets from the span start
+            if key in args:
+                args[key] = round(max(0.0, args[key] - (start - ts)), 4)
+        args["clipped"] = True
+        selected.append({**e, "ts": round(start, 6), "dur": round(stop - start, 6), "args": args})
+    selected += [{**e, "ts": round(w0, 6)} for e in weights_before.values()]
+    return selected, {k: v for k, v in metrics.items() if first <= k <= last}
+
+
 def sampler_intervals(events: list[dict], group: str) -> dict[str, Intervals]:
     """Generating / draining / paused intervals of one rollout replica (same rules as the page's ``state`` row).
 
@@ -297,6 +356,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--title", help="source name shown in the report (default: log file name / job id)")
     ap.add_argument("--save-log", help="also write the fetched log here (with --ray-address)")
     ap.add_argument("--save-events", help="also write the extracted events and metrics here (JSON)")
+    ap.add_argument(
+        "--steps", help="only keep these steps, e.g. 10-20: their metrics and what happened in their time window"
+    )
     ap.add_argument("--summary", action="store_true", help="print a per-step text summary")
     args = ap.parse_args(argv)
     if not args.output and not args.summary and not args.save_events:
@@ -318,6 +380,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         ap.error("give a log file or --ray-address/--job")
 
+    if args.steps:
+        first, last = parse_step_range(args.steps)
+        events, metrics = select_steps(events, metrics, first, last)
+        source += f" (steps {first}-{last})"
     payload = {"source": args.title or source, "events": events, "metrics": metrics}
     if args.save_events:
         with open(args.save_events, "w") as f:

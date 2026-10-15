@@ -14,6 +14,8 @@ and changes only what TPU needs:
   mode.
 * With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the Raiden worker extension
   (``tpu_raiden.py``), which receives the trainer's weights over the network.
+* With ``VERL_TIMELINE=1``, the server prints its requests, gate drain, engine pause and weight-sync
+  RPCs for the RL timeline report (``tpu_vllm_timeline.py``).
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
@@ -27,6 +29,7 @@ from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
+from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_timeline import vLLMServerTimelineMixin
 
 # vLLM imports the worker extension by name in its worker processes.
 RAIDEN_WORKER_EXTENSION_CLS = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden.vLLMRaidenWorkerExtension"
@@ -106,8 +109,8 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     )
 
 
-class TPUvLLMHttpServer(vLLMHttpServer):
-    """``vLLMHttpServer`` with the TPU engine arguments."""
+class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
+    """``vLLMHttpServer`` with the TPU engine arguments (and ``VERL_TIMELINE`` prints, see ``tpu_vllm_timeline``)."""
 
     def __init__(self, *args, **kwargs):
         # This actor builds the vLLM engine and starts its EngineCore process, so patch vLLM before

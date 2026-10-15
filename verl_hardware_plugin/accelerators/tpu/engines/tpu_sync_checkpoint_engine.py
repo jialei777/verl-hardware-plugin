@@ -40,6 +40,7 @@ import ray
 import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
+from verl_hardware_plugin.accelerators.tpu import timeline
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import TPU_SYNC_BACKEND
@@ -346,6 +347,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
         """
         step_key = global_steps if global_steps is not None else 0
         logger.info(f"RaidenCheckpointEngine: [Step {step_key}] Start send_weights...")
+        timeline_lane = timeline.trainer_lane()
+        t_start = time.time()
         tpu_synchronize(strict=True)
 
         # Materialize weights in a single pass and filter tied embeddings
@@ -361,6 +364,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device(RAIDEN_DEVICE))
 
         tpu_synchronize(strict=True)
+        t_gathered = time.time()
 
         # Reuse the synchronizer when the tensor signature is unchanged: rebinding keeps the pinned host staging
         # buffers, listener threads and controller registration, and only swaps the device buffers the D2H reads
@@ -377,11 +381,27 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         # Stage weights to host buffer via D2H DMA
         t_d2h_start = time.perf_counter()
+        t_bound = time.time()
         self._trainer_raiden_ws.d2h()
         t_d2h = time.perf_counter() - t_d2h_start
         logger.info(
             f"[RAIDEN TELEMETRY | Trainer Worker] Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s"
         )
+        if timeline_lane is not None:
+            t_end = time.time()
+            group, lane = timeline.TRAINER_WORKERS, timeline_lane
+            timeline.emit(
+                "update_weights",
+                t_start,
+                t_end - t_start,
+                group=group,
+                lane=lane,
+                step=step_key,
+                tensors=len(signature),
+            )
+            timeline.emit("gather", t_start, t_gathered - t_start, group=group, lane=lane, step=step_key)
+            timeline.emit("bind", t_gathered, t_bound - t_gathered, group=group, lane=lane, step=step_key)
+            timeline.emit("d2h", t_bound, t_end - t_bound, group=group, lane=lane, step=step_key)
 
         # Compute deterministic stats & norms across all sent tensors on rank 0 only: every rank holds the
         # full model.
@@ -502,6 +522,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
         """
         if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
+        t_start = time.time()
         if hasattr(self._trainer_raiden_ws, "unbind_weights"):
             self._trainer_raiden_ws.unbind_weights()
             self._bound_tensors = None
@@ -519,6 +540,11 @@ class RaidenCheckpointEngine(CheckpointEngine):
         # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
         # TPU runtime reuses freed HBM without it.
         tpu_synchronize()
+        timeline_lane = timeline.trainer_lane()
+        if timeline_lane is not None:
+            timeline.emit(
+                "release_raiden", t_start, time.time() - t_start, group=timeline.TRAINER_WORKERS, lane=timeline_lane
+            )
         return {}
 
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs: Any):
@@ -611,6 +637,8 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
         )
     controller = _get_or_start_controller(manager)
 
+    # Offset from the perf_counter clock of the phase timers to wall-clock time, for the timeline prints.
+    wall_minus_perf = time.time() - time.perf_counter()
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -707,11 +735,13 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
     t_total = time.perf_counter() - t_total_start
 
     # 6. Parity verification (optional, default off).
+    t_parity_start = time.perf_counter()
     if verify_parity:
         try:
             await _verify_parity_async(manager, global_steps)
         except Exception as e:
             logger.warning(f"Failed to execute parity verification: {e}")
+    t_parity = time.perf_counter() - t_parity_start
 
     logger.info(
         f"[RAIDEN TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
@@ -725,7 +755,30 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
     )
 
     # 7. Resume generation immediately
+    t_resume_start = time.perf_counter()
     await manager.resume_generation_replicas()
+    t_resume = time.perf_counter() - t_resume_start
+
+    if timeline.enabled():
+        # The trainer loop's view of the sync, with the step number: the timeline report anchors the step's other
+        # phases (rebuilt from the timing_s/* metrics) at this update_weights span.
+        phases = [
+            ("sync.quiesce", t_abort_start, t_abort if global_steps else 0.0),  # nothing to abort before step 1
+            ("sync.trainer_send", t_init_trainer_start, t_init_trainer),
+            ("sync.sampler_init", t_init_sampler_start, t_init_sampler),
+            ("sync.barrier", t_barrier_start, t_barrier),
+            ("sync.p2p_transfer", t_transfer_start, t_transfer),
+            ("sync.sampler_install", t_install_start, t_install),
+            ("sync.finalize", t_install_start + t_install, t_total_start + t_total - t_install_start - t_install),
+            ("sync.parity_check", t_parity_start, t_parity if verify_parity else 0.0),
+            ("sync.resume", t_resume_start, t_resume),
+        ]
+        name = "update_weights" if global_steps else "initial_weight_sync"
+        t_sync_end = t_resume_start + t_resume
+        timeline.emit(name, t_abort_start + wall_minus_perf, t_sync_end - t_abort_start, step=global_steps)
+        for phase, start, duration in phases:
+            if duration > 0:
+                timeline.emit(phase, start + wall_minus_perf, duration, step=global_steps)
 
     # Surface the phase timers as step metrics. Trainers that record sync metrics (e.g. the separate-async
     # trainer's _pending_sync_metrics) log them next to timing_s/update_weights with every configured

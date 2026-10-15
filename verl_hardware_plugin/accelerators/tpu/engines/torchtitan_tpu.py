@@ -27,6 +27,7 @@ import importlib
 import logging
 import os
 import re
+import time
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
@@ -59,6 +60,7 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
+from verl_hardware_plugin.accelerators.tpu import timeline
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -508,8 +510,21 @@ class TorchTitanTPUEngine(BaseEngine):
             gathered = gathered[load_balancer._generate_indices(restore=True)[0]]
         return gathered
 
+    def train_batch(self, data: TensorDict, loss_function: Callable):
+        """``BaseEngine.train_batch`` (forward/backward, optimizer step), printed as an ``update_actor`` span."""
+        with timeline.span("update_actor", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            return super().train_batch(data, loss_function)
+
+    def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None):
+        """``BaseEngine.infer_batch``, printed as ``compute_ref_log_prob`` (reference) or ``compute_log_prob`` span."""
+        name = "compute_ref_log_prob" if self.engine_config.forward_only else "compute_log_prob"
+        with timeline.span(name, group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            return super().infer_batch(data, loss_function)
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
+        timeline_lane = None if forward_only else timeline.trainer_lane()
+        t_start = time.time()
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
 
         dp_group = self.get_data_parallel_group()
@@ -547,6 +562,16 @@ class TorchTitanTPUEngine(BaseEngine):
                         del loss
                 output_lst.append(output)
 
+        if timeline_lane is not None:
+            timeline.emit(
+                "fwd_bwd",
+                t_start,
+                time.time() - t_start,
+                group=timeline.TRAINER_WORKERS,
+                lane=timeline_lane,
+                micro_batches=len(micro_batches),
+                loss_tokens=batch_num_tokens,
+            )
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def model_forward_step(
@@ -583,6 +608,8 @@ class TorchTitanTPUEngine(BaseEngine):
         """Clip gradients using the per-tensor norm path (``foreach=False``) and step the optimizer."""
         from torchtitan.distributed import utils as dist_utils
 
+        timeline_lane = timeline.trainer_lane()
+        t_start = time.time()
         with tpu_eager_mode_context(self._tpu_eager_mode):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.module for p in m.parameters()],
@@ -598,7 +625,13 @@ class TorchTitanTPUEngine(BaseEngine):
             else:
                 self.optimizer.step()
 
-            return grad_norm.item()
+            grad_norm_value = grad_norm.item()
+
+        if timeline_lane is not None:
+            timeline.emit(
+                "optimizer_step", t_start, time.time() - t_start, group=timeline.TRAINER_WORKERS, lane=timeline_lane
+            )
+        return grad_norm_value
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""

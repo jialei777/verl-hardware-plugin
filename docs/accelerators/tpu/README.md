@@ -14,6 +14,7 @@ engines that send the trainer's weights to it (`ray-plasma-store` and `tpu-sync`
 ```text
 verl_hardware_plugin/accelerators/tpu/
 ├── platform_tpu.py                  # TPU platform settings
+├── timeline.py                      # Opt-in VERL_TIMELINE prints for the RL timeline report
 ├── engines/
 │   ├── ray_weight_registry.py        # Ray actor where trainer and rollout exchange weight-sync metadata
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
@@ -24,7 +25,8 @@ verl_hardware_plugin/accelerators/tpu/
 └── rollout/
     ├── tpu_raiden.py                 # vLLM worker extension that receives Raiden weight syncs
     ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
-    └── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+    ├── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+    └── tpu_vllm_timeline.py          # VERL_TIMELINE prints of the vLLM rollout server
 ```
 
 ```text
@@ -34,6 +36,8 @@ docs/accelerators/tpu/
 ├── quick_start.md                    # Selecting and verifying the platform
 ├── rollout.md                        # Running the vLLM rollout on TPU
 └── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
+
+scripts/accelerators/tpu/rl_timeline/ # RL timeline report: what the trainer and rollout chips do in every step
 ```
 
 ## Getting Started
@@ -42,6 +46,9 @@ docs/accelerators/tpu/
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
 - [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
+- [RL timeline](../../../scripts/accelerators/tpu/rl_timeline/README.md) — with `VERL_TIMELINE=1`, see per step what
+  the trainer chips (actor update, reference forward, weight sync) and the rollout chips (generation, weight sync) do
+  and how they overlap
 - [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
 
 ## Platform Summary

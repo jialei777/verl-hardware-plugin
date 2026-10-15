@@ -13,6 +13,7 @@ around the real ``RayWeightRegistryState``.
 import asyncio
 import importlib
 import itertools
+import json
 import logging
 import sys
 import threading
@@ -931,6 +932,43 @@ def test_update_raiden_weights_requires_single_replica(fake_tpu_sync):
     with pytest.raises(NotImplementedError, match="single rollout replica"):
         asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
     assert fake_tpu_sync.servers_started == 0
+
+
+def test_update_raiden_weights_prints_timeline(fake_tpu_sync, tpu_raiden, monkeypatch, capsys):
+    monkeypatch.setenv("VERL_TIMELINE", "1")
+    monkeypatch.setenv("VERL_TIMELINE_RANKS", "0")
+    monkeypatch.delenv("RANK", raising=False)
+    tp = 2
+    weights = _trainer_weights(seed=0)
+    engines = [_trainer_engine(rank) for rank in range(2)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    manager, _ = _make_manager(engines, lambda rank: iter(weights.items()), samplers, [])
+    for step in (0, 1):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=step))
+    marker = "VERL_TIMELINE"
+    events = [
+        json.loads(line[len(marker) :]) for line in capsys.readouterr().out.splitlines() if line.startswith(marker)
+    ]
+
+    # The driver prints the trainer loop's view of every sync, with the step number.
+    loop = {(e["step"], e["name"]): e for e in events if e["group"] == "trainer"}
+    phases = ["sync.trainer_send", "sync.sampler_init", "sync.p2p_transfer", "sync.sampler_install", "sync.resume"]
+    assert {name for step, name in loop if step == 0} >= {"initial_weight_sync", *phases}
+    assert (0, "sync.quiesce") not in loop and (0, "update_weights") not in loop  # nothing to abort before step 1
+    assert {name for step, name in loop if step == 1} >= {"update_weights", "sync.quiesce", *phases}
+    sync = loop[(1, "update_weights")]
+    for (step, name), e in loop.items():
+        if step == 1 and name.startswith("sync."):
+            assert sync["ts"] - 1e-3 <= e["ts"] and e["ts"] + e["dur"] <= sync["ts"] + sync["dur"] + 1e-3, name
+    assert sync["ts"] + sync["dur"] == pytest.approx(loop[(1, "sync.resume")]["ts"] + loop[(1, "sync.resume")]["dur"])
+
+    # Every trainer rank in VERL_TIMELINE_RANKS prints its side of the sync (in this test every engine is rank 0).
+    workers = [e for e in events if e["group"] == "trainer_workers"]
+    assert {e["lane"] for e in workers} == {"rank0"}
+    sends = [e for e in workers if e["name"] == "update_weights"]
+    assert [e["step"] for e in sends] == [0, 0, 1, 1] and all(e["args"]["tensors"] > 0 for e in sends)
+    for name in ("gather", "bind", "d2h", "release_raiden"):
+        assert sum(e["name"] == name for e in workers) == 4, name
 
 
 def test_wait_for_registration_times_out():

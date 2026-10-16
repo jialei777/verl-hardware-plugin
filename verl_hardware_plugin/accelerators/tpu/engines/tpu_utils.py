@@ -482,6 +482,108 @@ def tpu_eager_mode_context(mode: Optional[str]):
         return nullcontext()
 
 
+@torch.no_grad()
+def offload_tpu_model_to_cpu(
+    module: nn.Module,
+    *,
+    cache_cpu_copy: bool = False,
+    include_grad: bool = True,
+) -> None:
+    """Offload ``module`` parameters (and optionally gradients) to CPU without altering ``DTensor`` mesh specs.
+
+    Updating ``p._local_tensor`` in-place preserves the ``DTensor`` wrapper and its ``DeviceMesh("tpu", ...)``
+    placement spec, avoiding ``SimpleFSDP`` property getters and preventing ``torch.compile(backend="tpu")``
+    guard invalidation. When ``cache_cpu_copy=True`` (for frozen ``forward_only`` reference models whose weights
+    never mutate after checkpoint load), the CPU shard is cached on the parameter on first offload and reused on
+    subsequent steps without repeating Device-to-Host transfers.
+    """
+    memo: dict[int, torch.Tensor] = {}
+    for p in module.parameters():
+        if isinstance(p, DTensor):
+            local = p._local_tensor
+            if cache_cpu_copy:
+                cpu_tensor = getattr(p, "_tpu_cpu_offload_tensor", None)
+                if cpu_tensor is None:
+                    if local.device.type == "cpu":
+                        cpu_tensor = local
+                    else:
+                        cpu_tensor = memo.get(id(local))
+                        if cpu_tensor is None:
+                            cpu_tensor = local.to("cpu", non_blocking=False)
+                            memo[id(local)] = cpu_tensor
+                    p._tpu_cpu_offload_tensor = cpu_tensor
+                p._local_tensor = cpu_tensor
+            elif local.device.type != "cpu":
+                cpu_tensor = memo.get(id(local))
+                if cpu_tensor is None:
+                    cpu_tensor = local.to("cpu", non_blocking=False)
+                    memo[id(local)] = cpu_tensor
+                p._local_tensor = cpu_tensor
+        else:
+            data = p.data
+            if cache_cpu_copy:
+                cpu_tensor = getattr(p, "_tpu_cpu_offload_tensor", None)
+                if cpu_tensor is None:
+                    if data.device.type == "cpu":
+                        cpu_tensor = data
+                    else:
+                        cpu_tensor = memo.get(id(data))
+                        if cpu_tensor is None:
+                            cpu_tensor = data.to("cpu", non_blocking=False)
+                            memo[id(data)] = cpu_tensor
+                    p._tpu_cpu_offload_tensor = cpu_tensor
+                p.data = cpu_tensor
+            elif data.device.type != "cpu":
+                cpu_tensor = memo.get(id(data))
+                if cpu_tensor is None:
+                    cpu_tensor = data.to("cpu", non_blocking=False)
+                    memo[id(data)] = cpu_tensor
+                p.data = cpu_tensor
+
+        if include_grad and p.grad is not None:
+            if isinstance(p.grad, DTensor):
+                if p.grad._local_tensor.device.type != "cpu":
+                    p.grad._local_tensor = p.grad._local_tensor.to("cpu", non_blocking=False)
+            elif p.grad.device.type != "cpu":
+                p.grad = p.grad.to("cpu", non_blocking=False)
+
+
+@torch.no_grad()
+def load_tpu_model_to_device(
+    module: nn.Module,
+    device: torch.device | str,
+    *,
+    include_grad: bool = True,
+) -> None:
+    """Reload ``module`` parameters (and optionally gradients) from CPU to ``device`` in-place on ``DTensor``s."""
+    target_device = torch.device(device)
+    memo: dict[int, torch.Tensor] = {}
+    for p in module.parameters():
+        if isinstance(p, DTensor):
+            local = p._local_tensor
+            if local.device.type != target_device.type:
+                dev_tensor = memo.get(id(local))
+                if dev_tensor is None:
+                    dev_tensor = local.to(target_device, non_blocking=True)
+                    memo[id(local)] = dev_tensor
+                p._local_tensor = dev_tensor
+        else:
+            data = p.data
+            if data.device.type != target_device.type:
+                dev_tensor = memo.get(id(data))
+                if dev_tensor is None:
+                    dev_tensor = data.to(target_device, non_blocking=True)
+                    memo[id(data)] = dev_tensor
+                p.data = dev_tensor
+
+        if include_grad and p.grad is not None:
+            if isinstance(p.grad, DTensor):
+                if p.grad._local_tensor.device.type != target_device.type:
+                    p.grad._local_tensor = p.grad._local_tensor.to(target_device, non_blocking=True)
+            elif p.grad.device.type != target_device.type:
+                p.grad = p.grad.to(target_device, non_blocking=True)
+
+
 def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: int) -> Any:
     """Compute the global batch token count for loss normalization on TPU via CPU all-reduce."""
     batch_num_tokens = data["loss_mask"].sum().cpu()

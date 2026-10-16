@@ -23,6 +23,7 @@ decoupled from core verl's GPU TorchTitan engine:
 from __future__ import annotations
 
 import dataclasses
+import gc
 import importlib
 import logging
 import os
@@ -44,9 +45,7 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import (
-    load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
 from verl.utils.model import extract_multi_modal_inputs
@@ -74,6 +73,8 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     fused_linear_logprobs_tpu,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
+    load_tpu_model_to_device,
+    offload_tpu_model_to_cpu,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
@@ -225,8 +226,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 parallelize_fn=get_tpu_simple_fsdp_parallelize_fn(torchtitan_name),
             )
 
+        optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", "fused")
         optimizer = OptimizersContainer.Config(
-            implementation="foreach",
+            implementation=optim_impl,
             param_groups=[
                 ParamGroupConfig(
                     pattern=r".*",
@@ -361,8 +363,11 @@ class TorchTitanTPUEngine(BaseEngine):
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
-        # set FSDP offload params
-        self._is_offload_param = self.engine_config.param_offload
+        # set FSDP offload params (mirror GPU TorchTitanEngine by offloading forward_only reference models by default)
+        ref_offload = self.engine_config.forward_only and os.environ.get("VERL_TPU_REF_OFFLOAD", "1") != "0"
+        self._is_offload_param = bool(
+            self.engine_config.param_offload or self.engine_config.offload_policy or ref_offload
+        )
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
 
@@ -451,6 +456,7 @@ class TorchTitanTPUEngine(BaseEngine):
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
+        tpu_synchronize(wait=True)
 
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
@@ -618,6 +624,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+                if os.environ.get("VERL_TPU_OPTIM_SYNC_ZERO", "1") != "0":
+                    self.optimizer.zero_grad()
+                    tpu_synchronize(wait=True)
 
             return grad_norm.item()
 
@@ -631,25 +640,31 @@ class TorchTitanTPUEngine(BaseEngine):
         """Move model and/or optimizer to CPU or accelerator."""
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
-        if self.engine_config.forward_only:
-            return
-
         device_name = get_device_name()
         assert device in (device_name, "cpu")
-        if device == device_name:
-            if model:
-                for module in self.module:
-                    load_fsdp_model_to_gpu(module)
-            if optimizer and self.optimizer is not None:
-                load_fsdp_optimizer(self.optimizer, device)
-        elif device == "cpu":
-            if model:
-                for module in self.module:
-                    offload_fsdp_model_to_cpu(module)
-            if optimizer and self.optimizer is not None:
-                offload_fsdp_optimizer(self.optimizer)
-        else:
-            raise ValueError(f"Invalid device type: {device}")
+        with tpu_eager_mode_context(self._tpu_eager_mode):
+            if device == device_name:
+                target_device = torch.device(f"{device_name}:{get_device_id()}")
+                if model:
+                    for module in self.module:
+                        load_tpu_model_to_device(module, target_device, include_grad=grad)
+                if not self.engine_config.forward_only and optimizer and self.optimizer is not None:
+                    load_fsdp_optimizer(self.optimizer, target_device)
+            elif device == "cpu":
+                if model:
+                    for module in self.module:
+                        offload_tpu_model_to_cpu(
+                            module,
+                            cache_cpu_copy=bool(self.engine_config.forward_only),
+                            include_grad=grad,
+                        )
+                if not self.engine_config.forward_only and optimizer and self.optimizer is not None:
+                    offload_fsdp_optimizer(self.optimizer)
+                if model or optimizer:
+                    gc.collect()
+                    tpu_synchronize(wait=True)
+            else:
+                raise ValueError(f"Invalid device type: {device}")
 
     def save_checkpoint(
         self,
@@ -661,8 +676,7 @@ class TorchTitanTPUEngine(BaseEngine):
     ) -> None:
         """Save checkpoint."""
         if self._is_offload_param:
-            for module in self.module:
-                load_fsdp_model_to_gpu(module)
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
@@ -675,16 +689,14 @@ class TorchTitanTPUEngine(BaseEngine):
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
         """Load checkpoint."""
         if self._is_offload_param:
-            for module in self.module:
-                load_fsdp_model_to_gpu(module)
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
@@ -698,13 +710,17 @@ class TorchTitanTPUEngine(BaseEngine):
         else:
             # Fallback to latest
             self.checkpointer.load(step=-1)
+        for module in self.module:
+            for p in module.parameters():
+                if hasattr(p, "_tpu_cpu_offload_tensor"):
+                    delattr(p, "_tpu_cpu_offload_tensor")
+        tpu_synchronize(wait=True)
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and self.optimizer is not None:
             offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -809,16 +825,15 @@ class TorchTitanTPUEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         """Yield HF-named parameters cast to ``bfloat16`` before ``DTensor.full_tensor()`` all-gather."""
-        for module in self.module:
-            load_fsdp_model_to_gpu(module)
+        if self._is_offload_param:
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         params = {}
         for module in self.module:
             params.update(module.state_dict())
 
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
         stacks = {}
         for name, param in params.items():

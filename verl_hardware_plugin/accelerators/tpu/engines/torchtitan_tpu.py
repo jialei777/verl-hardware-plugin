@@ -281,13 +281,6 @@ class TorchTitanTPUEngine(BaseEngine):
             "enable_cpu_offload": False,
             "disable_cuda_graphs": True,
         }
-        mp_reduce = (
-            os.environ.get("VERL_TPU_MIXED_PRECISION_REDUCE")
-            or getattr(self.engine_config, "mixed_precision_reduce", None)
-            or "bfloat16"
-        )
-        if mp_reduce in ("bfloat16", "float32"):
-            training_kwargs["mixed_precision_reduce"] = mp_reduce
         if self.engine_config.forward_only:
             engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
             if engine_dtype in ("bfloat16", "float32"):

@@ -215,7 +215,6 @@ def extend_torchtitan_engine_config() -> None:
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
         ("use_fused_linear_cross_entropy", Optional[bool], None),
-        ("mixed_precision_reduce", Optional[str], None),
         ("tpu_eager_mode", Optional[str], None),
         ("pad_to_length", bool, False),
         ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),

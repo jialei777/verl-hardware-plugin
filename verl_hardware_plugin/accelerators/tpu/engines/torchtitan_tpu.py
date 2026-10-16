@@ -71,12 +71,14 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     extend_torchtitan_engine_config,
+    fused_linear_logprobs_tpu,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
+    resolve_tpu_use_fused_linear_cross_entropy,
     tpu_eager_mode_context,
     tpu_synchronize,
     unwrap_metadata,
@@ -202,6 +204,7 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
+        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
@@ -273,6 +276,17 @@ class TorchTitanTPUEngine(BaseEngine):
             "enable_cpu_offload": False,
             "disable_cuda_graphs": True,
         }
+        mp_reduce = (
+            os.environ.get("VERL_TPU_MIXED_PRECISION_REDUCE")
+            or getattr(self.engine_config, "mixed_precision_reduce", None)
+            or "bfloat16"
+        )
+        if mp_reduce in ("bfloat16", "float32"):
+            training_kwargs["mixed_precision_reduce"] = mp_reduce
+        if self.engine_config.forward_only:
+            engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
+            if engine_dtype in ("bfloat16", "float32"):
+                training_kwargs["dtype"] = engine_dtype
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
         training = TrainingConfig(**training_kwargs)
@@ -312,6 +326,11 @@ class TorchTitanTPUEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        if self._use_fused_linear_cross_entropy and hasattr(self.config, "override"):
+            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
+
+            if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+                self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
@@ -568,6 +587,8 @@ class TorchTitanTPUEngine(BaseEngine):
         # Non-PP forward. train_context (SPMD mesh) is set by the caller.
         assert len(model_parts) == 1
         pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
+        if isinstance(pred, tuple):
+            return tuple(p.full_tensor() if isinstance(p, DTensor) else p for p in pred)
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
         return pred
@@ -811,11 +832,22 @@ class TorchTitanTPUEngine(BaseEngine):
         device = get_device_id()
 
         def _gen():
-            for name, param in dense.items():
+            gathered_tied: dict[int, torch.Tensor] = {}
+            for name in list(dense.keys()):
+                param = dense.pop(name)
                 if isinstance(param, DTensor):
-                    yield name, param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                    pid = id(param)
+                    full = gathered_tied.get(pid)
+                    if full is None:
+                        full = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                        if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                            gathered_tied[pid] = full
+                    yield name, full
+                    del full
                 else:
                     yield name, param.to(torch.bfloat16, non_blocking=True)
+                del param
+            gathered_tied.clear()
             for stack, slots in expert_stacks:
                 full = stack.to(device, non_blocking=True)
                 if isinstance(full, DTensor):
@@ -951,6 +983,31 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
+        if isinstance(logits, tuple):
+            hidden_states, lm_head_weight_t = logits
+            if use_remove_padding and not calculate_entropy and not self.parallel_dims.tp_enabled:
+                if labels.dim() > 1:
+                    labels = labels.squeeze(0)
+                hidden_rmpad = hidden_states.squeeze(0) if hidden_states.dim() > 2 else hidden_states
+                log_probs = fused_linear_logprobs_tpu(
+                    hidden_rmpad,
+                    labels,
+                    lm_head_weight_t,
+                    temperature=temperature,
+                )
+                padded_log_probs = log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs
+                orig_seq_len = output_args.get("orig_seq_len")
+                if orig_seq_len is not None:
+                    cu_seqlens_cpu = cu_seqlens.detach().cpu()
+                    unpadded_log_probs = padded_log_probs.detach().cpu()[:orig_seq_len]
+                    log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens_cpu)
+                    setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded_log_probs)
+                else:
+                    log_probs = torch.nested.nested_tensor_from_jagged(padded_log_probs, cu_seqlens)
+                model_output["log_probs"] = log_probs
+                return model_output
+            logits = hidden_states @ lm_head_weight_t
+
         if use_remove_padding:
             if labels.dim() > 1:
                 labels = labels.squeeze(0)

@@ -214,6 +214,8 @@ def extend_torchtitan_engine_config() -> None:
     extras: list[tuple[str, Any, Any]] = [
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
+        ("use_fused_linear_cross_entropy", Optional[bool], None),
+        ("mixed_precision_reduce", Optional[str], None),
         ("tpu_eager_mode", Optional[str], None),
         ("pad_to_length", bool, False),
         ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),
@@ -315,6 +317,17 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
         raise ValueError(f"tpu_eager_mode {tpu_eager_mode!r} not supported")
 
     return use_splash_attention, use_simple_fsdp, tpu_eager_mode
+
+
+def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
+    """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs."""
+    env_val = _parse_optional_bool_env("VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY")
+    cfg_val = getattr(engine_config, "use_fused_linear_cross_entropy", None)
+    if env_val is not None:
+        return env_val
+    if cfg_val is not None:
+        return bool(cfg_val)
+    return bool(getattr(engine_config, "use_torch_compile", False))
 
 
 def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:
@@ -779,6 +792,105 @@ def replace_varlen_attention_with_tpu_attention(modules: Any) -> int:
     if replaced:
         logger.info("Replaced %d inner_attention submodule(s) with TPUVarlenAttention.", replaced)
     return replaced
+
+
+def _enable_reduction_none_in_torchtitan_linear_loss() -> Any:
+    """Import ``torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss`` and allow ``reduction='none'``.
+
+    Tokamax's ``pallas_mosaic_tpu_kernel`` and reference kernel natively support ``reduction='none'`` in both
+    forward (returning per-token NLL of shape ``(B,)``) and backward (accepting per-token cotangent ``dout``
+    of shape ``(B,)``). TorchTitan's ``_my_bwd`` unconditionally calls ``jax.numpy.reshape(dout, ())`` for
+    scalar reductions (``'sum'``/``'mean'``); rebinding ``jax.numpy.reshape`` in ``_my_bwd``'s globals to
+    preserve 1D ``dout`` when ``dout.size != 1`` lets us call TorchTitan's ``linear_softmax_cross_entropy_loss``
+    directly without duplicating any kernel or custom-op code.
+    """
+    from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss as lce_mod
+
+    if getattr(lce_mod, "_verl_reduction_none_patched", False):
+        return lce_mod
+
+    import types
+
+    orig_bwd = lce_mod._my_bwd
+    real_jax = lce_mod.jax
+
+    class _JaxNumpyProxy:
+        @staticmethod
+        def reshape(a: Any, shape: Any, *args: Any, **kwargs: Any) -> Any:
+            if shape == () and getattr(a, "size", 1) != 1:
+                return a
+            return real_jax.numpy.reshape(a, shape, *args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_jax.numpy, name)
+
+    class _JaxProxy:
+        numpy = _JaxNumpyProxy()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_jax, name)
+
+    lce_mod._my_bwd = types.FunctionType(
+        orig_bwd.__code__,
+        {**orig_bwd.__globals__, "jax": _JaxProxy()},
+        orig_bwd.__name__,
+        orig_bwd.__defaults__,
+        orig_bwd.__closure__,
+    )
+    lce_mod._verl_reduction_none_patched = True
+    return lce_mod
+
+
+def fused_linear_logprobs_tpu(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    weight_t: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    implementation: str = "mosaic_tpu",
+    b_block_size: int = 1024,
+    h_block_size: int = 512,
+    v_block_size: int = 2048,
+) -> torch.Tensor:
+    """Compute per-token ``log_probs`` on TPU via the Pallas fused linear + softmax cross-entropy kernel.
+
+    Avoids materializing the ``[T, V]`` logits and ``float32`` log-softmax tensors in HBM. Pads ``T`` up to
+    a multiple of ``b_block_size`` (1024) as required by Mosaic TPU tiles and slices back to ``[:T]``, so
+    padded rows receive zero upstream gradient in the backward pass.
+    """
+    if hidden_states.dim() > 2:
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if labels.dim() > 1:
+        labels = labels.reshape(-1)
+
+    b_dim = int(hidden_states.shape[0])
+    x = hidden_states
+    temp = float(temperature)
+    if temp != 1.0:
+        x = (x * (1.0 / temp)).to(weight_t.dtype)
+    elif x.dtype != weight_t.dtype:
+        x = x.to(weight_t.dtype)
+
+    padded_b = max(b_block_size, ((b_dim + b_block_size - 1) // b_block_size) * b_block_size)
+    pad_b = padded_b - b_dim
+    if pad_b > 0:
+        x = F.pad(x, (0, 0, 0, pad_b))
+        labels = F.pad(labels, (0, pad_b), value=0)
+
+    lce_mod = _enable_reduction_none_in_torchtitan_linear_loss()
+    nll = lce_mod.linear_softmax_cross_entropy_loss(
+        x.contiguous(),
+        labels.contiguous(),
+        weight_t,
+        reduction="none",
+        implementation=implementation,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+    )
+    if pad_b > 0:
+        nll = nll[:b_dim]
+    return -nll
 
 
 def pad_packed_inputs_for_tpu(

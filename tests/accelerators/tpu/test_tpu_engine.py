@@ -602,3 +602,58 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
     enable_fsdp_gradient_division(root, 4)
     fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)
+
+
+def test_fused_linear_cross_entropy_tpu_and_logprobs():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        fused_linear_logprobs_tpu,
+        resolve_tpu_use_fused_linear_cross_entropy,
+    )
+
+    class _FakeFusedLossLinearWrapper(torch.nn.Linear):
+        def forward(self, x: torch.Tensor):
+            return x, self.weight.t()
+
+    seen_calls = []
+
+    def _fake_kernel(hidden_2d, labels_1d, weight_hv, *, reduction="sum", **kwargs):
+        seen_calls.append((hidden_2d.shape, labels_1d.shape, weight_hv.shape, reduction))
+        return torch.full((hidden_2d.shape[0],), 0.5, dtype=torch.float32)
+
+    fake_loss_mod = types.ModuleType("torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss")
+    fake_loss_mod.linear_softmax_cross_entropy_loss = _fake_kernel
+    fake_loss_mod._verl_reduction_none_patched = True
+    fake_sys_modules = {
+        "torchtitan": types.ModuleType("torchtitan"),
+        "torchtitan.experiments": types.ModuleType("torchtitan.experiments"),
+        "torchtitan.experiments.tpu": types.ModuleType("torchtitan.experiments.tpu"),
+        "torchtitan.experiments.tpu.kernels": types.ModuleType("torchtitan.experiments.tpu.kernels"),
+        "torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss": fake_loss_mod,
+    }
+    fake_sys_modules["torchtitan"].experiments = fake_sys_modules["torchtitan.experiments"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments"].tpu = fake_sys_modules["torchtitan.experiments.tpu"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels = fake_sys_modules["torchtitan.experiments.tpu.kernels"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels.linear_softmax_cross_entropy_loss = fake_loss_mod  # type: ignore[attr-defined]
+
+    with mock.patch.dict(sys.modules, fake_sys_modules):
+        lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
+        x = torch.randn(2, 5, 16)
+        out_fused = lm_head(x)
+        assert isinstance(out_fused, tuple) and len(out_fused) == 2
+        assert out_fused[0] is x
+        assert out_fused[1].shape == (16, 32)
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(
+                SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
+            )
+            is True
+        )
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(SimpleNamespace(use_fused_linear_cross_entropy=False)) is False
+        )
+        labels = torch.randint(0, 32, (2, 5))
+        logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
+        assert logprobs.shape == (10,)
+        assert torch.allclose(logprobs, torch.full((10,), -0.5))
+        # Kernel receives B padded to a multiple of 1024 with reduction="none"
+        assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]

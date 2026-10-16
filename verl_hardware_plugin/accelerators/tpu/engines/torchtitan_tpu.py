@@ -1020,6 +1020,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             logits_rmpad = (logits.squeeze(0) if logits.dim() > 2 else logits) / temperature
 
             if logits_rmpad.device.type == "tpu":
+                # Like verl's GPU path (flash-attn cross entropy, CUDA autocast), take the log-softmax and entropy
+                # of the bf16 logits in fp32; torch_tpu's autocast would leave them in bf16.
+                logits_rmpad = logits_rmpad.float()
                 log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
             else:
                 inplace_backward = not calculate_entropy
@@ -1060,6 +1063,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             if logits.dim() == 2 and "batch_size" in output_args and "max_seq_len" in output_args:
                 logits = logits.view(output_args["batch_size"], output_args["max_seq_len"], -1)
             logits = logits / temperature
+            if logits.device.type == "tpu":
+                logits = logits.float()  # fp32 log-softmax and entropy, as above
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy = verl_F.entropy_from_logits(logits)

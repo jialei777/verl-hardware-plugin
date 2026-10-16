@@ -319,14 +319,16 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
 
 
 def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
-    """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs."""
+    """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs.
+
+    Off unless ``VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY`` or ``use_fused_linear_cross_entropy`` turns it on, like
+    verl's opt-in ``use_fused_kernels`` on GPU. The kernel keeps the logits in fp32, whereas verl's GPU engines
+    round them to bf16 before the fp32 log-softmax, so it changes the log-prob numerics.
+    """
     env_val = _parse_optional_bool_env("VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY")
-    cfg_val = getattr(engine_config, "use_fused_linear_cross_entropy", None)
     if env_val is not None:
         return env_val
-    if cfg_val is not None:
-        return bool(cfg_val)
-    return bool(getattr(engine_config, "use_torch_compile", False))
+    return bool(getattr(engine_config, "use_fused_linear_cross_entropy", None))
 
 
 def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:

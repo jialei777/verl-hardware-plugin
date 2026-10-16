@@ -646,11 +646,9 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
             resolve_tpu_use_fused_linear_cross_entropy(
                 SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
             )
-            is True
+            is False
         )
-        assert (
-            resolve_tpu_use_fused_linear_cross_entropy(SimpleNamespace(use_fused_linear_cross_entropy=False)) is False
-        )
+        assert resolve_tpu_use_fused_linear_cross_entropy(SimpleNamespace(use_fused_linear_cross_entropy=True)) is True
         labels = torch.randint(0, 32, (2, 5))
         logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
         assert logprobs.shape == (10,)

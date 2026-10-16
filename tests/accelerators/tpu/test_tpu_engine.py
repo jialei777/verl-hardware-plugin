@@ -657,3 +657,42 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
         assert torch.allclose(logprobs, torch.full((10,), -0.5))
         # Kernel receives B padded to a multiple of 1024 with reduction="none"
         assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]
+
+
+def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        load_tpu_model_to_device,
+        offload_tpu_model_to_cpu,
+    )
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group("gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        model = torch.nn.Linear(4, 3, bias=False)
+        local = model.weight.detach().clone()
+        model.weight = torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)]), requires_grad=False)
+        weight = model.weight
+
+        # First offload of a frozen model caches the host shard on the parameter.
+        offload_tpu_model_to_cpu(model, cache_cpu_copy=True)
+        cached = weight._tpu_cpu_offload_tensor
+        assert weight._local_tensor is cached
+
+        # "meta" stands in for the TPU: the reload swaps the local shard in place, keeping the DTensor and its mesh.
+        load_tpu_model_to_device(model, "meta")
+        assert model.weight is weight
+        assert weight._local_tensor.device.type == "meta"
+        assert weight.device_mesh is mesh
+
+        # Offloading again reuses the cached host shard (a device-to-host copy from "meta" would raise).
+        offload_tpu_model_to_cpu(model, cache_cpu_copy=True)
+        assert weight._local_tensor is cached
+        assert torch.equal(weight._local_tensor, local)
+    finally:
+        if owns_group:
+            dist.destroy_process_group()

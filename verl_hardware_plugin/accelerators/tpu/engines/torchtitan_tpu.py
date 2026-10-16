@@ -13,7 +13,8 @@ decoupled from core verl's GPU TorchTitan engine:
 - ``TPUSplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
-- ``OptimizersContainer.Config(implementation="foreach")`` and ``foreach=False`` grad norm clipping
+- ``OptimizersContainer.Config(implementation="fused")`` (``VERL_TPU_OPTIM_IMPL`` overrides) and ``foreach=False``
+  grad norm clipping
 - Host-side global token counting (avoiding eager device collectives inside the XLA SPMD trace)
 - Graph-break loss synchronization between forward and backward
 - Sequence-length bucketing for both packed (``use_remove_padding=True``) and padded inputs
@@ -226,6 +227,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 parallelize_fn=get_tpu_simple_fsdp_parallelize_fn(torchtitan_name),
             )
 
+        # torch_tpu's aten::_fused_adamw_ updates params, exp_avg and exp_avg_sq in place (buffer donation): no
+        # param-sized temporary as in the foreach path (+4.2 GB/chip for Qwen3-4B at FSDP=4) and ~2x faster.
         optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", "fused")
         optimizer = OptimizersContainer.Config(
             implementation=optim_impl,
@@ -363,11 +366,9 @@ class TorchTitanTPUEngine(BaseEngine):
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
-        # set FSDP offload params (mirror GPU TorchTitanEngine by offloading forward_only reference models by default)
-        ref_offload = self.engine_config.forward_only and os.environ.get("VERL_TPU_REF_OFFLOAD", "1") != "0"
-        self._is_offload_param = bool(
-            self.engine_config.param_offload or self.engine_config.offload_policy or ref_offload
-        )
+        # set FSDP offload params. ``ref.torchtitan.param_offload=True`` keeps the frozen reference model in host
+        # memory outside compute_ref_log_prob: frees its bf16 shard of HBM, costs one host-to-TPU copy per step.
+        self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
 
@@ -624,9 +625,6 @@ class TorchTitanTPUEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
-                if os.environ.get("VERL_TPU_OPTIM_SYNC_ZERO", "1") != "0":
-                    self.optimizer.zero_grad()
-                    tpu_synchronize(wait=True)
 
             return grad_norm.item()
 

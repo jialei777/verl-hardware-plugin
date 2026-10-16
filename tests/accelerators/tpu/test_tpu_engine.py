@@ -3,7 +3,11 @@
 
 """Unit tests for the TPU TorchTitan engine utilities on CPU."""
 
+import ast
 import os
+import sys
+import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -38,6 +42,36 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
     resolve_tpu_topology_bounds,
 )
+
+
+def _fake_torchtitan_modules() -> dict[str, types.ModuleType]:
+    """Stand-ins for the two torchtitan modules these CPU tests touch, for ``mock.patch.dict(sys.modules, ...)``.
+
+    The TPU engine imports google-pytorch/torchtitan lazily, and this repo's CPU test workflow does not install it.
+    """
+    attention = types.ModuleType("torchtitan.models.common.attention")
+    attention.VarlenInnerAttention = type("VarlenInnerAttention", (torch.nn.Module,), {})  # type: ignore[attr-defined]
+
+    simple_fsdp = types.ModuleType("torchtitan.experiments.graph_trainer.simple_fsdp")
+    simple_fsdp._active_parametrization = True  # type: ignore[attr-defined]
+
+    @contextmanager
+    def disable_active_parametrization():
+        # Like torchtitan's: not reentrant, it always re-enables the parametrization on exit.
+        try:
+            simple_fsdp._active_parametrization = False  # type: ignore[attr-defined]
+            yield
+        finally:
+            simple_fsdp._active_parametrization = True  # type: ignore[attr-defined]
+
+    simple_fsdp.disable_active_parametrization = disable_active_parametrization  # type: ignore[attr-defined]
+    graph_trainer = types.ModuleType("torchtitan.experiments.graph_trainer")
+    graph_trainer.simple_fsdp = simple_fsdp  # type: ignore[attr-defined]
+    return {
+        attention.__name__: attention,
+        graph_trainer.__name__: graph_trainer,
+        simple_fsdp.__name__: simple_fsdp,
+    }
 
 
 def test_bucket_length_and_env_override():
@@ -144,11 +178,12 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
             self.inner_attention = _DummyInnerAttn()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    assert apply_splash_attention_tpu([model]) == 2
-    assert isinstance(model[0].inner_attention, TPUSplashAttention)
-    assert model[0].inner_attention.local_window_size == 256
-    # Idempotent on repeated calls (e.g. __init__ followed by initialize)
-    assert apply_splash_attention_tpu([model]) == 0
+    with mock.patch.dict(sys.modules, _fake_torchtitan_modules()):
+        assert apply_splash_attention_tpu([model]) == 2
+        assert isinstance(model[0].inner_attention, TPUSplashAttention)
+        assert model[0].inner_attention.local_window_size == 256
+        # Idempotent on repeated calls (e.g. __init__ followed by initialize)
+        assert apply_splash_attention_tpu([model]) == 0
 
     q = torch.ones(256, 2, 4)
     out = model[0].inner_attention(q, q, q)
@@ -157,15 +192,17 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
 
 
 def test_apply_splash_attention_tpu_falls_back_to_tpu_varlen_attention_for_varlen():
-    from torchtitan.models.common.attention import VarlenInnerAttention
+    fake_modules = _fake_torchtitan_modules()
+    VarlenInnerAttention = fake_modules["torchtitan.models.common.attention"].VarlenInnerAttention
 
     class _AttnBlock(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.inner_attention = VarlenInnerAttention(VarlenInnerAttention.Config())
+            self.inner_attention = VarlenInnerAttention()
 
     model = torch.nn.Sequential(_AttnBlock())
-    assert apply_splash_attention_tpu([model]) == 1
+    with mock.patch.dict(sys.modules, fake_modules):
+        assert apply_splash_attention_tpu([model]) == 1
     splash = model[0].inner_attention
     assert isinstance(splash, TPUSplashAttention)
     # torchtitan's VarlenInnerAttention needs the CUDA flash-attention varlen op; TPU falls back to dense SDPA.
@@ -309,6 +346,7 @@ def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
         assert get_tpu_seq_bucket_size(cfg_enabled) == 128
 
 
+@mock.patch.dict(sys.modules, _fake_torchtitan_modules())
 def test_get_tpu_simple_fsdp_parallelize_fn_uses_torchtitan_tpu_recipe():
     from torchtitan.experiments.graph_trainer import simple_fsdp
 
@@ -339,6 +377,7 @@ def test_get_tpu_simple_fsdp_parallelize_fn_uses_torchtitan_tpu_recipe():
         get_tpu_simple_fsdp_parallelize_fn("deepseek_v3")
 
 
+@mock.patch.dict(sys.modules, _fake_torchtitan_modules())
 def test_init_states_without_simple_fsdp_parametrization_is_reentrant():
     from torchtitan.experiments.graph_trainer import simple_fsdp
 
@@ -514,12 +553,22 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
     assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
 
 
+def _imported_modules(nodes) -> set[str]:
+    names = set()
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom):
+            names.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+    return names
+
+
 def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     """TorchTitanTPUEngine subclasses BaseEngine directly without importing verl.workers.engine.torchtitan."""
     from torch.distributed.fsdp import FSDPModule
 
     from verl.workers.engine.base import BaseEngine
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_utils
     from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
         derive_torchtitan_name_and_flavor,
         enable_fsdp_gradient_division,
@@ -527,7 +576,13 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
     assert issubclass(torchtitan_tpu.TorchTitanTPUEngine, BaseEngine)
     assert issubclass(torchtitan_tpu.TorchTitanTPUEngineWithLMHead, torchtitan_tpu.TorchTitanTPUEngine)
-    assert "verl.workers.engine.torchtitan" not in open(torchtitan_tpu.__file__).read().split('"""')[-1]
+
+    # Nothing in the engine imports core verl's GPU TorchTitan engine, and torchtitan is only imported inside
+    # functions, so the plugin registers on machines without torchtitan.
+    for module in (torchtitan_tpu, tpu_utils):
+        tree = ast.parse(open(module.__file__).read())
+        assert not any(n.startswith("verl.workers.engine.torchtitan") for n in _imported_modules(ast.walk(tree)))
+        assert not any(n.startswith("torchtitan") for n in _imported_modules(tree.body))
 
     hf_cfg = SimpleNamespace(
         model_type="qwen3",

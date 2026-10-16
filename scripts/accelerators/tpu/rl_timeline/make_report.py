@@ -65,6 +65,69 @@ RANK_CLASS = {
 Intervals = list[tuple[float, float]]
 
 
+_GIB = float(1024**3)
+
+
+def parse_hbm_csv(
+    spec: str,
+    default_group: str = "trainer_workers",
+    t_min: Optional[float] = None,
+    t_max: Optional[float] = None,
+) -> list[dict]:
+    """Parse ``[group=]path.csv`` produced by ``hbm_monitor.py`` into ``ph='C'`` timeline events.
+
+    Each CSV line has ``unix_time,port,device_id,memory_usage_bytes,total_memory_bytes,duty_cycle_pct``.
+    """
+    if "=" in spec and not os.path.exists(spec):
+        prefix, path = spec.split("=", 1)
+        group = prefix if prefix in ("trainer_workers",) or prefix.startswith("rollout_replica_") else default_group
+    else:
+        group, path = default_group, spec
+    buckets: dict[int, dict[int, tuple[int, int, float]]] = defaultdict(dict)
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line or line.startswith("#") or line.startswith("unix_time"):
+                continue
+            parts = line.strip().split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                t_raw = float(parts[0])
+                t_sec = int(round(t_raw))
+                dev = int(parts[2])
+                used_b = int(parts[3])
+                tot_b = int(parts[4])
+                duty = float(parts[5])
+            except ValueError:
+                continue
+            if t_min is not None and t_raw < t_min:
+                continue
+            if t_max is not None and t_raw > t_max:
+                continue
+            prev = buckets[t_sec].get(dev)
+            if prev is None or used_b > prev[0]:
+                buckets[t_sec][dev] = (used_b, tot_b, duty)
+    out: list[dict] = []
+    for t_sec in sorted(buckets):
+        by_dev = buckets[t_sec]
+        devs = sorted(by_dev)
+        out.append(
+            {
+                "ph": "C",
+                "name": "hbm",
+                "group": group,
+                "lane": "hbm",
+                "ts": float(t_sec),
+                "args": {
+                    "used": [round(by_dev[d][0] / _GIB, 3) for d in devs],
+                    "cap": round(max(by_dev[d][1] for d in devs) / _GIB, 2),
+                    "duty": [round(by_dev[d][2], 1) for d in devs],
+                },
+            }
+        )
+    return out
+
+
 def _parse_value(text: str) -> Optional[float]:
     text = text.strip()
     match = _NUMPY_SCALAR_RE.match(text)  # numpy scalars print as np.float64(1.0)
@@ -213,10 +276,10 @@ def select_steps(
             continue
         if ts is None:
             continue
-        if ph == "i":
+        if ph in ("i", "C"):
             if w0 <= ts <= w1:
                 selected.append(e)
-            elif ts < w0 and e.get("name") == "weights":
+            elif ph == "i" and ts < w0 and e.get("name") == "weights":
                 prev = weights_before.get(e.get("group"))
                 if prev is None or ts > prev["ts"]:
                     weights_before[e.get("group")] = e
@@ -359,6 +422,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--steps", help="only keep these steps, e.g. 10-20: their metrics and what happened in their time window"
     )
+    ap.add_argument(
+        "--hbm-csv",
+        action="append",
+        default=[],
+        metavar="[GROUP=]CSV",
+        help="merge external 1 Hz HBM CSV file(s) from hbm_monitor.py (e.g. trainer_workers=trainer.csv)",
+    )
     ap.add_argument("--summary", action="store_true", help="print a per-step text summary")
     args = ap.parse_args(argv)
     if not args.output and not args.summary and not args.save_events:
@@ -379,6 +449,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         source = os.path.basename(args.log)
     else:
         ap.error("give a log file or --ray-address/--job")
+
+    if args.hbm_csv:
+        span_ts = [
+            e["ts"] + (e.get("dur") or 0.0)
+            for e in events
+            if isinstance(e.get("ts"), int | float) and e.get("ph") not in ("M", "C")
+        ] + [e["ts"] for e in events if isinstance(e.get("ts"), int | float) and e.get("ph") not in ("M", "C")]
+        t_min = (min(span_ts) - 240.0) if span_ts else None
+        t_max = (max(span_ts) + 30.0) if span_ts else None
+        for spec in args.hbm_csv:
+            events.extend(parse_hbm_csv(spec, t_min=t_min, t_max=t_max))
 
     if args.steps:
         first, last = parse_step_range(args.steps)

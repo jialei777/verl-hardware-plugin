@@ -60,7 +60,8 @@ def test_emit_prints_one_token_per_span(timeline_on, capsys):
     timeline.emit("request", 10.0, 2.5, group="rollout_replica_0", lane="requests", step=3, stop="hit length", out=7)
     timeline.instant("weights", "rollout_replica_0", "server", ts=12.0, wv=3)
     timeline.meta("rollout_replica", "rollout_replica_0", max_num_seqs=256)
-    request, weights, meta = _events(capsys.readouterr().out)
+    timeline.counter("hbm", "trainer_workers", ts=13.0, used=[12.16, 12.16], cap=31.25)
+    request, weights, meta, hbm = _events(capsys.readouterr().out)
     assert request == {
         "name": "request",
         "group": "rollout_replica_0",
@@ -79,6 +80,14 @@ def test_emit_prints_one_token_per_span(timeline_on, capsys):
         "args": {"wv": 3},
     }
     assert (meta["ph"], meta["name"], meta["args"]) == ("M", "rollout_replica", {"max_num_seqs": 256})
+    assert hbm == {
+        "ph": "C",
+        "name": "hbm",
+        "group": "trainer_workers",
+        "lane": "hbm",
+        "ts": 13.0,
+        "args": {"used": [12.16, 12.16], "cap": 31.25},
+    }
 
 
 def test_span_times_the_body_and_skips_lane_none(timeline_on, capsys):
@@ -401,3 +410,24 @@ def test_report_selects_a_step_range(make_report):
     assert [line.split()[0] for line in summary.splitlines()[1:3]] == ["2", "3"]
     with pytest.raises(ValueError, match="not in the log"):
         make_report.select_steps(events, metrics, 3, 4)
+
+
+def test_report_parses_hbm_csv(make_report, tmp_path):
+    csv_file = tmp_path / "trainer.csv"
+    csv_file.write_text(
+        "# chip_type=v6e count=4\n"
+        "unix_time,port,device_id,memory_usage_bytes,total_memory_bytes,duty_cycle_pct\n"
+        f"100.1,8431,0,{12 * 1024**3},{int(31.25 * 1024**3)},85.0\n"
+        f"100.1,8431,1,{13 * 1024**3},{int(31.25 * 1024**3)},86.0\n"
+    )
+    events = make_report.parse_hbm_csv(f"trainer_workers={csv_file}")
+    assert events == [
+        {
+            "ph": "C",
+            "name": "hbm",
+            "group": "trainer_workers",
+            "lane": "hbm",
+            "ts": 100.0,
+            "args": {"used": [12.0, 13.0], "cap": 31.25, "duty": [85.0, 86.0]},
+        }
+    ]

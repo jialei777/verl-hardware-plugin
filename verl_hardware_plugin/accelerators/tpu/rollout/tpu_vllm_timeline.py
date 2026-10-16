@@ -44,6 +44,7 @@ class vLLMServerTimelineMixin:
                 nnodes=getattr(self, "nnodes", None),
                 host=getattr(self, "_server_address", None),
             )
+            timeline.start_hbm_sampler(group=self._tl_group(), lane=timeline.HBM_LANE)
         return result
 
     def _tl_install_engine_hooks(self) -> None:

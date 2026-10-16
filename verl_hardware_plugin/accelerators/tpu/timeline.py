@@ -32,6 +32,7 @@ Groups, lanes and span names:
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -40,14 +41,19 @@ from typing import Any, Optional
 MARKER = "VERL_TIMELINE"
 ENV_VAR = "VERL_TIMELINE"
 RANKS_ENV_VAR = "VERL_TIMELINE_RANKS"
+HBM_PERIOD_ENV_VAR = "VERL_TIMELINE_HBM_PERIOD"
 
 TRAINER = "trainer"
 TRAINER_LOOP = "loop"
 TRAINER_WORKERS = "trainer_workers"
 SERVER_LANE = "server"
 REQUESTS_LANE = "requests"
+HBM_LANE = "hbm"
 
 _FALSE_VALUES = ("", "0", "false", "no", "off")
+_hbm_sampler_lock = threading.Lock()
+_hbm_sampler_started: set[str] = set()
+_GIB = float(1024**3)
 
 
 def enabled() -> bool:
@@ -175,3 +181,86 @@ def trainer_lane() -> Optional[str]:
     if ranks not in ("all", "*") and str(rank) not in {r.strip() for r in ranks.split(",")}:
         return None
     return f"rank{rank}"
+
+
+def counter(
+    name: str,
+    group: str,
+    lane: str = HBM_LANE,
+    ts: Optional[float] = None,
+    **args: Any,
+) -> None:
+    """Print a counter sample event (``ph="C"``), e.g. 1 Hz local TPU chip HBM usage."""
+    if not enabled():
+        return
+    event: dict[str, Any] = {"ph": "C", "name": name, "group": group, "lane": lane, "ts": round(ts or time.time(), 3)}
+    if args:
+        event["args"] = args
+    _write(event)
+
+
+def start_hbm_sampler(
+    group: str,
+    lane: str = HBM_LANE,
+    period: Optional[float] = None,
+    ports: tuple[int, ...] = (8431, 8432, 8433, 8434),
+) -> bool:
+    """Start a daemon thread that polls ``tpu_info`` local chip HBM usage every ``period`` seconds.
+
+    Emits ``VERL_TIMELINE{"ph":"C","name":"hbm","group":group,"lane":lane,"ts":...,"args":{"used":[...],...}}``
+    where ``used`` is the per-chip HBM usage in GiB (`1024^3` bytes), ``cap`` is per-chip HBM capacity in GiB,
+    and ``duty`` is the per-chip duty cycle percentage. Safe to call multiple times; starts at most one sampler
+    thread per ``group`` in the current process. Disabled if ``VERL_TIMELINE`` is off or
+    ``VERL_TIMELINE_HBM_PERIOD=0``.
+    """
+    if not enabled():
+        return False
+    if period is None:
+        try:
+            period = float(os.environ.get(HBM_PERIOD_ENV_VAR, "1.0"))
+        except ValueError:
+            period = 1.0
+    if period <= 0:
+        return False
+    with _hbm_sampler_lock:
+        if group in _hbm_sampler_started:
+            return False
+        try:
+            from tpu_info import device, metrics  # type: ignore[import-not-found]
+
+            chip_type, count = device.get_local_chips()
+            if not chip_type or not count:
+                return False
+        except Exception:
+            return False
+        _hbm_sampler_started.add(group)
+
+    def _loop() -> None:
+        while True:
+            t0 = time.time()
+            by_dev: dict[int, tuple[int, int, float]] = {}
+            for port in ports:
+                try:
+                    usages = metrics.get_chip_usage(chip_type, addr=f"localhost:{port}")
+                except Exception:
+                    continue
+                for u in usages:
+                    dev_id = int(u.device_id)
+                    used_b = int(u.memory_usage)
+                    tot_b = int(u.total_memory)
+                    duty_pct = float(getattr(u, "duty_cycle_pct", 0.0) or 0.0)
+                    prev = by_dev.get(dev_id)
+                    if prev is None or used_b > prev[0]:
+                        by_dev[dev_id] = (used_b, tot_b, duty_pct)
+            if by_dev:
+                devs = sorted(by_dev)
+                used_gib = [round(by_dev[d][0] / _GIB, 3) for d in devs]
+                cap_gib = round(max(by_dev[d][1] for d in devs) / _GIB, 2)
+                duty = [round(by_dev[d][2], 1) for d in devs]
+                counter("hbm", group=group, lane=lane, ts=t0, used=used_gib, cap=cap_gib, duty=duty)
+            elapsed = time.time() - t0
+            time.sleep(max(0.05, period - elapsed))
+
+    t = threading.Thread(target=_loop, name=f"verl-timeline-hbm-{group}", daemon=True)
+    t.start()
+    return True

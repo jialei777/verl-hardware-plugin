@@ -455,7 +455,7 @@ function buildTimelineModel(evs, metrics, sourceName) {
     T0 = Math.min(T0, e.ts); T1 = Math.max(T1, e.ts + (e.dur || 0));
   }
   const model = {kind: "timeline", source: sourceName, T0, duration: T1 - T0, groups: [], steps: [], meta: {},
-                 replicas: [], metrics, nEvents: evs.length};
+                 replicas: [], hbm: new Map(), metrics, nEvents: evs.length};
   const groups = new Map();
   const getLane = (g, l) => {
     if (!groups.has(g)) groups.set(g, {id: g, lanes: new Map()});
@@ -469,6 +469,19 @@ function buildTimelineModel(evs, metrics, sourceName) {
     if (e.ph === "M") { (model.meta[e.name] = model.meta[e.name] || []).push(Object.assign({group: g, lane: l, ts: e.ts}, e.args || {})); continue; }
     if (typeof e.ts !== "number") continue;
     const t0 = e.ts - T0;
+    if (e.ph === "C" && e.name === "hbm") {
+      if (!groups.has(g)) groups.set(g, {id: g, lanes: new Map()});
+      const a = e.args || {}, used = Array.isArray(a.used) ? a.used : (typeof a.used === "number" ? [a.used] : []);
+      if (!used.length) continue;
+      let H = model.hbm.get(g);
+      if (!H) { H = {group: g, samples: [], cap: a.cap || 31.25, maxUsed: 0, minUsed: Infinity, nChips: 0}; model.hbm.set(g, H); }
+      if (a.cap) H.cap = Math.max(H.cap, a.cap);
+      H.nChips = Math.max(H.nChips, used.length);
+      const hi = Math.max(...used), lo = Math.min(...used);
+      H.maxUsed = Math.max(H.maxUsed, hi); H.minUsed = Math.min(H.minUsed, lo);
+      H.samples.push({t: t0, used, max: hi, min: lo, duty: Array.isArray(a.duty) ? a.duty : []});
+      continue;
+    }
     if (e.ph === "i") { getLane(g, l).instants.push({t: t0, name: e.name, cat: e.cat, args: e.args || {}, step: e.step}); continue; }
     if (e.ph !== "X") continue;
     const t1 = t0 + (e.dur || 0);
@@ -557,6 +570,7 @@ function buildTimelineModel(evs, metrics, sourceName) {
     model.replicas.push(rep);
   }
   model.run = (model.meta.run || [])[0] || {};
+  for (const H of model.hbm.values()) H.samples.sort((a, b) => a.t - b.t);
   computeStepStats(model);
   return model;
 }
@@ -723,8 +737,32 @@ function trainerBreakdown(model, a, b) {
   return out;
 }
 
+function hbmMaxIn(H, a, b) {
+  if (!H || !H.samples.length || b <= a) return null;
+  let m = null;
+  const i0 = Math.max(0, lowerBound(H.samples, a, "t") - 1);
+  for (let i = i0; i < H.samples.length; i++) {
+    const s = H.samples[i];
+    if (s.t > b) break;
+    if (s.t >= a && (m == null || s.max > m)) m = s.max;
+  }
+  return m;
+}
+function hbmMinIn(H, a, b) {
+  if (!H || !H.samples.length || b <= a) return null;
+  let m = null;
+  const i0 = Math.max(0, lowerBound(H.samples, a, "t") - 1);
+  for (let i = i0; i < H.samples.length; i++) {
+    const s = H.samples[i];
+    if (s.t > b) break;
+    if (s.t >= a && (m == null || s.min < m)) m = s.min;
+  }
+  return m;
+}
+
 function computeStepStats(model) {
   const phases = new Set();
+  const trHbm = model.hbm ? model.hbm.get("trainer_workers") : null;
   for (const st of model.steps) {
     const a = st.t0, b = st.tNext;
     st.phase = {};
@@ -741,6 +779,8 @@ function computeStepStats(model) {
     st.total = b - a;
     st.stepDur = st.t1 - st.t0;
     st.trainer = trainerBreakdown(model, a, b);
+    st.hbmPeak = hbmMaxIn(trHbm, a, b);
+    st.hbmFloor = hbmMinIn(trHbm, a, b);
     let busy = 0, paused = 0, idle = 0, area = 0, nDone = 0, nAbort = 0, outTok = 0;
     for (const rep of model.replicas) {
       const t = stateTime(rep, a, b);
@@ -833,11 +873,13 @@ function buildRows() {
   // Overview: the trainer's step, what the trainer chips run, what the sampler chips do and which weights they serve.
   const wg0 = m.groups.find(g => g.id === "trainer_workers");
   const rankLane = wg0 && wg0.lanes.length ? wg0.lanes[0] : null, rep0 = m.replicas[0];
-  if (m.loop && (rankLane || rep0)) {
+  const trHbm = m.hbm ? m.hbm.get("trainer_workers") : null;
+  if (m.loop && (rankLane || rep0 || trHbm)) {
     rows.push({kind: "group", id: "overview", label: "overview: trainer chips vs sampler chips", h: GROUP_H});
     if (!view.collapsed.has("overview")) {
       rows.push({kind: "spans", lane: m.loop, depth: 0, label: "trainer step", h: 18});
       if (rankLane) rows.push({kind: "spans", lane: rankLane, depth: 0, label: "trainer chips (" + rankLane.id + ")", h: 20, idle: true});
+      if (trHbm && trHbm.samples.length) rows.push({kind: "hbm", hbm: trHbm, label: "trainer HBM (peak " + trHbm.maxUsed.toFixed(1) + "/" + trHbm.cap.toFixed(1) + " GiB)", h: 42});
       if (rep0) {
         rows.push({kind: "state", rep: rep0, label: "sampler chips (" + rep0.id.replace("rollout_replica_", "replica ") + ")", h: 20});
         if (rep0.versions && rep0.versions.length) rows.push({kind: "versions", rep: rep0, label: "sampler weights", h: 14});
@@ -847,6 +889,7 @@ function buildRows() {
   for (const G of m.groups) {
     const isRep = G.id.startsWith("rollout_replica");
     const rep = isRep ? m.replicas.find(r => r.id === G.id) : null;
+    const hbm = m.hbm ? m.hbm.get(G.id) : null;
     let title = G.id;
     if (G.id === "trainer") title = "trainer loop";
     else if (G.id === "trainer_workers") title = "trainer ranks (what runs on the trainer chips)";
@@ -859,6 +902,7 @@ function buildRows() {
     if (rep) {
       rows.push({kind: "state", rep, label: "state", h: 16});
       if (rep.versions && rep.versions.length) rows.push({kind: "versions", rep, label: "weights (vK = after step K)", h: 14});
+      if (hbm && hbm.samples.length) rows.push({kind: "hbm", hbm, label: "HBM (peak " + hbm.maxUsed.toFixed(1) + "/" + hbm.cap.toFixed(1) + " GiB)", h: 38});
       const cap = rep.meta.max_num_seqs ? "max_num_seqs " + rep.meta.max_num_seqs : "peak " + rep.maxDecode;
       rows.push({kind: "occ", rep, label: "decoding (" + cap + ")", h: 40});
       if (rep.maxQueued > 0) rows.push({kind: "queue", rep, label: "waiting (peak " + rep.maxQueued + ")", h: 26});
@@ -885,6 +929,9 @@ function buildRows() {
                                          : (d === 0 ? L.id + " (chips)" : L.id + " detail");
         rows.push({kind: "spans", lane: L, depth: d, label, h: G.id === "trainer" ? 20 : (d === 0 ? 18 : 13)});
       }
+    }
+    if (hbm && hbm.samples.length) {
+      rows.push({kind: "hbm", hbm, label: "HBM (" + hbm.nChips + " chips, peak " + hbm.maxUsed.toFixed(1) + "/" + hbm.cap.toFixed(1) + " GiB)", h: 48});
     }
   }
   let y = AXIS_H;
@@ -1083,6 +1130,52 @@ function drawRow(r) {
       ctx.beginPath(); ctx.moveTo(labelW(), yc + 0.5); ctx.lineTo(W, yc + 0.5); ctx.stroke(); ctx.setLineDash([]);
     }
     ctx.restore();
+  } else if (r.kind === "hbm") {
+    const H = r.hbm, samples = H.samples, cap = Math.max(H.cap || 31.25, H.maxUsed, 1);
+    ctx.strokeStyle = "rgba(0,0,0,0.12)";
+    ctx.strokeRect(labelW() + 0.5, y + 0.5, W - labelW() - 1, h - 1);
+    if (!samples.length) return;
+    const yOf = v => y + h - 1 - (h - 3) * Math.min(1, Math.max(0, v) / cap);
+    ctx.save(); ctx.beginPath(); ctx.rect(labelW(), y, W - labelW(), h); ctx.clip();
+    // Shaded area under max chip HBM
+    const i0 = Math.max(0, lowerBound(samples, view.t0, "t") - 1);
+    ctx.beginPath();
+    let started = false, prevY = y + h - 1, lastX = labelW();
+    for (let i = i0; i < samples.length; i++) {
+      const s = samples[i], x = Math.max(labelW(), Math.min(W, tx(s.t))), yy = yOf(s.max);
+      if (!started) { ctx.moveTo(x, y + h - 1); started = true; }
+      ctx.lineTo(x, prevY); ctx.lineTo(x, yy); prevY = yy; lastX = x;
+      if (s.t > view.t1) break;
+    }
+    if (started) {
+      ctx.lineTo(lastX, y + h - 1); ctx.closePath();
+      ctx.fillStyle = H.group === "trainer_workers" ? "rgba(21,101,192,0.22)" : "rgba(0,137,123,0.20)";
+      ctx.fill();
+    }
+    // Per-chip lines
+    const chipColors = ["#1565c0", "#ef6c00", "#2e7d32", "#c62828", "#6a1b9a", "#00838f", "#ad1457", "#4e342e"];
+    for (let c = 0; c < H.nChips; c++) {
+      ctx.beginPath();
+      let stChip = false;
+      for (let i = i0; i < samples.length; i++) {
+        const s = samples[i];
+        if (c >= s.used.length) continue;
+        const x = Math.max(labelW(), Math.min(W, tx(s.t))), yy = yOf(s.used[c]);
+        if (!stChip) { ctx.moveTo(x, yy); stChip = true; } else ctx.lineTo(x, yy);
+        if (s.t > view.t1) break;
+      }
+      if (stChip) {
+        ctx.strokeStyle = chipColors[c % chipColors.length];
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
+    // Capacity dashed line
+    const yc = yOf(H.cap || 31.25);
+    ctx.strokeStyle = "rgba(183,28,28,0.55)"; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(labelW(), yc + 0.5); ctx.lineTo(W, yc + 0.5); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
   } else if (r.kind === "reqs") {
     const rep = r.rep;
     for (let k = 0; k < rep.nRows; k++) {
@@ -1127,6 +1220,12 @@ function hitTest(x, y) {
   if (row.kind === "occ" || row.kind === "queue") {
     const occ = row.rep.occ, i = Math.max(0, lowerBound(occ, t, "t") - (occ.length && lowerBound(occ, t, "t") < occ.length && occ[lowerBound(occ, t, "t")].t === t ? 0 : 1));
     return {row, kind: "occ", o: occ[Math.min(i, occ.length - 1)], t};
+  }
+  if (row.kind === "hbm") {
+    const arr = row.hbm.samples;
+    if (!arr.length) return {row, t};
+    const idx = Math.max(0, Math.min(arr.length - 1, lowerBound(arr, t, "t") - (lowerBound(arr, t, "t") < arr.length && arr[lowerBound(arr, t, "t")].t === t ? 0 : 1)));
+    return {row, kind: "hbm", sample: arr[idx], t};
   }
   if (row.kind === "reqs") {
     const k = Math.floor((y - row.y - 1) / row.rh);
@@ -1177,6 +1276,17 @@ function tooltipHtml(h) {
     return "<b>" + esc(h.row.rep.id) + "</b> @ " + fmtClock(h.t) + "<br>" + kv("decoding (running)", o.decode) +
            kv("queued in engine / prefill", o.engine - o.decode) + kv("parked at closed gate", o.parked) +
            (h.row.rep.meta.max_num_seqs ? kv("max_num_seqs", h.row.rep.meta.max_num_seqs) : kv("peak decoding", h.row.rep.maxDecode));
+  }
+  if (h.kind === "hbm" && h.sample) {
+    const s = h.sample, H = h.row.hbm, cap = H.cap || 31.25;
+    let html = "<b>" + esc(H.group) + " HBM</b> @ " + fmtClock(s.t) + "<br>" +
+               kv("max across chips", s.max.toFixed(2) + " / " + cap.toFixed(2) + " GiB (" + pct(s.max / cap) + ")") +
+               kv("window peak / floor", H.maxUsed.toFixed(2) + " / " + H.minUsed.toFixed(2) + " GiB");
+    s.used.forEach((u, i) => {
+      const d = s.duty && s.duty[i] != null ? " · duty " + s.duty[i].toFixed(0) + "%" : "";
+      html += kv("  chip " + i, u.toFixed(2) + " GiB (" + (u * 1.073741824).toFixed(2) + " GB)" + d);
+    });
+    return html;
   }
   if (h.kind === "req") {
     const q = h.q;
@@ -1309,6 +1419,16 @@ function updateSummary() {
                 (before > 0 ? " · not up " + pct(before / n / (b - a)) : "")]);
   }
   if (run.train_batch_size) cards.push(["batch", run.train_batch_size + " × n=" + run.rollout_n, "resp ≤ " + run.max_response_length + " · " + (run.checkpoint_engine || "") + " sync"]);
+  const trHbm = m.hbm ? m.hbm.get("trainer_workers") : null;
+  if (trHbm && trHbm.samples.length) {
+    const pk = hbmMaxIn(trHbm, a, b), fl = hbmMinIn(trHbm, a, b), cap = trHbm.cap || 31.25;
+    if (pk != null) cards.push(["trainer HBM peak", pk.toFixed(2) + " GiB (" + pct(pk / cap) + ")", "floor " + (fl != null ? fl.toFixed(2) : "–") + " / " + cap.toFixed(2) + " GiB"]);
+  }
+  const repHbm = m.replicas.map(r => m.hbm ? m.hbm.get(r.id) : null).find(h => h && h.samples.length);
+  if (repHbm) {
+    const pk = hbmMaxIn(repHbm, a, b), cap = repHbm.cap || 31.25;
+    if (pk != null) cards.push(["rollout HBM peak", pk.toFixed(2) + " GiB (" + pct(pk / cap) + ")", repHbm.nChips + " chips · cap " + cap.toFixed(2) + " GiB"]);
+  }
   document.getElementById("cards").innerHTML = cards.map(c => '<div class="card"><div class="k">' + c[0] + '</div><div class="v">' + c[1] +
     '</div><div class="s">' + (c[2] || "") + "</div></div>").join("");
 
@@ -1463,6 +1583,8 @@ const STEP_COLS = [
   ["chips: log-prob (s)", s => s.rank ? s.rank.logp : undefined, 7],
   ["chips: weight sync (s)", s => s.rank ? s.rank.sync : undefined, 7],
   ["trainer chips idle (s)", s => s.rank ? s.rank.idle : undefined, 7],
+  ["trainer HBM peak (GiB)", s => s.hbmPeak, 7],
+  ["trainer HBM floor (GiB)", s => s.hbmFloor, 7],
   ["req done", s => s.sampler ? s.sampler.nDone : undefined, 5],
   ["aborted", s => s.sampler ? s.sampler.nAbort : undefined, 5],
   ["mean in engine", s => s.sampler ? s.sampler.meanEngine : undefined, 6],
@@ -1633,6 +1755,8 @@ function steadyStats(m) {
     ["↳ sync.p2p_transfer", (ph("sync.p2p_transfer") || 0) + (ph("sync.transfer") || 0), "s"],
     ["↳ sync.sampler_install", ph("sync.sampler_install"), "s"], ["↳ sync.parity_check", ph("sync.parity_check"), "s"],
     ["metrics", ph("metrics"), "s"],
+    ["trainer HBM peak (GiB)", mean(s => s.hbmPeak), "x"],
+    ["trainer HBM floor (GiB)", mean(s => s.hbmFloor), "x"],
   ];
   if (m.replicas.length) {
     rows.push(["rollout generating", mean(s => s.sampler.busy / s.total), "%"], ["rollout paused", mean(s => s.sampler.paused / s.total), "%"],
@@ -1690,6 +1814,14 @@ function exportPerfetto() {
       out.push({ph: "M", name: "thread_name", pid: pi + 1, tid: ti + 1, args: {name: L.id}});
       for (const s of L.spans) out.push({ph: "X", name: s.name, cat: s.cat || "", pid: pi + 1, tid: ti + 1, ts: us(s.t0), dur: us(s.t1 - s.t0), args: Object.assign({step: s.step}, s.args)});
     });
+    const hbm = m.hbm ? m.hbm.get(G.id) : null;
+    if (hbm) {
+      for (const s of hbm.samples) {
+        const chipArgs = {};
+        s.used.forEach((u, c) => { chipArgs["chip_" + c + "_gib"] = u; });
+        out.push({ph: "C", name: "HBM (GiB)", pid: pi + 1, ts: us(s.t), args: chipArgs});
+      }
+    }
     const rep = m.replicas.find(r => r.id === G.id);
     if (rep) {
       for (const q of rep.requests) out.push({ph: "X", name: "request:" + q.stop, cat: "req", pid: pi + 1, tid: 1000 + (q.row || 0),

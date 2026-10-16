@@ -363,6 +363,9 @@ class TorchTitanTPUEngine(BaseEngine):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+        if timeline.trainer_lane() is not None:
+            timeline.start_hbm_sampler(group=timeline.TRAINER_WORKERS, lane=timeline.HBM_LANE)
+
         logger.info(
             "TorchTitanTPUEngine initialized (compile=%s, splash=%s, simple_fsdp=%s, eager_mode=%s)",
             engine_config.use_torch_compile,

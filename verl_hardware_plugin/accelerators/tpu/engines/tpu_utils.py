@@ -246,28 +246,22 @@ def configure_tpu_context_parallel(parallelism: Any, model_config: Any) -> None:
     parallelism.spmd_backend = "spmd_types"
     parallelism.context_parallel_load_balancer = None
 
+    upgrade_map = (
+        (ScaledDotProductInnerAttention.Config, UlyssesCPScaledDotProductInnerAttention.Config),
+        (FlexInnerAttention.Config, UlyssesCPFlexInnerAttention.Config),
+        (VarlenInnerAttention.Config, UlyssesCPVarlenInnerAttention.Config),
+    )
+
     def _upgrade_inner_attn(attn: Any) -> Any:
         owner = getattr(attn, "_owner", None)
         if (owner is not None and isinstance(owner, type) and issubclass(owner, CPInnerAttention)) or isinstance(
             attn,
-            (
-                UlyssesCPFlexInnerAttention.Config,
-                UlyssesCPScaledDotProductInnerAttention.Config,
-                UlyssesCPVarlenInnerAttention.Config,
-            ),
+            tuple(cp_cls for _, cp_cls in upgrade_map),
         ):
             return attn
-        if isinstance(attn, ScaledDotProductInnerAttention.Config):
-            return UlyssesCPScaledDotProductInnerAttention.Config()
-        if isinstance(attn, FlexInnerAttention.Config):
-            return UlyssesCPFlexInnerAttention.Config(
-                block_size=attn.block_size,
-                kernel_options=dict(attn.kernel_options),
-            )
-        if isinstance(attn, VarlenInnerAttention.Config):
-            return UlyssesCPVarlenInnerAttention.Config(
-                window_size=getattr(attn, "window_size", (-1, -1)),
-            )
+        for base_cfg_cls, cp_cfg_cls in upgrade_map:
+            if isinstance(attn, base_cfg_cls):
+                return cp_cfg_cls(**{f.name: getattr(attn, f.name) for f in dataclasses.fields(attn)})
         return attn
 
     visited: set[int] = set()
@@ -941,7 +935,8 @@ def replace_varlen_attention_with_tpu_attention(modules: Any) -> int:
                 continue
             inner = sub.inner_attention
             if callable(getattr(inner, "set_local_attention", None)):
-                if not isinstance(getattr(inner, "_local_attention", None), TPUVarlenAttention | TPUSplashAttention):
+                local_impl = getattr(inner, "_local_attn_override", None) or getattr(inner, "_local_attention", None)
+                if not isinstance(local_impl, TPUVarlenAttention | TPUSplashAttention):
                     inner.set_local_attention(TPUVarlenAttention())
                     replaced += 1
             elif not isinstance(inner, TPUVarlenAttention | TPUSplashAttention):

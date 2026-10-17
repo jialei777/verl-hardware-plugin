@@ -241,16 +241,28 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
 
     cfg_tp = SimpleNamespace(
         use_torch_compile=True,
-        use_splash_attention=True,
-        use_simple_fsdp=True,
-        tpu_eager_mode="DEFER_AND_FUSE",
+        use_splash_attention=None,
+        use_simple_fsdp=None,
+        tpu_eager_mode=None,
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         expert_parallel_size=1,
     )
-    with pytest.raises(ValueError, match="use_simple_fsdp supports pure FSDP/HSDP only"):
-        resolve_tpu_torchtitan_options(cfg_tp)
+    assert resolve_tpu_torchtitan_options(cfg_tp) == (True, True, "DEFER_AND_FUSE")
+
+    cfg_pp = SimpleNamespace(
+        use_torch_compile=True,
+        use_splash_attention=True,
+        use_simple_fsdp=True,
+        tpu_eager_mode="DEFER_AND_FUSE",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        context_parallel_size=1,
+        expert_parallel_size=1,
+    )
+    with pytest.raises(ValueError, match="pipeline/context/expert parallel size 1"):
+        resolve_tpu_torchtitan_options(cfg_pp)
 
 
 def test_replace_varlen_attention_with_tpu_attention():
@@ -331,7 +343,13 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
 
 
 def test_get_ray_init_kwargs_pins_tpu_platform():
-    assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VERL_USE_EXTERNAL_MODULES", None)
+        assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
+    with mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin"}, clear=False):
+        assert PlatformTPU().get_ray_init_kwargs() == {
+            "runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu", "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin"}}
+        }
 
 
 def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
@@ -602,3 +620,243 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
     enable_fsdp_gradient_division(root, 4)
     fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)
+
+
+def test_build_dp_gloo_group_creates_per_tp_rank_gloo_subgroups():
+    """When TP > 1 (dp_size < world_size), `_build_dp_gloo_group` builds a Gloo subgroup per TP slice."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.engine_config = SimpleNamespace(
+        data_parallel_shard_size=2,
+        data_parallel_replicate_size=1,
+    )
+    dataloading_mesh = SimpleNamespace(mesh=torch.tensor([[[[0, 1]], [[2, 3]]]], dtype=torch.int64))
+    engine.parallel_dims = SimpleNamespace(
+        pp=1,
+        cp=1,
+        tp=2,
+        _global_meshes={"dataloading": dataloading_mesh},
+    )
+
+    created_groups = []
+
+    def fake_new_group(ranks=None, backend=None):
+        created_groups.append((list(ranks), backend))
+        return f"gloo_pg_{ranks[0]}_{ranks[1]}"
+
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_world_size", return_value=4),
+        mock.patch("torch.distributed.get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+        mock.patch("torch.distributed.get_rank", return_value=2),
+        mock.patch("torch.distributed.new_group", side_effect=fake_new_group),
+    ):
+        engine._dp_group = engine._build_dp_gloo_group()
+        assert engine.get_data_parallel_group() == "gloo_pg_0_2"
+        # Second call on the same parallel_dims reuses the cached group without calling new_group again.
+        assert engine._build_dp_gloo_group() == "gloo_pg_0_2"
+
+    assert created_groups == [([0, 2], "gloo"), ([1, 3], "gloo")]
+
+
+def test_install_parallel_dims_cache_reuses_parallel_dims_and_meshes(monkeypatch):
+    """`install_parallel_dims_cache_for_tpu` reuses `ParallelDims` and `build_mesh` across actor/ref engines."""
+    import sys
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    build_calls = []
+
+    class FakeParallelDims:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._world_mesh = None
+            self._single_axis_meshes = {}
+
+        @classmethod
+        def from_config(cls, cfg, world_size):
+            return cls(
+                dp_shard=cfg.data_parallel_shard_degree,
+                tp=cfg.tensor_parallel_degree,
+                world_size=world_size,
+            )
+
+        def build_mesh(self):
+            build_calls.append(self)
+            self._world_mesh = SimpleNamespace(name="world")
+            self._single_axis_meshes = {"tp": SimpleNamespace(name="tp")}
+            return self._world_mesh
+
+    fake_pd_mod = SimpleNamespace(ParallelDims=FakeParallelDims)
+    monkeypatch.setitem(sys.modules, "torchtitan", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed.parallel_dims", fake_pd_mod)
+    monkeypatch.setattr(tpu_utils, "_PARALLEL_DIMS_PATCHED", False)
+    monkeypatch.setattr(tpu_utils, "_PARALLEL_DIMS_CACHE", {})
+
+    tpu_utils.install_parallel_dims_cache_for_tpu()
+    cfg = SimpleNamespace(
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=2,
+        context_parallel_degree=1,
+        tensor_parallel_degree=2,
+        pipeline_parallel_degree=1,
+        expert_parallel_degree=1,
+        spmd_backend="default",
+        enable_tpu_topo_mesh=False,
+    )
+    pd1 = FakeParallelDims.from_config(cfg, 4)
+    pd2 = FakeParallelDims.from_config(cfg, 4)
+    assert pd1 is pd2
+    m1 = pd1.build_mesh()
+    m2 = pd2.build_mesh()
+    assert m1 is m2
+    assert len(build_calls) == 1
+
+
+def test_optimizer_step_synchronizes_clip_and_step_in_lockstep(monkeypatch):
+    """`optimizer_step` synchronizes TPU ops after `clip_grad_norm_` and after `optimizer.step()`."""
+    import sys
+
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    events = []
+    fake_dist_utils = SimpleNamespace(
+        clip_grad_norm_=lambda *args, **kwargs: (events.append("clip"), torch.tensor(1.5))[1]
+    )
+    monkeypatch.setitem(sys.modules, "torchtitan", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed", SimpleNamespace(utils=fake_dist_utils))
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed.utils", fake_dist_utils)
+    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: events.append(("sync", kwargs)))
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine._tpu_eager_mode = "DEFER_AND_FUSE"
+    engine.module = [torch.nn.Linear(2, 2)]
+    engine.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
+    engine.parallel_dims = SimpleNamespace(
+        get_optional_mesh=lambda _name: None,
+        ep_enabled=False,
+    )
+    engine.optimizer = SimpleNamespace(
+        step=lambda: events.append("step"),
+        zero_grad=lambda: events.append("zero_grad"),
+    )
+
+    grad_norm_val = engine.optimizer_step()
+    assert grad_norm_val == pytest.approx(1.5)
+    assert events == [
+        "clip",
+        ("sync", {"wait": True}),
+        "step",
+        ("sync", {"wait": True}),
+    ]
+
+
+def test_forward_only_initialize_disables_parameter_grads():
+    """`TorchTitanTPUEngine.initialize()` freezes parameter gradients and drops optimizers when `forward_only=True`."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.engine_config = SimpleNamespace(forward_only=True)
+    engine._is_offload_param = False
+    engine._is_offload_optimizer = False
+    engine._use_splash_attention = True
+
+    layer = torch.nn.Linear(4, 4)
+    assert all(p.requires_grad for p in layer.parameters())
+
+    engine.trainer = SimpleNamespace(
+        model_parts=[layer],
+        checkpointer=SimpleNamespace(load=lambda: None, states={}),
+        optimizers="dummy_opt",
+        lr_schedulers="dummy_sched",
+    )
+
+    with (
+        mock.patch("verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu.apply_splash_attention_tpu"),
+        mock.patch("verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu.log_gpu_memory_usage"),
+    ):
+        engine.initialize()
+
+    assert engine.optimizer is None
+    assert engine.lr_scheduler is None
+    assert engine.trainer.optimizers is None
+    assert engine.trainer.lr_schedulers is None
+    assert all(not p.requires_grad for p in layer.parameters())
+
+
+def test_install_sync_dtensor_redistribute_for_tpu_unwraps_async_collective_tensor(monkeypatch):
+    """`install_sync_dtensor_redistribute_for_tpu` forces `async_op=False` and waits `AsyncCollectiveTensor`."""
+    import torch.distributed.tensor._redistribute as _redist
+    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import install_sync_dtensor_redistribute_for_tpu
+
+    waited = []
+    redist_calls = []
+
+    class FakeAsyncTensor(AsyncCollectiveTensor):
+        def __new__(cls, elem):
+            return super().__new__(cls, elem)
+
+        def wait(self):
+            waited.append(self.elem)
+            return self.elem
+
+    def fake_orig_rlt(local_tensor, current_spec, target_spec, *, async_op=False, **kwargs):
+        redist_calls.append(async_op)
+        return FakeAsyncTensor(local_tensor + 2)
+
+    monkeypatch.setattr(tpu_utils, "_SYNC_DTENSOR_REDISTRIBUTE_PATCHED", False)
+    monkeypatch.setattr(_redist, "redistribute_local_tensor", fake_orig_rlt)
+
+    install_sync_dtensor_redistribute_for_tpu()
+    # Idempotent on repeated calls
+    install_sync_dtensor_redistribute_for_tpu()
+
+    inp = torch.ones(2, 4)
+    r_out = _redist.redistribute_local_tensor(inp, None, None, async_op=True, is_explicit=True)
+    assert redist_calls == [False]
+    assert len(waited) == 1
+    assert torch.equal(r_out, inp + 2)
+    assert not isinstance(r_out, AsyncCollectiveTensor)
+
+
+def test_compute_tpu_logprobs_chunked_matches_logprobs_from_logits_naive():
+    """`compute_tpu_logprobs_chunked` matches `logprobs_from_logits_naive` in forward and backward."""
+    from verl.utils.torch_functional import logprobs_from_logits_naive
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import compute_tpu_logprobs_chunked
+
+    torch.manual_seed(0)
+    logits_ref = torch.randn(1, 20, 32, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, 32, (20,), dtype=torch.int64)
+    grad_out = torch.randn(20, dtype=torch.float32)
+    temperature = 1.25
+
+    lp_ref = logprobs_from_logits_naive(logits_ref.squeeze(0) / temperature, labels)
+    lp_ref.backward(grad_out)
+
+    logits_chunked = logits_ref.detach().clone().requires_grad_(True)
+    lp_chunked = compute_tpu_logprobs_chunked(
+        logits_chunked,
+        labels.unsqueeze(0),
+        temperature=temperature,
+        chunk_size=8,
+    )
+    assert lp_chunked.grad_fn is not None and "_TPULogProbsChunkedFnBackward" in type(lp_chunked.grad_fn).__name__
+    lp_chunked.backward(grad_out)
+
+    torch.testing.assert_close(lp_chunked, lp_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(logits_chunked.grad, logits_ref.grad, rtol=1e-5, atol=1e-6)
+
+    with torch.no_grad():
+        lp_nograd = compute_tpu_logprobs_chunked(
+            logits_ref.detach(),
+            labels,
+            temperature=temperature,
+            chunk_size=8,
+        )
+    torch.testing.assert_close(lp_nograd, lp_ref.detach(), rtol=1e-5, atol=1e-6)

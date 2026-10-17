@@ -39,12 +39,6 @@ def _ensure_torch_tpu() -> bool:
     if hasattr(torch, "tpu"):
         return True
     try:
-        import importlib.util
-
-        if importlib.util.find_spec("torch_tpu") is not None:
-            libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "--xla_tpu_use_enhanced_launch_barrier=false")
-            if "--xla_tpu_scoped_vmem_limit_kib" not in libtpu_args:
-                os.environ["LIBTPU_INIT_ARGS"] = f"{libtpu_args} --xla_tpu_scoped_vmem_limit_kib=65536".strip()
         import torch_tpu  # noqa: F401
 
         return hasattr(torch, "tpu")
@@ -629,10 +623,6 @@ class PlatformTPU(PlatformBase):
             "LOCAL_RANK": str(local_rank),
             "LOCAL_WORLD_SIZE": str(local_world_size),
         }
-        libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "--xla_tpu_use_enhanced_launch_barrier=false")
-        if "--xla_tpu_scoped_vmem_limit_kib" not in libtpu_args:
-            libtpu_args = f"{libtpu_args} --xla_tpu_scoped_vmem_limit_kib=65536".strip()
-        env_vars["LIBTPU_INIT_ARGS"] = libtpu_args
 
         # Derive the mesh from the pod type Ray reports, falling back to the chip count.
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]

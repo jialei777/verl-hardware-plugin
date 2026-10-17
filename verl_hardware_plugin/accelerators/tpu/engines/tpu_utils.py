@@ -230,6 +230,13 @@ def configure_tpu_context_parallel(parallelism: Any, model_config: Any) -> None:
     cp = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
     if cp <= 1:
         return
+    try:
+        from torchtitan.experiments.tpu.cp_attention import configure_tpu_context_parallel as _tt_configure_cp
+
+        _tt_configure_cp(parallelism, model_config)
+        return
+    except ImportError:
+        pass
 
     from torchtitan.models.common.attention import (
         FlexInnerAttention,
@@ -245,45 +252,23 @@ def configure_tpu_context_parallel(parallelism: Any, model_config: Any) -> None:
 
     parallelism.spmd_backend = "spmd_types"
     parallelism.context_parallel_load_balancer = None
-
     upgrade_map = (
         (ScaledDotProductInnerAttention.Config, UlyssesCPScaledDotProductInnerAttention.Config),
         (FlexInnerAttention.Config, UlyssesCPFlexInnerAttention.Config),
         (VarlenInnerAttention.Config, UlyssesCPVarlenInnerAttention.Config),
     )
-
-    def _upgrade_inner_attn(attn: Any) -> Any:
-        owner = getattr(attn, "_owner", None)
-        if (owner is not None and isinstance(owner, type) and issubclass(owner, CPInnerAttention)) or isinstance(
-            attn,
-            tuple(cp_cls for _, cp_cls in upgrade_map),
-        ):
-            return attn
+    for layer in getattr(model_config, "layers", ()) or ():
+        attn_cfg = getattr(layer, "attention", None)
+        inner = getattr(attn_cfg, "inner_attention", None)
+        owner = getattr(inner, "_owner", None)
+        if inner is None or (owner is not None and isinstance(owner, type) and issubclass(owner, CPInnerAttention)):
+            continue
         for base_cfg_cls, cp_cfg_cls in upgrade_map:
-            if isinstance(attn, base_cfg_cls):
-                return cp_cfg_cls(**{f.name: getattr(attn, f.name) for f in dataclasses.fields(attn)})
-        return attn
-
-    visited: set[int] = set()
-
-    def _walk(obj: Any) -> None:
-        obj_id = id(obj)
-        if obj_id in visited:
-            return
-        visited.add(obj_id)
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            if hasattr(obj, "inner_attention") and obj.inner_attention is not None:
-                obj.inner_attention = _upgrade_inner_attn(obj.inner_attention)
-            for f in dataclasses.fields(obj):
-                _walk(getattr(obj, f.name, None))
-        elif isinstance(obj, list | tuple):
-            for item in obj:
-                _walk(item)
-        elif isinstance(obj, dict):
-            for item in obj.values():
-                _walk(item)
-
-    _walk(model_config)
+            if isinstance(inner, base_cfg_cls) and not isinstance(inner, cp_cfg_cls):
+                attn_cfg.inner_attention = cp_cfg_cls(
+                    **{f.name: getattr(inner, f.name) for f in dataclasses.fields(inner)}
+                )
+                break
 
 
 def extend_torchtitan_engine_config() -> None:
@@ -339,6 +324,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
        (for pure FSDP/HSDP where TP/PP/CP/EP == 1), and ``DEFER_AND_FUSE``.
     """
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
+    cp_enabled = int(getattr(engine_config, "context_parallel_size", 1) or 1) > 1
 
     splash_env = _parse_optional_bool_env("VERL_TPU_USE_SPLASH_ATTENTION")
     splash_cfg = getattr(engine_config, "use_splash_attention", None)
@@ -347,7 +333,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     elif splash_cfg is not None:
         use_splash_attention = bool(splash_cfg)
     else:
-        use_splash_attention = use_torch_compile
+        use_splash_attention = use_torch_compile or cp_enabled
 
     if use_torch_compile and not use_splash_attention:
         raise ValueError(
@@ -427,15 +413,10 @@ def install_parallel_dims_cache_for_tpu() -> None:
         )
         key = (
             world_pg_id,
-            getattr(parallelism_config, "data_parallel_replicate_degree", 1),
-            getattr(parallelism_config, "data_parallel_shard_degree", -1),
-            getattr(parallelism_config, "context_parallel_degree", 1),
-            getattr(parallelism_config, "tensor_parallel_degree", 1),
-            getattr(parallelism_config, "pipeline_parallel_degree", 1),
-            getattr(parallelism_config, "expert_parallel_degree", 1),
             world_size,
-            getattr(parallelism_config, "spmd_backend", "partial_dtensor"),
-            getattr(parallelism_config, "enable_tpu_topo_mesh", False),
+            dataclasses.astuple(parallelism_config)
+            if dataclasses.is_dataclass(parallelism_config)
+            else id(parallelism_config),
         )
         cached = _PARALLEL_DIMS_CACHE.get(key)
         if cached is None:
@@ -872,9 +853,7 @@ def apply_splash_attention_tpu(modules: Any) -> int:
     """
     if modules is None:
         return 0
-    attn_mod = importlib.import_module("torchtitan.models.common.attention")
-    VarlenInnerAttention = attn_mod.VarlenInnerAttention
-    ScaledDotProductInnerAttention = getattr(attn_mod, "ScaledDotProductInnerAttention", None)
+    from torchtitan.models.common.attention import VarlenInnerAttention
 
     model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
     replaced = 0
@@ -900,16 +879,11 @@ def apply_splash_attention_tpu(modules: Any) -> int:
             if isinstance(window, tuple) and len(window) == 2 and window[0] >= 0:
                 local_window_size = int(window[0])
             # torchtitan's VarlenInnerAttention calls the CUDA flash-attention varlen op, which TPU lacks.
-            if isinstance(inner, VarlenInnerAttention):
-                fallback = TPUVarlenAttention()
-            elif has_local_attn_hook:
-                fallback = (
-                    ScaledDotProductInnerAttention(ScaledDotProductInnerAttention.Config())
-                    if ScaledDotProductInnerAttention is not None
-                    else TPUVarlenAttention()
-                )
-            else:
-                fallback = inner
+            fallback = (
+                TPUVarlenAttention()
+                if isinstance(inner, VarlenInnerAttention)
+                else getattr(inner, "local_forward", inner)
+            )
             splash = TPUSplashAttention(fallback, local_window_size=local_window_size)
             if has_local_attn_hook:
                 inner.set_local_attention(splash)

@@ -13,7 +13,7 @@ decoupled from core verl's GPU TorchTitan engine:
 - ``TPUSplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
-- ``OptimizersContainer.Config(implementation="for-loop")`` and ``foreach=False`` grad norm clipping
+- ``OptimizersContainer.Config(implementation="foreach")`` and ``foreach=False`` grad norm clipping
 - Host-side global token counting (avoiding eager device collectives inside the XLA SPMD trace)
 - Graph-break loss synchronization between forward and backward
 - Sequence-length bucketing for both packed (``use_remove_padding=True``) and padded inputs
@@ -229,7 +229,7 @@ class TorchTitanTPUEngine(BaseEngine):
             )
 
         optimizer = OptimizersContainer.Config(
-            implementation="for-loop",
+            implementation="foreach",
             param_groups=[
                 ParamGroupConfig(
                     pattern=r".*",
@@ -430,7 +430,7 @@ class TorchTitanTPUEngine(BaseEngine):
         self._dp_group = self._build_gloo_data_parallel_group()
 
     def _build_gloo_data_parallel_group(self):
-        """Build a CPU Gloo ProcessGroup for the data-parallel axis.
+        """Build a CPU Gloo ProcessGroup for the data-parallel axis when CP is active.
 
         In verl, ``TrainingWorker._postprocess_output`` and ``SFTTrainer.fit`` invoke collectives on
         ``get_data_parallel_group()`` only on ``is_mp_src_rank_with_outputs()`` ranks (e.g. ``cp_rank == 0``).
@@ -438,7 +438,7 @@ class TorchTitanTPUEngine(BaseEngine):
         lockstep, whereas a CPU Gloo subgroup allows each DP subgroup (such as ``cp_rank == 0``) to communicate
         independently.
         """
-        if not torch.distributed.is_initialized():
+        if not torch.distributed.is_initialized() or getattr(self.engine_config, "context_parallel_size", 1) <= 1:
             return None
         pd_dict = getattr(self.parallel_dims, "__dict__", {})
         if "_verl_dp_gloo_group" in pd_dict:
@@ -581,7 +581,7 @@ class TorchTitanTPUEngine(BaseEngine):
             dp_group=dp_group,
             same_micro_num_in_dp=True,
         )
-        if self._use_simple_fsdp:
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled:
             align_micro_batch_shapes_across_ranks(
                 micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
             )

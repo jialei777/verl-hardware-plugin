@@ -255,8 +255,8 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
         resolve_tpu_torchtitan_options(cfg_tp)
 
     cfg_cp = SimpleNamespace(
-        use_torch_compile=True,
-        use_splash_attention=True,
+        use_torch_compile=False,
+        use_splash_attention=None,
         use_simple_fsdp=True,
         tpu_eager_mode="DEFER_AND_FUSE",
         tensor_parallel_size=1,
@@ -764,6 +764,7 @@ def test_build_gloo_data_parallel_group_enumerates_batch_axis():
         mesh_dim_names=("batch", "cp"),
     )
     dummy_engine = SimpleNamespace(
+        engine_config=SimpleNamespace(context_parallel_size=2),
         parallel_dims=SimpleNamespace(_global_meshes={"dataloading": dataloading_mesh}),
         _dp_group=None,
     )

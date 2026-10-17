@@ -225,52 +225,6 @@ class ContextParallelGather(torch.autograd.Function):
             return grad_output.chunk(ctx.world_size, dim=0)[ctx.rank], None
 
 
-def configure_tpu_context_parallel(parallelism: Any, model_config: Any) -> None:
-    """Configure ``ParallelismConfig`` and ``model_config`` for Ulysses Context Parallelism on TPU."""
-    cp = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
-    if cp <= 1:
-        return
-    try:
-        from torchtitan.experiments.tpu.cp_attention import configure_tpu_context_parallel as _tt_configure_cp
-
-        _tt_configure_cp(parallelism, model_config)
-        return
-    except ImportError:
-        pass
-
-    from torchtitan.models.common.attention import (
-        FlexInnerAttention,
-        ScaledDotProductInnerAttention,
-        VarlenInnerAttention,
-    )
-    from torchtitan.models.common.cp_attention import (
-        CPInnerAttention,
-        UlyssesCPFlexInnerAttention,
-        UlyssesCPScaledDotProductInnerAttention,
-        UlyssesCPVarlenInnerAttention,
-    )
-
-    parallelism.spmd_backend = "spmd_types"
-    parallelism.context_parallel_load_balancer = None
-    upgrade_map = (
-        (ScaledDotProductInnerAttention.Config, UlyssesCPScaledDotProductInnerAttention.Config),
-        (FlexInnerAttention.Config, UlyssesCPFlexInnerAttention.Config),
-        (VarlenInnerAttention.Config, UlyssesCPVarlenInnerAttention.Config),
-    )
-    for layer in getattr(model_config, "layers", ()) or ():
-        attn_cfg = getattr(layer, "attention", None)
-        inner = getattr(attn_cfg, "inner_attention", None)
-        owner = getattr(inner, "_owner", None)
-        if inner is None or (owner is not None and isinstance(owner, type) and issubclass(owner, CPInnerAttention)):
-            continue
-        for base_cfg_cls, cp_cfg_cls in upgrade_map:
-            if isinstance(inner, base_cfg_cls) and not isinstance(inner, cp_cfg_cls):
-                attn_cfg.inner_attention = cp_cfg_cls(
-                    **{f.name: getattr(inner, f.name) for f in dataclasses.fields(inner)}
-                )
-                break
-
-
 def extend_torchtitan_engine_config() -> None:
     """Register TPU-specific optional fields on ``TorchtitanEngineConfig`` for Hydra/OmegaConf."""
     extras: list[tuple[str, Any, Any]] = [

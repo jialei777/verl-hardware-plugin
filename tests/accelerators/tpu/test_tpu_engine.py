@@ -28,7 +28,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
-    configure_tpu_context_parallel,
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
@@ -648,95 +647,7 @@ def test_context_parallel_splash_and_varlen_preserve_cp_wrapper():
     assert replace_varlen_attention_with_tpu_attention([model_varlen]) == 0
 
 
-def test_configure_tpu_context_parallel_and_token_count():
-    import dataclasses
-
-    attention_mod = types.ModuleType("torchtitan.models.common.attention")
-    cp_attention_mod = types.ModuleType("torchtitan.models.common.cp_attention")
-
-    class _BaseCfg:
-        pass
-
-    class ScaledDotProductInnerAttention:
-        @dataclasses.dataclass
-        class Config(_BaseCfg):
-            pass
-
-    class FlexInnerAttention:
-        @dataclasses.dataclass
-        class Config(_BaseCfg):
-            block_size: int = 128
-            kernel_options: dict = dataclasses.field(default_factory=dict)
-
-    class VarlenInnerAttention:
-        @dataclasses.dataclass
-        class Config(_BaseCfg):
-            window_size: tuple[int, int] = (-1, -1)
-
-    class CPInnerAttention:
-        pass
-
-    class UlyssesCPScaledDotProductInnerAttention(CPInnerAttention, ScaledDotProductInnerAttention):
-        @dataclasses.dataclass
-        class Config(ScaledDotProductInnerAttention.Config):
-            pass
-
-    class UlyssesCPFlexInnerAttention(CPInnerAttention, FlexInnerAttention):
-        @dataclasses.dataclass
-        class Config(FlexInnerAttention.Config):
-            block_size: int = 128
-            kernel_options: dict = dataclasses.field(default_factory=dict)
-
-    class UlyssesCPVarlenInnerAttention(CPInnerAttention, VarlenInnerAttention):
-        @dataclasses.dataclass
-        class Config(VarlenInnerAttention.Config):
-            window_size: tuple[int, int] = (-1, -1)
-
-    attention_mod.ScaledDotProductInnerAttention = ScaledDotProductInnerAttention  # type: ignore[attr-defined]
-    attention_mod.FlexInnerAttention = FlexInnerAttention  # type: ignore[attr-defined]
-    attention_mod.VarlenInnerAttention = VarlenInnerAttention  # type: ignore[attr-defined]
-    cp_attention_mod.CPInnerAttention = CPInnerAttention  # type: ignore[attr-defined]
-    cp_attention_mod.UlyssesCPScaledDotProductInnerAttention = UlyssesCPScaledDotProductInnerAttention  # type: ignore[attr-defined]
-    cp_attention_mod.UlyssesCPFlexInnerAttention = UlyssesCPFlexInnerAttention  # type: ignore[attr-defined]
-    cp_attention_mod.UlyssesCPVarlenInnerAttention = UlyssesCPVarlenInnerAttention  # type: ignore[attr-defined]
-
-    @dataclasses.dataclass
-    class _AttnCfg:
-        inner_attention: object
-
-    @dataclasses.dataclass
-    class _LayerCfg:
-        attention: _AttnCfg
-
-    @dataclasses.dataclass
-    class _ModelCfg:
-        layers: list[_LayerCfg]
-
-    parallelism = SimpleNamespace(
-        context_parallel_degree=2,
-        spmd_backend="default",
-        context_parallel_load_balancer="headtail",
-    )
-    model_cfg = _ModelCfg(
-        layers=[
-            _LayerCfg(attention=_AttnCfg(inner_attention=ScaledDotProductInnerAttention.Config())),
-            _LayerCfg(attention=_AttnCfg(inner_attention=VarlenInnerAttention.Config())),
-        ]
-    )
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "torchtitan.models.common.attention": attention_mod,
-            "torchtitan.models.common.cp_attention": cp_attention_mod,
-        },
-    ):
-        configure_tpu_context_parallel(parallelism, model_cfg)
-
-    assert parallelism.spmd_backend == "spmd_types"
-    assert parallelism.context_parallel_load_balancer is None
-    assert isinstance(model_cfg.layers[0].attention.inner_attention, UlyssesCPScaledDotProductInnerAttention.Config)
-    assert isinstance(model_cfg.layers[1].attention.inner_attention, UlyssesCPVarlenInnerAttention.Config)
-
+def test_cp_bucket_size_and_token_count():
     # Sequence bucket size aligns to 2 * cp_size when needed
     cfg_cp3 = SimpleNamespace(pad_to_length=True, pad_to_length_bucket=256, context_parallel_size=3)
     with mock.patch.dict(os.environ, {}, clear=False):

@@ -67,7 +67,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
-    configure_tpu_context_parallel,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
@@ -187,6 +186,7 @@ class TorchTitanTPUEngine(BaseEngine):
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
         from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
         from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+        from torchtitan.experiments.tpu.cp_attention import configure_tpu_context_parallel
         from torchtitan.trainer import Trainer
 
         super().__init__()
@@ -967,10 +967,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         extra_kwargs = {"attention_masks": attention_mask}
 
         if self.parallel_dims.cp_enabled:
-            try:
-                from torchtitan.distributed.context_parallel.api import prepare_context_parallel_input
-            except ImportError:
-                from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+            from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 
             cp_batch: dict[str, Any] = {
                 "input": input_ids,

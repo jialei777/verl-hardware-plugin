@@ -819,21 +819,24 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
+        fused_log_probs = None
         if isinstance(logits, tuple):
             hidden_states, lm_head_weight_t = logits
-            if use_remove_padding and not calculate_entropy and not self.parallel_dims.tp_enabled:
+            if use_remove_padding and not self.parallel_dims.tp_enabled:
                 if labels.dim() > 1:
                     labels = labels.squeeze(0)
                 hidden_rmpad = hidden_states.squeeze(0) if hidden_states.dim() > 2 else hidden_states
-                log_probs = fused_linear_logprobs_tpu(
+                fused_log_probs = fused_linear_logprobs_tpu(
                     hidden_rmpad,
                     labels,
                     lm_head_weight_t,
                     temperature=temperature,
                 )
-                padded_log_probs = log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs
-                model_output["log_probs"] = _to_jagged(padded_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
-                return model_output
+                if not calculate_entropy:
+                    model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
+                    return model_output
+            # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
+            # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
             logits = hidden_states @ lm_head_weight_t
 
         if use_remove_padding:
@@ -844,7 +847,10 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             # Like verl's GPU path (flash-attn cross entropy, CUDA autocast), take the log-softmax and entropy of
             # the bf16 logits in fp32; torch_tpu's autocast would leave them in bf16.
             logits_rmpad = logits_rmpad.float()
-            log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
+            if fused_log_probs is not None:
+                log_probs = fused_log_probs
+            else:
+                log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
 
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:

@@ -622,6 +622,50 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
         assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]
 
 
+@pytest.mark.parametrize("calculate_entropy", [False, True])
+def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pass(calculate_entropy):
+    """With the fused LM head, log-probs come from the fused kernel also when entropy is requested.
+
+    The reference, old-log-prob (entropy) and update passes then compute log-probs the same way, so an on-policy
+    PPO ratio is exactly 1. Entropy is taken from the logits in fp32, as on GPU.
+    """
+    import verl.utils.torch_functional as verl_F
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    seq_lens, hidden_dim, vocab = [3, 5], 4, 6
+    total = sum(seq_lens)
+    hidden = torch.randn(1, total, hidden_dim)
+    weight_t = torch.randn(hidden_dim, vocab)
+    labels = torch.randint(0, vocab, (1, total))
+    fused_values = torch.full((total,), -0.25)
+
+    engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
+    engine.parallel_dims = SimpleNamespace(tp_enabled=False)
+    engine.engine_config = SimpleNamespace(entropy_checkpointing=False, entropy_from_logits_with_chunking=False)
+    engine.compute_entropy_from_logits = verl_F.entropy_from_logits
+
+    micro_batch = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.zeros(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged
+            )
+        },
+        batch_size=[len(seq_lens)],
+    )
+    tu.assign_non_tensor(micro_batch, use_remove_padding=True, calculate_entropy=calculate_entropy, temperature=1.0)
+
+    with mock.patch.object(torchtitan_tpu, "fused_linear_logprobs_tpu", return_value=fused_values) as fused:
+        output = engine.prepare_model_outputs((hidden, weight_t), {"labels": labels}, micro_batch)
+
+    fused.assert_called_once()
+    torch.testing.assert_close(output["log_probs"].values(), fused_values)
+    if calculate_entropy:
+        expected_entropy = verl_F.entropy_from_logits((hidden.squeeze(0) @ weight_t).float())
+        torch.testing.assert_close(output["entropy"].values(), expected_entropy)
+    else:
+        assert "entropy" not in output
+
+
 def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(tmp_path):
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, Shard, init_device_mesh

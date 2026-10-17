@@ -26,6 +26,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPUVarlenAttention,
     apply_splash_attention_tpu,
     bucket_length,
+    compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
@@ -251,6 +252,18 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
     )
     with pytest.raises(ValueError, match="use_simple_fsdp supports pure FSDP/HSDP only"):
         resolve_tpu_torchtitan_options(cfg_tp)
+
+    cfg_cp = SimpleNamespace(
+        use_torch_compile=False,
+        use_splash_attention=None,
+        use_simple_fsdp=True,
+        tpu_eager_mode="DEFER_AND_FUSE",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        context_parallel_size=2,
+        expert_parallel_size=1,
+    )
+    assert resolve_tpu_torchtitan_options(cfg_cp) == (True, True, "DEFER_AND_FUSE")
 
 
 def test_replace_varlen_attention_with_tpu_attention():
@@ -602,3 +615,116 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
     enable_fsdp_gradient_division(root, 4)
     fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)
+
+
+def test_context_parallel_splash_and_varlen_preserve_cp_wrapper():
+    class _DummyCPInnerAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.window_size = (256, 0)
+            self._local_attention = None
+
+        def set_local_attention(self, fn):
+            self._local_attention = fn
+
+    class _DummyAttnBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner_attention = _DummyCPInnerAttn()
+
+    model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
+    with mock.patch.dict(sys.modules, _fake_torchtitan_modules()):
+        assert apply_splash_attention_tpu([model]) == 2
+        assert isinstance(model[0].inner_attention, _DummyCPInnerAttn)
+        assert isinstance(model[0].inner_attention._local_attention, TPUSplashAttention)
+        assert model[0].inner_attention._local_attention.local_window_size == 256
+        assert apply_splash_attention_tpu([model]) == 0
+
+    model_varlen = torch.nn.Sequential(_DummyAttnBlock())
+    assert replace_varlen_attention_with_tpu_attention([model_varlen]) == 1
+    assert isinstance(model_varlen[0].inner_attention, _DummyCPInnerAttn)
+    assert isinstance(model_varlen[0].inner_attention._local_attention, TPUVarlenAttention)
+    assert replace_varlen_attention_with_tpu_attention([model_varlen]) == 0
+
+
+def test_cp_bucket_size_and_token_count():
+    # Sequence bucket size aligns to 2 * cp_size when needed
+    cfg_cp3 = SimpleNamespace(pad_to_length=True, pad_to_length_bucket=256, context_parallel_size=3)
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VERL_TPU_SEQ_BUCKET_SIZE", None)
+        assert get_tpu_seq_bucket_size(cfg_cp3) == 768
+
+    # compute_global_batch_num_tokens divides by tp_size * cp_size when distributed is initialized
+    data = TensorDict({"loss_mask": torch.ones(4, 10, dtype=torch.int64)}, batch_size=[4])
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.all_reduce", side_effect=lambda t, op=None: t.mul_(4)),
+    ):
+        assert compute_global_batch_num_tokens(data, None, tp_size=1, cp_size=2) == 80
+
+
+def test_build_gloo_data_parallel_group_enumerates_batch_axis():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    # 2x2 dataloading mesh with dims ("batch", "cp"):
+    # [[0, 1],
+    #  [2, 3]]
+    # DP subgroups along "batch" must be [[0, 2], [1, 3]] so cp_rank=0 ranks (0, 2) form a DP group.
+    dataloading_mesh = SimpleNamespace(
+        mesh=torch.tensor([[0, 1], [2, 3]]),
+        mesh_dim_names=("batch", "cp"),
+    )
+    dummy_engine = SimpleNamespace(
+        engine_config=SimpleNamespace(context_parallel_size=2),
+        parallel_dims=SimpleNamespace(_global_meshes={"dataloading": dataloading_mesh}),
+        _dp_group=None,
+    )
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+        mock.patch(
+            "torch.distributed.new_subgroups_by_enumeration",
+            return_value=("gloo_dp_pg", ["gloo_dp_pg_0", "gloo_dp_pg_1"]),
+        ) as mock_subgroups,
+    ):
+        dp_group = TorchTitanTPUEngine._build_gloo_data_parallel_group(dummy_engine)
+        assert dp_group == "gloo_dp_pg"
+        mock_subgroups.assert_called_once_with([[0, 2], [1, 3]], backend="gloo")
+        dummy_engine._dp_group = dp_group
+        assert TorchTitanTPUEngine.get_data_parallel_group(dummy_engine) == "gloo_dp_pg"
+
+
+def test_optimizer_step_synchronizes_clip_and_step_in_lockstep(monkeypatch):
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    events = []
+    fake_dist_utils = SimpleNamespace(
+        clip_grad_norm_=lambda *args, **kwargs: (events.append("clip"), torch.tensor(1.5))[1]
+    )
+    monkeypatch.setitem(sys.modules, "torchtitan", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed", SimpleNamespace(utils=fake_dist_utils))
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed.utils", fake_dist_utils)
+    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: events.append(("sync", kwargs)))
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine._tpu_eager_mode = "DEFER_AND_FUSE"
+    engine.module = [torch.nn.Linear(2, 2)]
+    engine.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
+    engine.parallel_dims = SimpleNamespace(
+        get_optional_mesh=lambda _name: None,
+        ep_enabled=False,
+    )
+    engine.optimizer = SimpleNamespace(
+        step=lambda: events.append("step"),
+        zero_grad=lambda: events.append("zero_grad"),
+    )
+
+    grad_norm_val = engine.optimizer_step()
+    assert grad_norm_val == pytest.approx(1.5)
+    assert events == [
+        "clip",
+        ("sync", {"wait": True}),
+        "step",
+        ("sync", {"wait": True}),
+    ]

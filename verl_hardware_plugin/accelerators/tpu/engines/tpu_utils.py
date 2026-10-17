@@ -11,11 +11,13 @@ eager-mode contexts for ``torch_tpu`` training.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import logging
+import math
 import os
 from collections.abc import Callable, Iterator
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -187,6 +189,18 @@ def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
             module.set_gradient_divide_factor(float(dp_size))
 
 
+@contextmanager
+def spmd_no_typecheck_context():
+    """Disable ``spmd_types`` type-checking when ``spmd_types`` is installed and active."""
+    try:
+        import spmd_types as spmd
+    except ImportError:
+        yield
+        return
+    with spmd.no_typecheck():
+        yield
+
+
 class ContextParallelGather(torch.autograd.Function):
     """All-gather along dim 0 whose backward keeps only the local slice.
 
@@ -197,16 +211,18 @@ class ContextParallelGather(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
-        ctx.rank = torch.distributed.get_rank(group)
-        ctx.world_size = torch.distributed.get_world_size(group)
-        tensor = tensor.contiguous()
-        gathered = tensor.new_empty((tensor.size(0) * ctx.world_size, *tensor.shape[1:]))
-        torch.distributed.all_gather_into_tensor(gathered, tensor, group=group)
-        return gathered
+        with spmd_no_typecheck_context():
+            ctx.rank = torch.distributed.get_rank(group)
+            ctx.world_size = torch.distributed.get_world_size(group)
+            tensor = tensor.contiguous()
+            gathered = tensor.new_empty((tensor.size(0) * ctx.world_size, *tensor.shape[1:]))
+            torch.distributed.all_gather_into_tensor(gathered, tensor, group=group)
+            return gathered
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
-        return grad_output.chunk(ctx.world_size, dim=0)[ctx.rank], None
+        with spmd_no_typecheck_context():
+            return grad_output.chunk(ctx.world_size, dim=0)[ctx.rank], None
 
 
 def extend_torchtitan_engine_config() -> None:
@@ -262,6 +278,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
        (for pure FSDP/HSDP where TP/PP/CP/EP == 1), and ``DEFER_AND_FUSE``.
     """
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
+    cp_enabled = int(getattr(engine_config, "context_parallel_size", 1) or 1) > 1
 
     splash_env = _parse_optional_bool_env("VERL_TPU_USE_SPLASH_ATTENTION")
     splash_cfg = getattr(engine_config, "use_splash_attention", None)
@@ -270,7 +287,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     elif splash_cfg is not None:
         use_splash_attention = bool(splash_cfg)
     else:
-        use_splash_attention = use_torch_compile
+        use_splash_attention = use_torch_compile or cp_enabled
 
     if use_torch_compile and not use_splash_attention:
         raise ValueError(
@@ -283,7 +300,6 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     pure_fsdp = (
         getattr(engine_config, "tensor_parallel_size", 1) == 1
         and getattr(engine_config, "pipeline_parallel_size", 1) == 1
-        and getattr(engine_config, "context_parallel_size", 1) == 1
         and getattr(engine_config, "expert_parallel_size", 1) == 1
     )
     simple_fsdp_env = _parse_optional_bool_env("VERL_TPU_USE_SIMPLE_FSDP")
@@ -296,9 +312,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
         use_simple_fsdp = bool(use_torch_compile and pure_fsdp)
 
     if use_simple_fsdp and not pure_fsdp:
-        raise ValueError(
-            "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
-        )
+        raise ValueError("use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/expert parallel size 1)")
 
     eager_env = os.environ.get("VERL_TPU_EAGER_MODE")
     eager_cfg = getattr(engine_config, "tpu_eager_mode", None)
@@ -315,6 +329,63 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
         raise ValueError(f"tpu_eager_mode {tpu_eager_mode!r} not supported")
 
     return use_splash_attention, use_simple_fsdp, tpu_eager_mode
+
+
+_PARALLEL_DIMS_CACHE: dict[tuple[Any, ...], Any] = {}
+_PARALLEL_DIMS_PATCHED = False
+
+
+def install_parallel_dims_cache_for_tpu() -> None:
+    """Reuse ``ParallelDims`` and its ``DeviceMesh`` objects across engines in the same process.
+
+    ``ActorRolloutRefWorker`` initializes both ``actor`` and ``ref`` ``TorchTitanTPUEngine`` instances
+    in the same worker process. TorchTitan's ``ParallelDims`` caches ``DeviceMesh`` instances on ``self``
+    because Dynamo traces ``DeviceMesh`` as a ``FakeScriptObject`` matched by object identity, whereas
+    ``DTensor``'s ``ShardingPropagator`` LRU cache hashes ``DeviceMesh`` by value. Caching
+    ``ParallelDims.from_config`` and making ``ParallelDims.build_mesh`` idempotent ensures ``actor`` and
+    ``ref`` share the exact same ``DeviceMesh`` Python instances and process groups.
+    """
+    global _PARALLEL_DIMS_PATCHED
+    if _PARALLEL_DIMS_PATCHED:
+        return
+    try:
+        from torchtitan.distributed.parallel_dims import ParallelDims
+    except ImportError:
+        return
+
+    orig_from_config = getattr(ParallelDims.from_config, "__func__", None)
+    orig_build_mesh = getattr(ParallelDims, "build_mesh", None)
+    if orig_from_config is None or orig_build_mesh is None:
+        return
+
+    @classmethod  # type: ignore[misc]
+    def _cached_from_config(cls, parallelism_config: Any, world_size: int) -> Any:
+        world_pg_id = (
+            id(torch.distributed.group.WORLD)
+            if torch.distributed.is_initialized() and torch.distributed.group.WORLD is not None
+            else None
+        )
+        key = (
+            world_pg_id,
+            world_size,
+            dataclasses.astuple(parallelism_config)
+            if dataclasses.is_dataclass(parallelism_config)
+            else id(parallelism_config),
+        )
+        cached = _PARALLEL_DIMS_CACHE.get(key)
+        if cached is None:
+            cached = orig_from_config(cls, parallelism_config, world_size)
+            _PARALLEL_DIMS_CACHE[key] = cached
+        return cached
+
+    def _cached_build_mesh(self: Any) -> Any:
+        if getattr(self, "_world_mesh", None) is not None and getattr(self, "_single_axis_meshes", None):
+            return self._world_mesh
+        return orig_build_mesh(self)
+
+    ParallelDims.from_config = _cached_from_config
+    ParallelDims.build_mesh = _cached_build_mesh
+    _PARALLEL_DIMS_PATCHED = True
 
 
 def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:
@@ -379,18 +450,23 @@ def get_tpu_seq_bucket_size(engine_config: Any = None) -> int:
     3. ``_DEFAULT_TPU_SEQ_BUCKET_SIZE`` (256).
     """
     env_raw = os.environ.get("VERL_TPU_SEQ_BUCKET_SIZE")
+    bucket = _DEFAULT_TPU_SEQ_BUCKET_SIZE
     if env_raw is not None and env_raw.strip() != "":
         try:
             val = int(env_raw)
             if val > 0:
-                return val
+                bucket = val
         except ValueError:
             pass
-    if engine_config is not None and bool(getattr(engine_config, "pad_to_length", False)):
+    elif engine_config is not None and bool(getattr(engine_config, "pad_to_length", False)):
         cfg_bucket = getattr(engine_config, "pad_to_length_bucket", None)
         if isinstance(cfg_bucket, int) and cfg_bucket > 0:
-            return cfg_bucket
-    return _DEFAULT_TPU_SEQ_BUCKET_SIZE
+            bucket = cfg_bucket
+    if engine_config is not None:
+        cp_size = int(getattr(engine_config, "context_parallel_size", 1) or 1)
+        if cp_size > 1:
+            bucket = math.lcm(bucket, 2 * cp_size)
+    return bucket
 
 
 def bucket_length(length: int, bucket_size: Optional[int] = None) -> int:
@@ -469,12 +545,12 @@ def tpu_eager_mode_context(mode: Optional[str]):
         return nullcontext()
 
 
-def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: int) -> Any:
+def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: int, cp_size: int = 1) -> Any:
     """Compute the global batch token count for loss normalization on TPU via CPU all-reduce."""
     batch_num_tokens = data["loss_mask"].sum().cpu()
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM)
-        batch_num_tokens = batch_num_tokens / tp_size
+        batch_num_tokens = batch_num_tokens / (tp_size * cp_size)
     return batch_num_tokens.item()
 
 
@@ -745,7 +821,11 @@ def apply_splash_attention_tpu(modules: Any) -> int:
             inner = getattr(module, "inner_attention", None)
             if not isinstance(inner, torch.nn.Module):
                 continue
-            if isinstance(inner, TPUSplashAttention):
+            has_local_attn_hook = callable(getattr(inner, "set_local_attention", None))
+            local_attn_impl = getattr(inner, "_local_attn_override", None) or getattr(inner, "_local_attention", None)
+            if isinstance(inner, TPUSplashAttention) or (
+                has_local_attn_hook and isinstance(local_attn_impl, TPUSplashAttention)
+            ):
                 already_splash += 1
                 continue
             window = getattr(inner, "window_size", None)
@@ -753,8 +833,16 @@ def apply_splash_attention_tpu(modules: Any) -> int:
             if isinstance(window, tuple) and len(window) == 2 and window[0] >= 0:
                 local_window_size = int(window[0])
             # torchtitan's VarlenInnerAttention calls the CUDA flash-attention varlen op, which TPU lacks.
-            fallback = TPUVarlenAttention() if isinstance(inner, VarlenInnerAttention) else inner
-            module.inner_attention = TPUSplashAttention(fallback, local_window_size=local_window_size)
+            fallback = (
+                TPUVarlenAttention()
+                if isinstance(inner, VarlenInnerAttention)
+                else getattr(inner, "local_forward", inner)
+            )
+            splash = TPUSplashAttention(fallback, local_window_size=local_window_size)
+            if has_local_attn_hook:
+                inner.set_local_attention(splash)
+            else:
+                module.inner_attention = splash
             replaced += 1
     if saw_nn_module and replaced == 0 and already_splash == 0:
         raise ValueError("use_splash_attention=True but no module with an `inner_attention` was found")
@@ -771,9 +859,15 @@ def replace_varlen_attention_with_tpu_attention(modules: Any) -> int:
         if not isinstance(root, torch.nn.Module):
             continue
         for sub in root.modules():
-            if hasattr(sub, "inner_attention") and not isinstance(
-                sub.inner_attention, TPUVarlenAttention | TPUSplashAttention
-            ):
+            if not hasattr(sub, "inner_attention"):
+                continue
+            inner = sub.inner_attention
+            if callable(getattr(inner, "set_local_attention", None)):
+                local_impl = getattr(inner, "_local_attn_override", None) or getattr(inner, "_local_attention", None)
+                if not isinstance(local_impl, TPUVarlenAttention | TPUSplashAttention):
+                    inner.set_local_attention(TPUVarlenAttention())
+                    replaced += 1
+            elif not isinstance(inner, TPUVarlenAttention | TPUSplashAttention):
                 sub.inner_attention = TPUVarlenAttention()
                 replaced += 1
     if replaced:

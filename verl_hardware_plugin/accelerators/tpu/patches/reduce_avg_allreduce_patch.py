@@ -123,6 +123,7 @@ def apply() -> None:
 
     original_all_reduce = dist.all_reduce
     original_all_gather_object = getattr(dist, "all_gather_object", None)
+    original_all_gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
 
     def _patched_all_reduce(tensor, op=None, group=None, async_op=False):
         # Forward `op` only when the caller passed one. Under torch.compile, dynamo rewrites the original
@@ -132,6 +133,21 @@ def apply() -> None:
         # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
         if op is None:
             return original_all_reduce(tensor, group=group, async_op=async_op)
+        if (
+            not async_op
+            and group is not None
+            and getattr(getattr(tensor, "device", None), "type", None) == "tpu"
+            and str(dist.get_backend(group)) == "gloo"
+        ):
+            cpu_tensor = tensor.detach().cpu()
+            if op == dist.ReduceOp.AVG:
+                world_size = dist.get_world_size(group=group)
+                result = original_all_reduce(cpu_tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
+                cpu_tensor.div_(world_size)
+            else:
+                result = original_all_reduce(cpu_tensor, op=op, group=group, async_op=False)
+            tensor.copy_(cpu_tensor)
+            return result
         if op != dist.ReduceOp.AVG or async_op or not _is_tpu_all_reduce(tensor, group):
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
@@ -141,6 +157,24 @@ def apply() -> None:
         return result
 
     dist.all_reduce = _patched_all_reduce
+
+    if callable(original_all_gather_into_tensor):
+
+        def _patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+            if (
+                not async_op
+                and group is not None
+                and getattr(getattr(input_tensor, "device", None), "type", None) == "tpu"
+                and str(dist.get_backend(group)) == "gloo"
+            ):
+                cpu_out = output_tensor.detach().cpu()
+                cpu_in = input_tensor.detach().cpu()
+                result = original_all_gather_into_tensor(cpu_out, cpu_in, group=group, async_op=False)
+                output_tensor.copy_(cpu_out)
+                return result
+            return original_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
+
+        dist.all_gather_into_tensor = _patched_all_gather_into_tensor
 
     if callable(original_all_gather_object):
 

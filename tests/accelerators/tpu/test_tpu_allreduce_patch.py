@@ -4,6 +4,7 @@
 """The TPU `dist.all_reduce` patch must stay traceable by torch.compile (vLLM's compiled TP all-reduce)."""
 
 import socket
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -66,3 +67,35 @@ def test_patched_all_reduce_is_traceable_by_torch_compile():
         torch._dynamo.reset()
         if initialized_here:
             dist.destroy_process_group()
+
+
+def test_patched_all_reduce_routes_tpu_tensor_on_gloo_subgroup_via_cpu():
+    """When a Gloo-only DP subgroup is used with a TPU tensor (e.g. `_postprocess_output` under TP>1),
+    `_patched_all_reduce` must stage the tensor through CPU so Gloo executes the subgroup reduction
+    without triggering a 4-chip `tpu_dist` SPMD collective barrier.
+    """
+    calls = []
+
+    def fake_original(tensor, op=None, group=None, async_op=False):
+        calls.append((tensor.device.type, op, group, async_op))
+        tensor.mul_(2.0)
+        return "ok"
+
+    fake_tpu_tensor = mock.MagicMock()
+    fake_tpu_tensor.device = SimpleNamespace(type="tpu")
+    cpu_buf = torch.tensor([6.0])
+    fake_tpu_tensor.detach.return_value.cpu.return_value = cpu_buf
+
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=fake_original),
+        mock.patch.object(dist, "get_backend", return_value="gloo"),
+        mock.patch.object(dist, "get_world_size", return_value=2),
+    ):
+        tpu_patch_mod.apply()
+        res = dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG, group="dp_gloo_group")
+
+    assert res == "ok"
+    assert calls == [("cpu", dist.ReduceOp.SUM, "dp_gloo_group", False)]
+    assert cpu_buf.item() == pytest.approx(6.0)
+    fake_tpu_tensor.copy_.assert_called_once_with(cpu_buf)

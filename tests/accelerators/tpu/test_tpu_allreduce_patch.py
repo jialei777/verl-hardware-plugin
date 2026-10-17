@@ -17,11 +17,14 @@ from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_p
 def _reset_patch_state():
     original_all_reduce = dist.all_reduce
     original_all_gather_object = getattr(dist, "all_gather_object", None)
+    original_all_gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
     tpu_patch_mod._applied = False
     yield
     dist.all_reduce = original_all_reduce
     if original_all_gather_object is not None:
         dist.all_gather_object = original_all_gather_object
+    if original_all_gather_into_tensor is not None:
+        dist.all_gather_into_tensor = original_all_gather_into_tensor
     tpu_patch_mod._applied = False
 
 
@@ -66,3 +69,55 @@ def test_patched_all_reduce_is_traceable_by_torch_compile():
         torch._dynamo.reset()
         if initialized_here:
             dist.destroy_process_group()
+
+
+def test_gloo_group_with_tpu_tensor_routes_via_cpu():
+    """When `group` uses the `gloo` backend and `tensor` lives on TPU, collectives run on CPU and copy back."""
+
+    class _FakeTPUTensor:
+        def __init__(self, data: torch.Tensor):
+            self.device = mock.MagicMock(type="tpu")
+            self._cpu = data.clone()
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self._cpu.clone()
+
+        def copy_(self, other: torch.Tensor):
+            self._cpu.copy_(other)
+            return self
+
+    def _fake_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        assert tensor.device.type == "cpu"
+        tensor.mul_(2.0)
+        return "work_ar"
+
+    def _fake_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+        assert output_tensor.device.type == "cpu"
+        assert input_tensor.device.type == "cpu"
+        output_tensor.copy_(torch.cat([input_tensor, input_tensor * 3], dim=0))
+        return "work_ag"
+
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_all_reduce),
+        mock.patch.object(dist, "all_gather_into_tensor", side_effect=_fake_all_gather_into_tensor),
+        mock.patch.object(dist, "get_backend", return_value="gloo"),
+        mock.patch.object(dist, "get_world_size", return_value=2),
+    ):
+        tpu_patch_mod.apply()
+
+        t_avg = _FakeTPUTensor(torch.tensor([4.0, 6.0]))
+        dist.all_reduce(t_avg, op=dist.ReduceOp.AVG, group="dp_gloo")
+        assert t_avg._cpu.tolist() == [4.0, 6.0]
+
+        t_sum = _FakeTPUTensor(torch.tensor([4.0, 6.0]))
+        dist.all_reduce(t_sum, op=dist.ReduceOp.SUM, group="dp_gloo")
+        assert t_sum._cpu.tolist() == [8.0, 12.0]
+
+        t_out = _FakeTPUTensor(torch.zeros(4))
+        t_in = _FakeTPUTensor(torch.tensor([1.0, 2.0]))
+        dist.all_gather_into_tensor(t_out, t_in, group="dp_gloo")
+        assert t_out._cpu.tolist() == [1.0, 2.0, 3.0, 6.0]

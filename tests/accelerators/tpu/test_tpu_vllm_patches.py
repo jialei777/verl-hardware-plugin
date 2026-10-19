@@ -52,22 +52,34 @@ def test_sampler_patch_wraps_bf16_sampler_with_extra_parameters():
     assert seen == {"u_dtype": torch.float32, "topk_candidates": 7}
 
 
-def test_patches_are_skipped_when_vllm_torchtpu_already_uses_fp32():
-    """vllm-torchtpu #1747 / #2024 compute in FP32 themselves: keep their implementations."""
+def test_sampler_patch_passes_fp32_noise_through():
+    """vllm-torchtpu #1747 draws ``u`` in FP32 at the call sites: the wrapper must not redraw it."""
+    seen = {}
 
     class Runner:
-        def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False):
-            u = u.to(torch.float32)
+        def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False, topk_candidates=0):
+            seen.update(u=u, topk_candidates=topk_candidates)
             return logits
 
-        def gather_logprobs(self, logits, sampled_tokens):
-            return logits.to(torch.float32)
-
-    original_sampler, original_logprobs = Runner.sample_from_logits, Runner.gather_logprobs
+    u = torch.rand(2, 4, dtype=torch.float32)
     p1, p2 = _install_fake_vllm(Runner)
     with p1, p2:
         tpu_vllm_patches.patch_tpu_sampler()
+        Runner().sample_from_logits(torch.zeros(2, 4), torch.ones(2), u, None, None, False, topk_candidates=3)
+    assert seen["u"] is u
+    assert seen["topk_candidates"] == 3
+
+
+def test_logprob_patch_is_skipped_when_vllm_torchtpu_already_uses_fp32():
+    """vllm-torchtpu #2024 normalizes log probabilities in FP32 itself: keep its implementation."""
+
+    class Runner:
+        def gather_logprobs(self, logits, sampled_tokens):
+            return logits.to(torch.float32)
+
+    original_logprobs = Runner.gather_logprobs
+    p1, p2 = _install_fake_vllm(Runner)
+    with p1, p2:
         tpu_vllm_patches.patch_tpu_logprobs()
-    assert Runner.sample_from_logits is original_sampler
     assert Runner.gather_logprobs is original_logprobs
-    assert Runner._verl_fp32_sampler_patched and Runner._verl_fp32_logprobs_patched
+    assert Runner._verl_fp32_logprobs_patched

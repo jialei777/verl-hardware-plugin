@@ -18,9 +18,11 @@ slice through Ray. Each patch fills a gap in vLLM (v0.29.0 / v0.31.0) and vllm-t
   raise the limit on every thread.
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
-* ``TPUModelRunner.gather_logprobs`` and ``sample_from_logits``: normalize log probabilities
-  and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias. Skipped when
-  vllm-torchtpu already does both (#1747, #2024).
+* ``TPUModelRunner.gather_logprobs``: normalize log probabilities in FP32, avoiding BF16
+  cancellation. Skipped when vllm-torchtpu already does it (#2024).
+* ``TPUModelRunner.sample_from_logits``: redraw BF16 sampling noise in FP32, avoiding sampling
+  bias. vllm-torchtpu #1747 draws the noise in FP32 at the call sites, so there the wrapper
+  passes it through unchanged.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
@@ -48,7 +50,7 @@ _PATCHES_APPLIED = False
 
 
 def _source_upcasts_to_fp32(fn) -> bool:
-    """Whether ``fn``'s source already computes in FP32 (vllm-torchtpu >= #1747 / #2024 does)."""
+    """Whether ``fn``'s source already computes in FP32 (vllm-torchtpu >= #2024's ``gather_logprobs`` does)."""
     try:
         return "torch.float32" in inspect.getsource(inspect.unwrap(fn))
     except (OSError, TypeError):
@@ -107,11 +109,15 @@ def patch_tpu_logprobs() -> None:
 _fp32_sampling_noise_logged = False
 
 
-# TODO: Remove once vllm-torchtpu draws its sampling uniforms in FP32.
+# TODO: Remove once the minimum supported vllm-torchtpu includes #1747.
 def patch_tpu_sampler() -> None:
     """Draw TPU sampling noise from FP32 random values to reduce BF16 rounding bias.
 
-    Use the runner's sampling generator when available.
+    Older vllm-torchtpu draws the Gumbel-Max uniforms ``u`` in the logits dtype (BF16); the wrapper
+    redraws them in FP32 with the runner's sampling generator when available. vllm-torchtpu #1747
+    draws ``u`` in FP32 at the call sites rather than inside ``sample_from_logits``, so the
+    function's own source cannot tell the versions apart; the wrapper checks ``u.dtype`` at run
+    time instead and passes FP32 noise through unchanged.
     Apply this patch before the TPU model runner is created.
     """
     if importlib.util.find_spec("vllm_torchtpu") is None:
@@ -123,11 +129,6 @@ def patch_tpu_sampler() -> None:
         return
 
     original = getattr(TPUModelRunner, "sample_from_logits", None)
-    if _source_upcasts_to_fp32(original):
-        # vllm-torchtpu #1747 draws the Gumbel-Max uniforms in FP32 itself.
-        TPUModelRunner._verl_fp32_sampler_patched = True
-        logger.info("vllm-torchtpu already draws sampling noise in FP32; sampler patch not needed.")
-        return
     # Later vllm-torchtpu releases append parameters (e.g. ``topk_candidates``); only the leading
     # ones are used here and the rest are forwarded unchanged.
     expected = ["self", "logits", "temperatures", "u", "top_k", "top_p", "all_greedy"]

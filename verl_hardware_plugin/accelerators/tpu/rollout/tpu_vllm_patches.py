@@ -4,8 +4,8 @@
 """vLLM / vllm-torchtpu runtime patches for multi-host TPU rollout.
 
 ``patch_vllm_for_tpu`` lets the vLLM engine of a ``TPUvLLMHttpServer`` run on all hosts of a TPU
-slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-torchtpu
-(9faafb17) and can be dropped once upstream closes it:
+slice through Ray. Each patch fills a gap in vLLM (v0.29.0 / v0.31.0) and vllm-torchtpu
+(9faafb17 / 33ee547b) and can be dropped once upstream closes it:
 
 * ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
   ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,

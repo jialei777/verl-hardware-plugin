@@ -204,15 +204,27 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
     cfg_tp = SimpleNamespace(
         use_torch_compile=True,
         use_splash_attention=True,
-        use_simple_fsdp=True,
+        use_simple_fsdp=None,
         tpu_eager_mode="DEFER_AND_FUSE",
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         expert_parallel_size=1,
     )
-    with pytest.raises(ValueError, match="use_simple_fsdp supports pure FSDP/HSDP only"):
-        resolve_tpu_torchtitan_options(cfg_tp)
+    assert resolve_tpu_torchtitan_options(cfg_tp) == (True, True, "DEFER_AND_FUSE")
+
+    cfg_pp = SimpleNamespace(
+        use_torch_compile=True,
+        use_splash_attention=True,
+        use_simple_fsdp=True,
+        tpu_eager_mode="DEFER_AND_FUSE",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        context_parallel_size=1,
+        expert_parallel_size=1,
+    )
+    with pytest.raises(ValueError, match="use_simple_fsdp supports FSDP/HSDP"):
+        resolve_tpu_torchtitan_options(cfg_pp)
 
 
 def test_install_tpu_attention_dense():
@@ -700,3 +712,145 @@ def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(t
     finally:
         if owns_group:
             dist.destroy_process_group()
+
+
+def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
+    from verl.utils.torch_functional import logprobs_from_logits_naive
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import compute_tpu_logprobs_chunked
+
+    torch.manual_seed(0)
+    logits_ref = torch.randn(1, 20, 32, dtype=torch.bfloat16, requires_grad=True)
+    logits_chk = logits_ref.detach().clone().requires_grad_(True)
+    labels = torch.randint(0, 32, (20,), dtype=torch.int64)
+
+    lp_ref = logprobs_from_logits_naive((logits_ref.squeeze(0) / 1.25).float(), labels)
+    lp_chk = compute_tpu_logprobs_chunked(logits_chk, labels, temperature=1.25, chunk_size=7)
+
+    assert torch.allclose(lp_ref, lp_chk, atol=1e-3, rtol=1e-3)
+    grad_out = torch.randn_like(lp_ref)
+    lp_ref.backward(grad_out)
+    lp_chk.backward(grad_out)
+    assert logits_ref.grad is not None and logits_chk.grad is not None
+    assert torch.allclose(logits_ref.grad, logits_chk.grad, atol=1e-3, rtol=1e-3)
+
+
+def test_install_parallel_dims_cache_for_tpu_reuses_parallel_dims_and_mesh():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    build_calls = []
+
+    class _FakeParallelDims:
+        def __init__(self, cfg, ws):
+            self.cfg = cfg
+            self.ws = ws
+            self._world_mesh = None
+            self._single_axis_meshes = None
+
+        @classmethod
+        def from_config(cls, cfg, ws):
+            return cls(cfg, ws)
+
+        def build_mesh(self):
+            build_calls.append(1)
+            self._world_mesh = object()
+            self._single_axis_meshes = {"tp": object()}
+            return self._world_mesh
+
+    fake_pd_mod = types.ModuleType("torchtitan.distributed.parallel_dims")
+    fake_pd_mod.ParallelDims = _FakeParallelDims  # type: ignore[attr-defined]
+    fake_dist_mod = types.ModuleType("torchtitan.distributed")
+    fake_dist_mod.parallel_dims = fake_pd_mod  # type: ignore[attr-defined]
+
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "torchtitan.distributed": fake_dist_mod,
+                "torchtitan.distributed.parallel_dims": fake_pd_mod,
+            },
+        ),
+        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_PATCHED", False),
+        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_CACHE", {}),
+    ):
+        tpu_utils.install_parallel_dims_cache_for_tpu()
+        cfg1 = SimpleNamespace(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=2,
+            context_parallel_degree=1,
+            tensor_parallel_degree=2,
+            pipeline_parallel_degree=1,
+            expert_parallel_degree=1,
+            spmd_backend="spmd_types",
+            enable_tpu_topo_mesh=False,
+        )
+        cfg2 = SimpleNamespace(**vars(cfg1))
+        pd1 = _FakeParallelDims.from_config(cfg1, 4)
+        pd2 = _FakeParallelDims.from_config(cfg2, 4)
+        assert pd1 is pd2
+        m1 = pd1.build_mesh()
+        m2 = pd2.build_mesh()
+        assert m1 is m2
+        assert len(build_calls) == 1
+
+
+def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
+    import torch.distributed.tensor._api as dt_api
+    import torch.distributed.tensor._dispatch as dt_disp
+    import torch.distributed.tensor._redistribute as redist_mod
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    seen = []
+
+    def _fake_rlt(local_tensor, current_spec, target_spec, *, async_op=False, **kwargs):
+        seen.append(async_op)
+        return local_tensor
+
+    with (
+        mock.patch.object(redist_mod, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(dt_api, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(dt_disp, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(tpu_utils, "_SYNC_DTENSOR_REDISTRIBUTE_PATCHED", False),
+    ):
+        tpu_utils.install_sync_dtensor_redistribute_for_tpu()
+        x = torch.ones(2, 2)
+        with mock.patch("torch.compiler.is_compiling", return_value=False):
+            redist_mod.redistribute_local_tensor(x, None, None, async_op=True)
+        with mock.patch("torch.compiler.is_compiling", return_value=True):
+            redist_mod.redistribute_local_tensor(x, None, None, async_op=True)
+        assert seen == [False, True]
+
+
+def test_build_dp_gloo_group_creates_host_gloo_subgroups_when_tp_enabled():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.engine_config = SimpleNamespace(
+        data_parallel_shard_size=2,
+        data_parallel_replicate_size=1,
+    )
+    engine.parallel_dims = SimpleNamespace(
+        pp=1,
+        cp=1,
+        tp=2,
+        _global_meshes={"dataloading": SimpleNamespace(mesh=torch.tensor([[0, 1], [2, 3]]))},
+    )
+    created_groups = []
+
+    def _fake_new_group(ranks=None, backend=None):
+        pg = f"gloo_pg_{tuple(ranks)}"
+        created_groups.append((list(ranks), backend, pg))
+        return pg
+
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_world_size", return_value=4),
+        mock.patch("torch.distributed.get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+        mock.patch("torch.distributed.get_rank", return_value=2),
+        mock.patch("torch.distributed.new_group", side_effect=_fake_new_group),
+    ):
+        my_pg = engine._build_dp_gloo_group()
+        assert my_pg == "gloo_pg_(0, 2)"
+        assert [(r, b) for r, b, _ in created_groups] == [([0, 2], "gloo"), ([1, 3], "gloo")]
+        assert engine._build_dp_gloo_group() == "gloo_pg_(0, 2)"
+        assert len(created_groups) == 2

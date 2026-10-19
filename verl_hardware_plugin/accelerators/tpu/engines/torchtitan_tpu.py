@@ -63,6 +63,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     align_micro_batch_shapes_across_ranks,
     bucket_length,
     compute_global_batch_num_tokens,
+    compute_tpu_logprobs_chunked,
     configure_torch_compile_for_tpu,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
@@ -70,6 +71,8 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     fused_linear_logprobs_tpu,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
+    install_parallel_dims_cache_for_tpu,
+    install_sync_dtensor_redistribute_for_tpu,
     install_tpu_attention,
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
@@ -177,12 +180,6 @@ class TorchTitanTPUEngine(BaseEngine):
 
         if engine_config.context_parallel_size > 1:
             raise NotImplementedError("context parallelism is not supported by the TPU TorchTitan engine")
-        if engine_config.tensor_parallel_size > 1:
-            logger.warning(
-                "tensor_parallel_size=%d is not properly tested on TPU; try "
-                "tensor_parallel_size=1 for better performance on TPU.",
-                engine_config.tensor_parallel_size,
-            )
 
         (
             self._use_splash_attention,
@@ -212,7 +209,10 @@ class TorchTitanTPUEngine(BaseEngine):
 
         # torch_tpu's aten::_fused_adamw_ updates params, exp_avg and exp_avg_sq in place (buffer donation): no
         # param-sized temporary as in the foreach path (+4.2 GB/chip for Qwen3-4B at FSDP=4) and ~2x faster.
-        optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", "fused")
+        # Under 2D (dp_shard, tp) SimpleFSDP, parameters have heterogeneous 2D DTensor placements
+        # ((_StridedShard(0), Shard(0)), (Shard(0), Shard(1)), (Replicate(), Replicate())), so default to "for-loop".
+        default_optim_impl = "for-loop" if self.engine_config.tensor_parallel_size > 1 else "fused"
+        optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", default_optim_impl)
         optimizer = OptimizersContainer.Config(
             implementation=optim_impl,
             param_groups=[
@@ -283,11 +283,14 @@ class TorchTitanTPUEngine(BaseEngine):
         # on the autograd backward thread where the thread-local SPMD mesh is inactive,
         # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
         # (or enable torch.compile, which recomputes in-graph) in that configuration.
-        activation_checkpoint = {
-            "selective": SelectiveAC.Config,
-            "full": FullAC.Config,
-            "none": lambda: None,
-        }[self.engine_config.activation_checkpoint]()
+        if self.engine_config.forward_only:
+            activation_checkpoint = None
+        else:
+            activation_checkpoint = {
+                "selective": SelectiveAC.Config,
+                "full": FullAC.Config,
+                "none": lambda: None,
+            }[self.engine_config.activation_checkpoint]()
 
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
@@ -311,8 +314,10 @@ class TorchTitanTPUEngine(BaseEngine):
 
             if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
                 self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+        install_parallel_dims_cache_for_tpu()
         self.trainer = Trainer(self.config)
         self.parallel_dims = self.trainer.parallel_dims
+        self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
         # activation-checkpoint recompute can access the thread-local SPMD mesh / process groups.
         torch.autograd.set_multithreading_enabled(False)
@@ -393,6 +398,57 @@ class TorchTitanTPUEngine(BaseEngine):
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
         return is_collect
 
+    def _build_dp_gloo_group(self):
+        """Build a host-side Gloo ProcessGroup per data-parallel slice when model parallelism is active.
+
+        Subgroups created by ``init_device_mesh("tpu", ...)`` register only ``tpu_dist``, which compiles
+        subgroup collectives (e.g. ``replica_groups={{0,2},{1,3}}``) into XLA SPMD programs with a hardware
+        barrier across all TPU chips in the world. ``TrainingWorker._postprocess_output`` executes
+        ``all_reduce(loss, op=AVG, group=dp_group)`` and ``all_gather_object(..., group=dp_group)`` only on
+        ``is_mp_src_rank_with_outputs()`` ranks (``tp_rank == 0``), so a ``tpu_dist`` subgroup collective
+        stalls waiting for ``tp_rank > 0`` chips. Using a host-side ``gloo`` group for ``get_data_parallel_group()``
+        when ``dp_size < world_size`` lets ``tp_rank == 0`` ranks aggregate metrics over TCP independently.
+        """
+        pd_dict = getattr(self.parallel_dims, "__dict__", {})
+        if "_verl_dp_gloo_group" in pd_dict:
+            return pd_dict["_verl_dp_gloo_group"]
+        if not torch.distributed.is_initialized():
+            return None
+        dp_size = self.get_data_parallel_size()
+        world_size = torch.distributed.get_world_size()
+        if dp_size >= world_size:
+            return None
+        try:
+            default_backend = str(torch.distributed.get_backend(None))
+        except Exception:
+            default_backend = ""
+        if "gloo" not in default_backend:
+            return None
+
+        pp = self.parallel_dims.pp
+        cp = self.parallel_dims.cp
+        tp = self.parallel_dims.tp
+        if pp * dp_size * cp * tp != world_size:
+            return None
+
+        dataloading_mesh = getattr(self.parallel_dims, "_global_meshes", {}).get("dataloading")
+        if dataloading_mesh is not None and hasattr(dataloading_mesh, "mesh"):
+            grid = dataloading_mesh.mesh.detach().cpu().reshape(pp, dp_size, cp, tp)
+        else:
+            grid = torch.arange(world_size, dtype=torch.int64).reshape(pp, dp_size, cp, tp)
+
+        rank = torch.distributed.get_rank()
+        my_group = None
+        for pp_idx in range(pp):
+            for cp_idx in range(cp):
+                for tp_idx in range(tp):
+                    ranks = grid[pp_idx, :, cp_idx, tp_idx].tolist()
+                    pg = torch.distributed.new_group(ranks=ranks, backend="gloo")
+                    if rank in ranks:
+                        my_group = pg
+        self.parallel_dims._verl_dp_gloo_group = my_group
+        return my_group
+
     def _drop_checkpoint_state_dict_cache(self) -> None:
         """Free torchtitan ``ModelWrapper.cached_state_dict`` after the initial HF load."""
         from torchtitan.components.checkpointer import MODEL
@@ -413,6 +469,9 @@ class TorchTitanTPUEngine(BaseEngine):
         else:
             self.optimizer = None
             self.lr_scheduler = None
+            for part in self.module:
+                for p in part.parameters():
+                    p.requires_grad_(False)
 
         self.to(
             device="cpu",
@@ -422,6 +481,8 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         self._drop_checkpoint_state_dict_cache()
+        if getattr(self.engine_config, "use_torch_compile", False) and self.parallel_dims.tp_enabled:
+            install_sync_dtensor_redistribute_for_tpu()
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
@@ -441,6 +502,8 @@ class TorchTitanTPUEngine(BaseEngine):
         return self.engine_config.data_parallel_shard_size * self.engine_config.data_parallel_replicate_size
 
     def get_data_parallel_group(self):
+        if getattr(self, "_dp_group", None) is not None:
+            return self._dp_group
         mesh = self._get_data_parallel_mesh()
         if mesh is not None:
             return mesh.get_group()
@@ -510,6 +573,7 @@ class TorchTitanTPUEngine(BaseEngine):
         inputs: torch.Tensor,
         extra_inputs: dict[str, torch.Tensor] | None = None,
         extra_kwargs: dict[str, torch.Tensor] | None = None,
+        return_dtensor: bool = False,
     ) -> torch.Tensor:
         """Perform a forward pass through the trainer model without backward."""
         model_parts = self.module
@@ -525,7 +589,7 @@ class TorchTitanTPUEngine(BaseEngine):
         pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
         if isinstance(pred, tuple):
             return tuple(p.full_tensor() if isinstance(p, DTensor) else p for p in pred)
-        if isinstance(pred, DTensor):
+        if isinstance(pred, DTensor) and not return_dtensor:
             pred = pred.full_tensor()
         return pred
 
@@ -549,13 +613,16 @@ class TorchTitanTPUEngine(BaseEngine):
                 ep_enabled=self.parallel_dims.ep_enabled,
             )
 
+            grad_norm_val = grad_norm.item()
+            tpu_synchronize(wait=True)
             if not torch.isfinite(grad_norm):
                 logger.warning("grad_norm is not finite (%s); skipping this optimizer step", grad_norm)
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+            tpu_synchronize(wait=True)
 
-            return grad_norm.item()
+            return grad_norm_val
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""
@@ -810,7 +877,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         )
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
-        temperature = unwrap_metadata(micro_batch["temperature"])
+        temperature = float(unwrap_metadata(micro_batch["temperature"]))
         calculate_entropy = unwrap_metadata(
             tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
         )
@@ -842,33 +909,54 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         if use_remove_padding:
             if labels.dim() > 1:
                 labels = labels.squeeze(0)
-            logits_rmpad = (logits.squeeze(0) if logits.dim() > 2 else logits) / temperature
-
-            # Like verl's GPU path (flash-attn cross entropy, CUDA autocast), take the log-softmax and entropy of
-            # the bf16 logits in fp32; torch_tpu's autocast would leave them in bf16.
-            logits_rmpad = logits_rmpad.float()
-            if fused_log_probs is not None:
-                log_probs = fused_log_probs
+            if (
+                not calculate_entropy
+                and fused_log_probs is None
+                and (isinstance(logits, DTensor) or logits.device.type == "tpu")
+            ):
+                log_probs = compute_tpu_logprobs_chunked(
+                    logits,
+                    labels,
+                    temperature=temperature,
+                    chunk_size=get_tpu_seq_bucket_size(self.engine_config),
+                )
+                del logits
             else:
-                log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
+                if isinstance(logits, DTensor):
+                    logits = logits.full_tensor()
+                logits_rmpad = (logits.squeeze(0) if logits.dim() > 2 else logits) / temperature
+                del logits
 
-            if calculate_entropy:
-                if not self.engine_config.entropy_checkpointing:
-                    if self.engine_config.entropy_from_logits_with_chunking:
-                        entropy_rmpad = self.compute_entropy_from_logits(
-                            logits_rmpad,
-                            chunk_size=self.engine_config.entropy_from_logits_chunk_size,
-                        )
-                    else:
-                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                # Like verl's GPU path (flash-attn cross entropy, CUDA autocast), take the log-softmax and entropy of
+                # the bf16 logits in fp32; torch_tpu's autocast would leave them in bf16.
+                logits_rmpad = logits_rmpad.float()
+                if fused_log_probs is not None:
+                    log_probs = fused_log_probs
                 else:
-                    entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+                    log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
+
+                if calculate_entropy:
+                    if not self.engine_config.entropy_checkpointing:
+                        if self.engine_config.entropy_from_logits_with_chunking:
+                            entropy_rmpad = self.compute_entropy_from_logits(
+                                logits_rmpad,
+                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+                            )
+                        else:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                    else:
+                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                            self.compute_entropy_from_logits, logits_rmpad
+                        )
+                del logits_rmpad
 
             orig_seq_len = output_args.get("orig_seq_len")
             log_probs = _to_jagged(log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs, cu_seqlens, orig_seq_len)
             if calculate_entropy:
                 entropy = _to_jagged(entropy_rmpad, cu_seqlens, orig_seq_len)
         else:
+            if isinstance(logits, DTensor):
+                logits = logits.full_tensor()
             if logits.dim() == 2 and "batch_size" in output_args and "max_seq_len" in output_args:
                 logits = logits.view(output_args["batch_size"], output_args["max_seq_len"], -1)
             logits = (logits / temperature).float()  # fp32 log-softmax and entropy, as above
@@ -882,7 +970,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
             logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
             logits_rmpad = torch.cat([t for t in logits.unbind()])
+            del logits
             log_probs = logprobs_from_logits_naive(logits_rmpad, output_args["labels"])
+            del logits_rmpad
             log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
             if calculate_entropy:
                 entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
@@ -901,9 +991,16 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
-
-            model_output = self.prepare_model_outputs(logits=logits, output_args=output_args, micro_batch=micro_batch)
+            model_output = self.prepare_model_outputs(
+                logits=self.model_forward_step(
+                    inputs=input_ids,
+                    extra_inputs=extra_inputs,
+                    extra_kwargs=extra_kwargs,
+                    return_dtensor=True,
+                ),
+                output_args=output_args,
+                micro_batch=micro_batch,
+            )
 
             if loss_function is not None:
                 loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)

@@ -235,7 +235,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     2. Explicit ``engine_config`` field value when non-``None``.
     3. Automatic TPU defaults based on ``engine_config.use_torch_compile``:
        when ``use_torch_compile=True``, enables ``TPUSplashAttention``, ``SimpleFSDP``
-       (for pure FSDP/HSDP where TP/PP/CP/EP == 1), and ``DEFER_AND_FUSE``.
+       (for FSDP/HSDP with optional TP where PP/CP/EP == 1), and ``DEFER_AND_FUSE``.
     """
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
     use_splash_attention = _resolve_option(
@@ -249,15 +249,17 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
             "use_torch_compile=False."
         )
 
-    pure_fsdp = all(
-        getattr(engine_config, f"{dim}_parallel_size", 1) == 1 for dim in ("tensor", "pipeline", "context", "expert")
+    simple_fsdp_compatible = all(
+        getattr(engine_config, f"{dim}_parallel_size", 1) == 1 for dim in ("pipeline", "context", "expert")
     )
     use_simple_fsdp = _resolve_option(
-        "VERL_TPU_USE_SIMPLE_FSDP", getattr(engine_config, "use_simple_fsdp", None), use_torch_compile and pure_fsdp
+        "VERL_TPU_USE_SIMPLE_FSDP",
+        getattr(engine_config, "use_simple_fsdp", None),
+        use_torch_compile and simple_fsdp_compatible,
     )
-    if use_simple_fsdp and not pure_fsdp:
+    if use_simple_fsdp and not simple_fsdp_compatible:
         raise ValueError(
-            "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
+            "use_simple_fsdp supports FSDP/HSDP (+ optional TP) only (pipeline/context/expert parallel size 1)"
         )
 
     eager = os.environ.get("VERL_TPU_EAGER_MODE", "").strip() or getattr(engine_config, "tpu_eager_mode", None)
@@ -275,15 +277,278 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
 def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
     """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs.
 
-    On by default with ``use_torch_compile``. The kernel never writes the ``[tokens, vocab]`` logits to HBM and keeps
-    them in fp32, so its log-probs are more precise than verl's GPU path, which rounds the logits to bf16 before the
-    fp32 log-softmax.
+    On by default with ``use_torch_compile`` when ``tensor_parallel_size == 1``. The kernel never writes the
+    ``[tokens, vocab]`` logits to HBM and keeps them in fp32, so its log-probs are more precise than verl's GPU
+    path, which rounds the logits to bf16 before the fp32 log-softmax. Disabled when ``tensor_parallel_size > 1``
+    because ``FusedLossLinearWrapper`` returns a ``(hidden_states, weight_t)`` tuple that is incompatible with
+    TorchTitan's ``ColwiseParallel`` output redistribution (TP uses :func:`compute_tpu_logprobs_chunked` instead).
     """
+    if getattr(engine_config, "tensor_parallel_size", 1) > 1:
+        return False
     return _resolve_option(
         "VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY",
         getattr(engine_config, "use_fused_linear_cross_entropy", None),
         bool(getattr(engine_config, "use_torch_compile", False)),
     )
+
+
+_PARALLEL_DIMS_CACHE: dict[tuple[Any, ...], Any] = {}
+_PARALLEL_DIMS_PATCHED = False
+
+
+def install_parallel_dims_cache_for_tpu() -> None:
+    """Reuse ``ParallelDims`` and its ``DeviceMesh`` objects across engines in the same process.
+
+    ``ActorRolloutRefWorker`` initializes both ``actor`` and ``ref`` ``TorchTitanTPUEngine`` instances
+    in the same worker process. TorchTitan's ``ParallelDims`` caches ``DeviceMesh`` instances on ``self``
+    because Dynamo traces ``DeviceMesh`` as a ``FakeScriptObject`` matched by object identity, whereas
+    ``DTensor``'s ``ShardingPropagator`` LRU cache hashes ``DeviceMesh`` by value. If ``actor`` and
+    ``ref`` construct separate ``ParallelDims`` objects with identical topology, ``ShardingPropagator``
+    returns cached ``DTensorSpec``s holding ``ref``'s ``DeviceMesh`` when ``actor`` compiles the same
+    sequence-length bucket, causing Dynamo to emit a non-placeholder ``_torchbind_obj0`` output that
+    ``torch_tpu`` rejects. Caching ``ParallelDims.from_config`` and making ``ParallelDims.build_mesh``
+    idempotent ensures ``actor`` and ``ref`` share the exact same ``DeviceMesh`` Python instances and
+    process groups.
+    """
+    global _PARALLEL_DIMS_PATCHED
+    if _PARALLEL_DIMS_PATCHED:
+        return
+    try:
+        from torchtitan.distributed.parallel_dims import ParallelDims
+    except ImportError:
+        return
+
+    orig_from_config = getattr(ParallelDims.from_config, "__func__", None)
+    orig_build_mesh = getattr(ParallelDims, "build_mesh", None)
+    if orig_from_config is None or orig_build_mesh is None:
+        return
+
+    @classmethod  # type: ignore[misc]
+    def _cached_from_config(cls, parallelism_config: Any, world_size: int) -> Any:
+        world_pg_id = (
+            id(torch.distributed.group.WORLD)
+            if torch.distributed.is_initialized() and torch.distributed.group.WORLD is not None
+            else None
+        )
+        key = (
+            world_pg_id,
+            getattr(parallelism_config, "data_parallel_replicate_degree", 1),
+            getattr(parallelism_config, "data_parallel_shard_degree", -1),
+            getattr(parallelism_config, "context_parallel_degree", 1),
+            getattr(parallelism_config, "tensor_parallel_degree", 1),
+            getattr(parallelism_config, "pipeline_parallel_degree", 1),
+            getattr(parallelism_config, "expert_parallel_degree", 1),
+            world_size,
+            getattr(parallelism_config, "spmd_backend", "partial_dtensor"),
+            getattr(parallelism_config, "enable_tpu_topo_mesh", False),
+        )
+        cached = _PARALLEL_DIMS_CACHE.get(key)
+        if cached is None:
+            cached = orig_from_config(cls, parallelism_config, world_size)
+            _PARALLEL_DIMS_CACHE[key] = cached
+        return cached
+
+    def _cached_build_mesh(self: Any) -> Any:
+        if getattr(self, "_world_mesh", None) is not None and getattr(self, "_single_axis_meshes", None):
+            return self._world_mesh
+        return orig_build_mesh(self)
+
+    ParallelDims.from_config = _cached_from_config
+    ParallelDims.build_mesh = _cached_build_mesh
+    _PARALLEL_DIMS_PATCHED = True
+
+
+_SYNC_DTENSOR_REDISTRIBUTE_PATCHED = False
+
+
+def install_sync_dtensor_redistribute_for_tpu() -> None:
+    """Force ``redistribute_local_tensor(..., async_op=False)`` outside ``torch.compile`` tracing.
+
+    TorchTitan's ``Module._redistribute_inputs`` / ``Module._redistribute_outputs`` (and PyTorch TP
+    ``ParallelStyle``) call ``DTensor.redistribute(..., async_op=True)``, which sets ``ctx.async_op = True``
+    on ``Redistribute`` for both forward and backward. Outside a ``torch.compile`` region (e.g. on
+    uncompiled ``tok_embeddings``, ``norm``, and ``output`` at the boundaries of compiled
+    ``TransformerBlock``s), returning an unwaited ``AsyncCollectiveTensor`` into a compiled graph input
+    (forward ``tok_embeddings -> layers["0"]`` or backward ``output/norm -> layers["35"]``) causes Dynamo
+    to unwrap ``AsyncCollectiveTensor.elem`` without dispatching ``wait_tensor(elem)``, permanently
+    retaining ``elem`` in C++ ``c10d::WorkRegistry``. Forcing ``async_op=False`` when not compiling calls
+    ``.wait()`` immediately in ``redistribute_local_tensor`` so ``WorkRegistry`` frees ``elem`` and
+    synchronizes eager TPU redistributions across ranks.
+    """
+    global _SYNC_DTENSOR_REDISTRIBUTE_PATCHED
+    if _SYNC_DTENSOR_REDISTRIBUTE_PATCHED:
+        return
+    try:
+        import torch.distributed.tensor._api as _dt_api
+        import torch.distributed.tensor._dispatch as _dt_disp
+        import torch.distributed.tensor._redistribute as _redist
+        from torch.distributed._functional_collectives import AsyncCollectiveTensor
+    except ImportError:
+        return
+
+    orig_rlt = getattr(_redist, "redistribute_local_tensor", None)
+    if orig_rlt is None:
+        return
+
+    def _sync_redistribute_local_tensor(
+        local_tensor: torch.Tensor,
+        current_spec: Any,
+        target_spec: Any,
+        *,
+        async_op: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        is_eager = not torch.compiler.is_compiling() and not torch.compiler._is_non_strict_tracing()
+        if is_eager:
+            async_op = False
+            if isinstance(local_tensor, torch.Tensor) and local_tensor.device.type == "tpu":
+                tpu_synchronize(local_tensor, wait=False)
+        out = orig_rlt(
+            local_tensor,
+            current_spec,
+            target_spec,
+            async_op=async_op,
+            **kwargs,
+        )
+        if not async_op and isinstance(out, AsyncCollectiveTensor):
+            out = out.wait()
+        if is_eager and isinstance(out, torch.Tensor) and out.device.type == "tpu":
+            tpu_synchronize(out, wait=False)
+        return out
+
+    _redist.redistribute_local_tensor = _sync_redistribute_local_tensor
+    if hasattr(_dt_api, "redistribute_local_tensor"):
+        _dt_api.redistribute_local_tensor = _sync_redistribute_local_tensor
+    if hasattr(_dt_disp, "redistribute_local_tensor"):
+        _dt_disp.redistribute_local_tensor = _sync_redistribute_local_tensor
+    _SYNC_DTENSOR_REDISTRIBUTE_PATCHED = True
+
+
+def _tpu_logprobs_chunk_step(
+    logits_chunk: torch.Tensor,
+    labels_chunk: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """All-gather one static sequence chunk of ``logits_chunk`` (if ``DTensor``) and compute log-probs."""
+    from verl.utils.torch_functional import logprobs_from_logits_naive
+
+    if isinstance(logits_chunk, DTensor):
+        logits_chunk = logits_chunk.full_tensor()
+    if logits_chunk.dim() > 2:
+        logits_chunk = logits_chunk.squeeze(0)
+    if temperature != 1.0:
+        logits_chunk = logits_chunk / temperature
+    return logprobs_from_logits_naive(logits_chunk.float(), labels_chunk)
+
+
+def _eval_tpu_logprobs_chunks_no_grad(
+    local_logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+    step: int,
+    mesh: Any,
+    placements: Any,
+) -> torch.Tensor:
+    total_tokens = int(labels.shape[0])
+    seq_dim = 1 if local_logits.dim() == 3 else 0
+    chunks: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, total_tokens, step):
+            end = min(start + step, total_tokens)
+            l_slice = local_logits[:, start:end, :] if seq_dim == 1 else local_logits[start:end, :]
+            l_chunk = DTensor.from_local(l_slice, mesh, placements, run_check=False) if mesh is not None else l_slice
+            lp = _tpu_logprobs_chunk_step(l_chunk, labels[start:end], temperature)
+            tpu_synchronize(lp, wait=False)
+            chunks.append(lp)
+        out = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        tpu_synchronize(out, wait=False)
+        return out
+
+
+class _TPULogProbsChunkedFn(torch.autograd.Function):
+    """Chunked log-probabilities autograd function avoiding full-sequence ``SliceBackward0`` buffers."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        local_logits: torch.Tensor,
+        labels: torch.Tensor,
+        temperature: float,
+        step: int,
+        mesh: Any,
+        placements: Any,
+    ) -> torch.Tensor:
+        out = _eval_tpu_logprobs_chunks_no_grad(local_logits, labels, temperature, step, mesh, placements)
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(local_logits, labels)
+            ctx.temperature = temperature
+            ctx.step = step
+            ctx.mesh = mesh
+            ctx.placements = placements
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Optional[torch.Tensor], None, None, None, None, None]:
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None, None
+        local_logits, labels = ctx.saved_tensors
+        temperature = ctx.temperature
+        step = ctx.step
+        mesh = ctx.mesh
+        placements = ctx.placements
+        total_tokens = int(labels.shape[0])
+        seq_dim = 1 if local_logits.dim() == 3 else 0
+        grad_chunks: list[torch.Tensor] = []
+        for start in range(0, total_tokens, step):
+            end = min(start + step, total_tokens)
+            l_slice = (
+                (local_logits[:, start:end, :] if seq_dim == 1 else local_logits[start:end, :])
+                .detach()
+                .requires_grad_(True)
+            )
+            with torch.enable_grad():
+                l_chunk = (
+                    DTensor.from_local(l_slice, mesh, placements, run_check=False) if mesh is not None else l_slice
+                )
+                lp = _tpu_logprobs_chunk_step(l_chunk, labels[start:end], temperature)
+                (g_slice,) = torch.autograd.grad(lp, l_slice, grad_outputs=grad_output[start:end])
+            tpu_synchronize(g_slice, wait=False)
+            grad_chunks.append(g_slice)
+        grad_local_logits = grad_chunks[0] if len(grad_chunks) == 1 else torch.cat(grad_chunks, dim=seq_dim)
+        tpu_synchronize(grad_local_logits, wait=False)
+        return grad_local_logits, None, None, None, None, None
+
+
+def compute_tpu_logprobs_chunked(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute per-token log-probabilities on TPU in static ``chunk_size`` token slices with checkpointing.
+
+    All-gathering and running ``F.log_softmax`` over a full ``[T, V]`` vocabulary tensor at once (e.g.
+    ``[3072, 151936]`` = ``0.93 GB`` in ``bfloat16``) materializes multiple ``~1 GB`` buffers and compiles
+    a separate ``1.2–2.2 GB`` XLA executable for every sequence-length bucket ``T``. Evaluating static
+    ``[chunk_size, V]`` chunks via :class:`_TPULogProbsChunkedFn` reuses a single static XLA executable across
+    all sequence-length buckets, keeps only the TP-sharded ``DTensor`` logits saved for backward, and avoids
+    chaining ``N`` full-sequence ``SliceBackward0`` + ``aten.add`` buffers before ``lm_head`` backward.
+    """
+    if labels.dim() > 1:
+        labels = labels.squeeze(0)
+    step = chunk_size if chunk_size is not None and chunk_size > 0 else get_tpu_seq_bucket_size()
+    if isinstance(logits, DTensor):
+        mesh = logits.device_mesh
+        placements = logits.placements
+        local_logits = logits.to_local()
+    else:
+        mesh = None
+        placements = None
+        local_logits = logits
+    if torch.is_grad_enabled() and local_logits.requires_grad:
+        return _TPULogProbsChunkedFn.apply(local_logits, labels, float(temperature), int(step), mesh, placements)
+    return _eval_tpu_logprobs_chunks_no_grad(local_logits, labels, float(temperature), int(step), mesh, placements)
 
 
 def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:

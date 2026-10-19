@@ -66,3 +66,40 @@ def test_patched_all_reduce_is_traceable_by_torch_compile():
         torch._dynamo.reset()
         if initialized_here:
             dist.destroy_process_group()
+
+
+def test_gloo_only_group_with_tpu_tensor_stages_via_cpu():
+    class _FakeTPUTensor:
+        device = mock.Mock(type="tpu")
+
+        def __init__(self, val: float):
+            self._cpu = torch.tensor([val])
+            self.copied = None
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self._cpu.clone()
+
+        def copy_(self, src):
+            self.copied = src.clone()
+            return self
+
+    def _fake_orig_all_reduce(t, op=None, group=None, async_op=False):
+        t.mul_(2.0)
+        return "ok"
+
+    fake_tpu_tensor = _FakeTPUTensor(6.0)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_orig_all_reduce),
+        mock.patch.object(dist, "get_backend", return_value="gloo"),
+        mock.patch.object(dist, "get_world_size", return_value=2),
+    ):
+        tpu_patch_mod.apply()
+        res = dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG, group="dp_gloo")
+
+    assert res == "ok"
+    assert fake_tpu_tensor.copied is not None
+    assert torch.allclose(fake_tpu_tensor.copied, torch.tensor([6.0]))

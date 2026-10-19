@@ -23,6 +23,7 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
@@ -252,41 +253,48 @@ class TPUDeviceModuleProxy:
             setattr(self._original_module, name, value)
 
     def is_available(self) -> bool:
-        if hasattr(self._original_module, "is_available"):
-            try:
-                return self._original_module.is_available()
-            except Exception as e:
-                logger.warning(f"torch.tpu.is_available() check failed: {e}")
-                return False
-        return False
+        return tpu_device_api.is_available()
 
     def set_device(self, device_index: Any) -> None:
         pass
 
     def current_device(self) -> int:
-        if hasattr(self._original_module, "current_device"):
-            try:
-                return self._original_module.current_device()
-            except Exception as e:
-                logger.warning(f"torch.tpu.current_device() failed: {e}")
-                return 0
-        return 0
+        try:
+            return tpu_device_api.current_device()
+        except Exception as e:
+            logger.warning(f"TPU current_device() failed: {e}")
+            return 0
 
     def device_count(self) -> int:
-        if hasattr(self._original_module, "device_count"):
-            try:
-                return self._original_module.device_count()
-            except Exception as e:
-                logger.warning(f"torch.tpu.device_count() failed: {e}")
-                return 0
-        return 0
+        try:
+            return tpu_device_api.device_count()
+        except Exception as e:
+            logger.warning(f"TPU device_count() failed: {e}")
+            return 0
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        if hasattr(self._original_module, "synchronize"):
-            try:
-                self._original_module.synchronize()
-            except Exception as e:
-                logger.warning(f"torch.tpu.synchronize() failed: {e}")
+        try:
+            tpu_device_api.synchronize()
+        except Exception as e:
+            logger.warning(f"TPU synchronize() failed: {e}")
+
+    # torch_tpu >= 0.2.0 makes these torch.tpu functions internal (they raise when called from
+    # outside torch / torch_tpu), so they are served through torch.accelerator instead of being
+    # forwarded to torch.tpu by __getattr__.
+    def current_stream(self, device: Any = None):
+        return tpu_device_api.current_stream(device)
+
+    def set_stream(self, stream: Any) -> None:
+        tpu_device_api.set_stream(stream)
+
+    def device(self, device_index: Any):
+        return tpu_device_api.device(device_index)
+
+    def get_rng_state(self, device: Any = None) -> torch.Tensor:
+        return tpu_device_api.get_rng_state(device)
+
+    def initial_seed(self) -> int:
+        return tpu_device_api.initial_seed()
 
     def manual_seed_all(self, seed: int) -> None:
         # torch_tpu does not always expose manual_seed_all; the global torch seed is the
@@ -453,10 +461,7 @@ class PlatformTPU(PlatformBase):
 
     def is_available(self) -> bool:
         if hasattr(torch, "tpu"):
-            try:
-                return torch.tpu.is_available()
-            except Exception as e:
-                logger.warning(f"torch.tpu.is_available() check failed: {e}")
+            return tpu_device_api.is_available()
         return False
 
     def is_platform_available(self, use_smi_check=False) -> bool:

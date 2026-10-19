@@ -46,9 +46,9 @@ def _tpu_available() -> bool:
             import torch_tpu  # noqa: F401
         except Exception:
             return False
-    tpu = getattr(torch, "tpu", None)
-    is_avail = getattr(tpu, "is_available", None)
-    return bool(callable(is_avail) and is_avail())
+    from verl_hardware_plugin.accelerators.tpu import device_api
+
+    return device_api.is_available()
 
 
 def _is_tpu_all_reduce(tensor: Any, group: Any) -> bool:

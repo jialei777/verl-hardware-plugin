@@ -19,7 +19,8 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
 * ``TPUModelRunner.gather_logprobs`` and ``sample_from_logits``: normalize log probabilities
-  and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias.
+  and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias. Skipped when
+  vllm-torchtpu already does both (#1747, #2024).
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
@@ -46,6 +47,14 @@ logger = logging.getLogger(__name__)
 _PATCHES_APPLIED = False
 
 
+def _source_upcasts_to_fp32(fn) -> bool:
+    """Whether ``fn``'s source already computes in FP32 (vllm-torchtpu >= #1747 / #2024 does)."""
+    try:
+        return "torch.float32" in inspect.getsource(inspect.unwrap(fn))
+    except (OSError, TypeError):
+        return False
+
+
 def patch_tpu_logprobs() -> None:
     """Use FP32 log_softmax when reporting vllm-torchtpu token log probabilities."""
     if importlib.util.find_spec("vllm_torchtpu") is None:
@@ -55,6 +64,11 @@ def patch_tpu_logprobs() -> None:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     if getattr(TPUModelRunner, "_verl_fp32_logprobs_patched", False):
+        return
+    if _source_upcasts_to_fp32(getattr(TPUModelRunner, "gather_logprobs", None)):
+        # vllm-torchtpu #2024 normalizes the log probabilities in FP32 itself.
+        TPUModelRunner._verl_fp32_logprobs_patched = True
+        logger.info("vllm-torchtpu already computes log probabilities in FP32; logprob patch not needed.")
         return
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -109,6 +123,13 @@ def patch_tpu_sampler() -> None:
         return
 
     original = getattr(TPUModelRunner, "sample_from_logits", None)
+    if _source_upcasts_to_fp32(original):
+        # vllm-torchtpu #1747 draws the Gumbel-Max uniforms in FP32 itself.
+        TPUModelRunner._verl_fp32_sampler_patched = True
+        logger.info("vllm-torchtpu already draws sampling noise in FP32; sampler patch not needed.")
+        return
+    # Later vllm-torchtpu releases append parameters (e.g. ``topk_candidates``); only the leading
+    # ones are used here and the rest are forwarded unchanged.
     expected = ["self", "logits", "temperatures", "u", "top_k", "top_p", "all_greedy"]
     try:
         parameters = list(inspect.signature(original).parameters) if callable(original) else None
@@ -117,7 +138,7 @@ def patch_tpu_sampler() -> None:
         parameters = expected
     if parameters in (["args", "kwargs"], ["self", "args", "kwargs"]):
         parameters = expected
-    if parameters != expected:
+    if parameters is None or parameters[: len(expected)] != expected:
         logger.error(
             "TPU sampler FP32 patch NOT applied: TPUModelRunner.sample_from_logits has parameters %s, "
             "expected %s. Sampling noise stays BF16, which biases policy-gradient training.",
@@ -126,7 +147,7 @@ def patch_tpu_sampler() -> None:
         )
         return
 
-    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False):
+    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False, *args, **kwargs):
         # The all-greedy path never reads ``u``; preserve its compiled graph.
         if not all_greedy and u.dtype != torch.float32:
             global _fp32_sampling_noise_logged
@@ -144,7 +165,7 @@ def patch_tpu_sampler() -> None:
                 # None during precompile warm-up, where the call site also uses the global RNG.
                 generator=getattr(self, "_sampling_generator", None),
             )
-        return original(self, logits, temperatures, u, top_k, top_p, all_greedy=all_greedy)
+        return original(self, logits, temperatures, u, top_k, top_p, all_greedy, *args, **kwargs)
 
     # functools.wraps copies torch.compile's bookkeeping attributes, which can let
     # Dynamo unwrap straight to the compiled function and skip the redraw.

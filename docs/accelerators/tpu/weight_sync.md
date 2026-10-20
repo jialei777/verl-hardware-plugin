@@ -19,11 +19,15 @@ The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEn
 for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
-2. Every trainer rank binds the full weights, which verl gathers on every rank, to its tpu-sync
-   `WeightSynchronizer`. On the first sync it creates that synchronizer and registers it with the Raiden
-   controller, which the driver starts at the same time; later syncs rebind the new tensors to the existing
-   synchronizer, as long as the tensor names, shapes and dtypes do not change. The trainer also publishes the
-   full shape of every tensor in the `RayWeightRegistry` actor.
+2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`: its own FSDP shard of every
+   weight that is split evenly on dim 0 (the FSDP `Shard(0)` layout), registered as its block of the full
+   tensor, and the full tensor for everything else (replicated weights, uneven cuts, FSDP x TP layouts and
+   fused expert stacks, which it all-gathers). The trainer therefore does not gather the model, and Raiden
+   reshards the blocks for the rollout. On the first sync it creates that synchronizer and registers it with
+   the Raiden controller, which the driver starts at the same time; later syncs rebind the new tensors to the
+   existing synchronizer, as long as the tensor names, shapes, dtypes and shard layout do not change. The
+   trainer also publishes the full shape of every tensor in the `RayWeightRegistry` actor, which the driver
+   re-creates at the start of every job.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
    and registers them.
 4. The controller moves the weights from the trainer chips, through the trainer hosts, to the rollout hosts.

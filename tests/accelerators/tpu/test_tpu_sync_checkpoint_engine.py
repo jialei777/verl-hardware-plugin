@@ -140,6 +140,13 @@ class _FakeTpuSync:
         self.ports = itertools.count(20000)
         self.registry_state = RayWeightRegistryState()
         self.registry = _FakeActorHandle(self.registry_state)
+        self.registry_resets = 0
+
+    def reset_registry(self):
+        """Stands in for ``reset_ray_weight_registry``: a fresh registry actor, the old one's entries gone."""
+        self.registry_resets += 1
+        self.registry_state.clear()
+        return self.registry
 
     def synchronizer_at(self, address):
         port = int(address.rsplit(":", 1)[1])
@@ -148,14 +155,32 @@ class _FakeTpuSync:
     def transfer(self, src_units, dst_units):
         """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata."""
         full = {}
+        blocks: dict[str, tuple[int, dict[int, torch.Tensor]]] = {}
         for unit in src_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
             for var, tensor in zip(registration.variables, ws.tensors, strict=True):
-                # Every trainer rank registers the full, unsharded tensor.
-                assert var.mesh_shape == [1] * len(var.shape) and var.sharding_spec == [""] * len(var.shape), var.name
-                assert list(tensor.shape) == list(var.shape), var.name
-                full[var.name] = tensor
+                rest = len(var.shape) - 1
+                indices = getattr(var, "global_shard_indices", None)
+                if indices:
+                    # A local FSDP shard: block `index` of `mesh_shape[0]` equal dim-0 blocks of the full tensor.
+                    num_shards = var.mesh_shape[0]
+                    assert var.mesh_shape[1:] == [1] * rest and var.sharding_spec == ["fsdp"] + [""] * rest, var.name
+                    assert registration.mesh_shape[0] >= num_shards, var.name
+                    assert list(tensor.shape) == [var.shape[0] // num_shards] + var.shape[1:], var.name
+                    (index,) = indices
+                    shards = blocks.setdefault(var.name, (num_shards, {}))[1]
+                    assert index not in shards, f"two units registered block {index} of {var.name}"
+                    shards[index] = tensor
+                else:
+                    # A full, unsharded tensor (the same on every trainer rank).
+                    assert var.mesh_shape == [1] * len(var.shape), var.name
+                    assert var.sharding_spec == [""] * len(var.shape), var.name
+                    assert list(tensor.shape) == list(var.shape), var.name
+                    full[var.name] = tensor
+        for name, (num_shards, shards) in blocks.items():
+            assert sorted(shards) == list(range(num_shards)), f"missing blocks of {name}"
+            full[name] = torch.cat([shards[i] for i in range(num_shards)])
         for unit in dst_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
@@ -368,6 +393,27 @@ def _trainer_engine(rank, **engine_kwargs):
     return engine
 
 
+class _LocalShardWeights:
+    """Stands in for ``TrainerWeights`` on trainer rank ``rank`` of ``world`` FSDP ranks.
+
+    ``local_shards()`` yields this rank's dim-0 block of every tensor not in ``full`` and the whole tensor of those in
+    ``full`` (replicated, or a layout the exporter gathered).
+    """
+
+    def __init__(self, weights, rank, world, full=("model.norm.weight",)):
+        self.weights, self.rank, self.world, self.full = weights, rank, world, set(full)
+
+    def local_shards(self):
+        for name, tensor in self.weights.items():
+            if name in self.full:
+                yield name, tensor, None
+            else:
+                yield name, tensor.chunk(self.world, dim=0)[self.rank].clone(), (self.world, self.rank)
+
+    def __iter__(self):
+        raise AssertionError("the tpu-sync engine must export through local_shards(), not gather")
+
+
 class _Linear(nn.Module):
     """Holds one bf16 ``weight``; ``flipped`` marks vllm-torchtpu's transposed ``(in, out)`` layout."""
 
@@ -466,6 +512,7 @@ def fake_tpu_sync(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(raiden, "RAIDEN_DEVICE", "cpu")
     monkeypatch.setattr(raiden, "get_ray_weight_registry", lambda: world.registry)
+    monkeypatch.setattr(raiden, "reset_ray_weight_registry", world.reset_registry)
     monkeypatch.setattr("ray.util.get_node_ip_address", lambda: "10.0.0.1")
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     monkeypatch.delenv("RANK", raising=False)
@@ -581,12 +628,61 @@ def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
 
     lookups[:] = [ValueError("Failed to look up actor")]
     assert ray_weight_registry.get_ray_weight_registry() is created
-    assert options_calls == [{"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached"}]
+    assert options_calls == [
+        {"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached", "scheduling_strategy": "DEFAULT"}
+    ]
 
     # Another process creates the actor between the lookup and the creation.
     lookups[:] = [ValueError("Failed to look up actor"), existing]
     create_error[:] = [ValueError("Actor name is already taken")]
     assert ray_weight_registry.get_ray_weight_registry() is existing
+
+
+def test_registry_rank_stats():
+    reg = RayWeightRegistryState()
+    reg.set_rank_stats(1, 0, {"l1_norm": 1.0})
+    reg.set_rank_stats(1, 1, {"l1_norm": 2.0})
+    assert reg.get_stats(1) == {"ranks": {0: {"l1_norm": 1.0}, 1: {"l1_norm": 2.0}}}
+    for step in range(2, 2 + reg.MAX_STATS_STEPS):
+        reg.set_rank_stats(step, 0, {})
+    assert reg.get_stats(1) is None  # pruned like set_stats
+
+
+def test_reset_ray_weight_registry_replaces_stale_actor(monkeypatch):
+    stale, fresh = object(), object()
+    killed = []
+    create_results: list = [ValueError("Actor name is already taken"), fresh]  # the name frees up asynchronously
+
+    def get_actor(name, namespace=None):
+        assert (name, namespace) == ("RayWeightRegistry", "verl")
+        return stale
+
+    def options(**kwargs):
+        assert kwargs["scheduling_strategy"] == "DEFAULT" and kwargs["lifetime"] == "detached"
+
+        def remote():
+            result = create_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(ray, "get_actor", get_actor)
+    monkeypatch.setattr(ray, "kill", lambda actor, no_restart: killed.append((actor, no_restart)))
+    monkeypatch.setattr(ray_weight_registry, "RayWeightRegistry", SimpleNamespace(options=options))
+    monkeypatch.setattr(ray_weight_registry, "_RESET_POLL_S", 0.0)
+
+    assert ray_weight_registry.reset_ray_weight_registry() is fresh
+    assert killed == [(stale, True)]
+
+    # No actor left behind: nothing to kill. A name that never frees up raises after the timeout.
+    monkeypatch.setattr(ray, "get_actor", lambda name, namespace=None: (_ for _ in ()).throw(ValueError("none")))
+    monkeypatch.setattr(ray_weight_registry, "_RESET_TIMEOUT_S", 0.0)
+    create_results[:] = [ValueError("Actor name is already taken")]
+    with pytest.raises(ValueError, match="already taken"):
+        ray_weight_registry.reset_ray_weight_registry()
+    assert killed == [(stale, True)]
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +763,7 @@ def test_setup_raiden_controller_publishes_address(fake_tpu_sync):
     assert address == "10.0.0.1:7777"
     assert server.controller is controller is fake_tpu_sync.controller
     assert state.get_controller_address() == address
+    assert fake_tpu_sync.registry_resets == 1  # every job starts with a fresh registry actor
 
 
 def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatch):
@@ -674,7 +771,7 @@ def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatc
         raise ValueError("registry unavailable")
 
     broken = _FakeActorHandle(SimpleNamespace(set_controller_address=fail))
-    monkeypatch.setattr(raiden, "get_ray_weight_registry", lambda: broken)
+    monkeypatch.setattr(raiden, "reset_ray_weight_registry", lambda: broken)
     with pytest.raises(RuntimeError, match=r"Failed to store RaidenController address \(10\.0\.0\.1:7777\)") as err:
         raiden.setup_raiden_controller()
     assert isinstance(err.value.__cause__, ValueError)
@@ -806,6 +903,69 @@ def test_send_weights_drops_tied_lm_head(fake_tpu_sync):
     assert "lm_head.weight" not in fake_tpu_sync.registry_state.get_global_shapes()
 
 
+def test_send_weights_registers_local_shards(fake_tpu_sync):
+    raiden.setup_raiden_controller()
+    rank, world = 1, 2
+    weights = _trainer_weights()
+    names = sorted(weights)
+    engine = _trainer_engine(rank=rank, verify_parity=True)
+    asyncio.run(engine.send_weights(_LocalShardWeights(weights, rank, world), global_steps=1))
+
+    (ws,) = fake_tpu_sync.synchronizers
+    registration = fake_tpu_sync.registrations[RaidenId("trainer", str(rank), "weights")]
+    assert registration.mesh_shape == [world, 1]
+    for var, tensor, name in zip(registration.variables, ws.tensors, names, strict=True):
+        shape = list(TRAINER_SHAPES[name])
+        rest = [1] * (len(shape) - 1)
+        assert (var.name, var.shape) == (name, shape)  # every variable carries its full shape
+        if name == "model.norm.weight":
+            assert (var.mesh_shape, var.sharding_spec) == ([1], [""])
+            assert not hasattr(var, "global_shard_indices")
+            assert torch.equal(tensor, weights[name])
+        else:
+            assert (var.mesh_shape, var.global_shard_indices) == ([world] + rest, [rank])
+            assert var.sharding_spec == ["fsdp"] + [""] * len(rest)
+            assert torch.equal(tensor, weights[name].chunk(world, dim=0)[rank])  # only this rank's block is bound
+    # The rollout sizes its receive buffers from the full shapes.
+    assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
+    # Parity: this rank posts the stats of its own blocks; the full tensors are counted by rank 0 only.
+    (posted,) = fake_tpu_sync.registry_state.get_stats(1)["ranks"].values()
+    assert sorted(posted["per_tensor"]) == sorted(set(names) - {"model.norm.weight"})
+    assert posted["total_numel"] == sum(weights[n].numel() // world for n in names if n != "model.norm.weight")
+
+    # Same layout next step: rebind, no new registration.
+    engine.release_sync_buffers()
+    asyncio.run(engine.send_weights(_LocalShardWeights(_trainer_weights(seed=1), rank, world), global_steps=2))
+    assert fake_tpu_sync.synchronizers == [ws] and ws.bind_calls == 1
+    assert fake_tpu_sync.registrations[RaidenId("trainer", str(rank), "weights")] is registration
+
+    # A different shard layout with identical local shapes (block 0 instead of 1) re-registers.
+    engine.release_sync_buffers()
+    asyncio.run(engine.send_weights(_LocalShardWeights(weights, 0, world), global_steps=3))
+    assert len(fake_tpu_sync.synchronizers) == 2
+    registration = fake_tpu_sync.registrations[RaidenId("trainer", str(rank), "weights")]
+    assert {tuple(getattr(var, "global_shard_indices", ())) for var in registration.variables} == {(), (0,)}
+
+
+def test_merge_rank_stats_matches_full_tensor_stats():
+    weights = _trainer_weights()
+    world = 4
+    rank_stats = {}
+    for rank in range(world):
+        shards = _LocalShardWeights(weights, rank, world).local_shards()
+        items = [(n, t) for n, t, shard in shards if shard is not None or rank == 0]
+        rank_stats[rank] = raiden.compute_tensor_stats(items)
+    merged = raiden.merge_rank_stats(rank_stats)
+    reference = raiden.compute_tensor_stats(list(weights.items()))
+    assert (merged["total_numel"], merged["num_tensors"]) == (reference["total_numel"], reference["num_tensors"])
+    for key in ("l1_norm", "l2_norm", "l2_sq"):
+        assert merged[key] == pytest.approx(reference[key], rel=1e-6)
+    for name, ref in reference["per_tensor"].items():
+        got = merged["per_tensor"][name]
+        assert got["numel"] == ref["numel"]
+        assert (got["l1"], got["l2"]) == (pytest.approx(ref["l1"], rel=1e-6), pytest.approx(ref["l2"], rel=1e-6))
+
+
 # ---------------------------------------------------------------------------
 # Driver side: update_raiden_weights, end to end through the fake transfer
 # ---------------------------------------------------------------------------
@@ -917,6 +1077,87 @@ def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_t
         assert [(var.name, var.shape) for var in registration.variables] == [
             (name, list(TRAINER_SHAPES[name])) for name in sorted(TRAINER_SHAPES)
         ]
+
+
+@pytest.mark.parametrize(("trainer_ranks", "tp"), [(2, 2), (4, 2), (2, 4)])
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_update_raiden_weights_from_local_shards(
+    fake_tpu_sync, tpu_raiden, caplog, trainer_ranks, tp, tie_word_embeddings
+):
+    """Every trainer rank registers only its FSDP blocks; the controller reassembles and reshards them for vLLM TP.
+
+    Includes TP > KV heads (tp=4), where vLLM replicates each KV head, and FSDP degree != TP.
+    """
+    weights = {"current": _trainer_weights(seed=0)}
+    engines = [
+        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings)
+        for rank in range(trainer_ranks)
+    ]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        engines,
+        lambda rank: _LocalShardWeights(weights["current"], rank, trainer_ranks),
+        samplers,
+        [],
+        verify_parity=True,
+    )
+
+    for step in (1, 2):
+        weights["current"] = _trainer_weights(seed=step)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=raiden.__name__):
+            asyncio.run(raiden.update_raiden_weights(manager, global_steps=step))
+        for rank, model in enumerate(models):
+            expected = _expected_vllm_state(weights["current"], rank, tp, lm_head_from_embed=tie_word_embeddings)
+            _assert_state(model, expected)
+        assert f"RAIDEN PARITY VERIFIED | Step {step}" in caplog.text
+        assert "MISMATCH" not in caplog.text
+
+    for rank in range(trainer_ranks):
+        registration = fake_tpu_sync.registrations[RaidenId("trainer", str(rank), "weights")]
+        assert registration.mesh_shape == [trainer_ranks, 1]
+    sampler_synchronizers = [sampler._raiden_ws for sampler in samplers]
+    trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
+    assert [ws.bind_calls for ws in trainer_synchronizers] == [1] * trainer_ranks  # registered once, then rebound
+
+
+def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatch(
+    fake_tpu_sync, tpu_raiden, caplog, monkeypatch
+):
+    tp, trainer_ranks = 2, 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(tpu_raiden, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=True) for rank in range(trainer_ranks)],
+        lambda rank: _LocalShardWeights(weights, rank, trainer_ranks),
+        samplers,
+        [],
+        verify_parity=True,
+    )
+    asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+    state = fake_tpu_sync.registry_state
+    assert sorted(state.get_stats(1)["ranks"]) == list(range(trainer_ranks))
+
+    # A rank whose stats never arrive: the check gives up waiting and reports the stats as incomplete.
+    ranks = state.stats[1]["ranks"]
+    missing = ranks.pop(1)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(raiden.asyncio, "sleep", lambda _: real_sleep(0))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+    assert "Incomplete stats data for step 1" in caplog.text
+    assert "PARITY VERIFIED" not in caplog.text
+    ranks[1] = missing
+
+    # A corrupted rollout tensor is reported against the merged trainer stats.
+    samplers[1]._raiden_staging["model.embed_tokens.weight"].zero_()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+    assert "RAIDEN PARITY MISMATCH | Step 1" in caplog.text
+    assert "model.embed_tokens.weight" in caplog.text
 
 
 def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):

@@ -854,3 +854,69 @@ def test_build_dp_gloo_group_creates_host_gloo_subgroups_when_tp_enabled():
         assert [(r, b) for r, b, _ in created_groups] == [([0, 2], "gloo"), ([1, 3], "gloo")]
         assert engine._build_dp_gloo_group() == "gloo_pg_(0, 2)"
         assert len(created_groups) == 2
+
+
+def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
+    """One trainer rank of ``test_trainer_weights_exports_local_fsdp_shards_or_gathers``."""
+    import torch.distributed as dist
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TrainerWeights, even_dim0_shard
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+        generator = torch.Generator().manual_seed(0)  # the same full tensors on every rank
+        full = {
+            "a.even": torch.randn(8, 4, generator=generator).to(torch.bfloat16),  # bf16 already: .to() is a no-op
+            "b.uneven": torch.randn(5, 4, generator=generator),
+            "c.cols": torch.randn(4, 6, generator=generator),
+            "d.replicated": torch.randn(4, generator=generator),
+            "e.plain": torch.randn(3, generator=generator),
+            "model.embed_tokens.weight": torch.randn(6, 4, generator=generator),
+        }
+        full["lm_head.weight"] = full["model.embed_tokens.weight"]
+        stack = torch.randn(2, 3, 4, generator=generator)
+        placements = {"a.even": Shard(0), "b.uneven": Shard(0), "c.cols": Shard(1), "d.replicated": Replicate()}
+        placements["model.embed_tokens.weight"] = Shard(0)
+        params = {name: distribute_tensor(full[name], mesh, [p]) for name, p in placements.items()}
+        params["e.plain"] = full["e.plain"]
+        params["lm_head.weight"] = params["model.embed_tokens.weight"]  # tied: one DTensor under two names
+        stack_dt = distribute_tensor(stack, mesh, [Shard(0)])
+
+        assert even_dim0_shard(params["a.even"]) == (world, rank)
+        for name in ("b.uneven", "c.cols", "d.replicated", "e.plain"):
+            assert even_dim0_shard(params[name]) is None, name
+
+        def weights() -> TrainerWeights:
+            return TrainerWeights(dict(params), [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu")
+
+        local_names = {"a.even", "model.embed_tokens.weight", "lm_head.weight"}
+        exported = list(weights().local_shards())
+        assert [name for name, _, _ in exported] == [*params, "x.0", "x.1"]
+        for name, tensor, shard in exported:
+            assert tensor.dtype == torch.bfloat16, name
+            expected = (stack[int(name[-1])] if name.startswith("x.") else full[name]).to(torch.bfloat16)
+            if name in local_names:
+                assert shard == (world, rank), name
+                assert torch.equal(tensor, expected.chunk(world, dim=0)[rank]), name
+            else:
+                assert shard is None, name
+                assert torch.equal(tensor, expected), name
+        # The exported block is a copy: an optimizer step after the export must not change what is sent.
+        assert exported[0][1].data_ptr() != params["a.even"].to_local().data_ptr()
+
+        gathered = list(weights())  # plain iteration: every tensor full, as verl expects
+        assert [name for name, _ in gathered] == [*params, "x.0", "x.1"]
+        for name, tensor in gathered:
+            expected = (stack[int(name[-1])] if name.startswith("x.") else full[name]).to(torch.bfloat16)
+            assert torch.equal(tensor, expected), name
+    finally:
+        dist.destroy_process_group()
+
+
+def test_trainer_weights_exports_local_fsdp_shards_or_gathers(tmp_path):
+    """``local_shards()`` keeps even dim-0 FSDP shards local and gathers the rest; iteration gathers everything."""
+    torch.multiprocessing.start_processes(
+        _trainer_weights_worker, args=(2, str(tmp_path / "pg")), nprocs=2, join=True, start_method="fork"
+    )

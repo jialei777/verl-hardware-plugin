@@ -10,7 +10,7 @@ This module implements the TPU TorchTitan engine directly on top of ``verl.worke
 without importing ``verl.workers.engine.torchtitan``, keeping the TPU TorchTitan backend completely
 decoupled from core verl's GPU TorchTitan engine:
 - ``spmd_backend="default"`` and ``CompileConfig(backend="tpu")`` with static-shape Dynamo settings
-- ``TPUSplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
+- torchtitan's TPU ``SplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
 - ``OptimizersContainer.Config(implementation="fused")`` (``VERL_TPU_OPTIM_IMPL`` overrides) and ``foreach=False``
@@ -37,6 +37,7 @@ import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
@@ -60,6 +61,7 @@ from verl.workers.engine.utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
+    ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
     bucket_length,
     compute_global_batch_num_tokens,
@@ -79,6 +81,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     prepare_tpu_loss_inputs,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    spmd_no_typecheck_context,
     tpu_eager_mode_context,
     tpu_synchronize,
     unwrap_metadata,
@@ -117,7 +120,10 @@ class TPUEngineEvalModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanTPUEngine)
 
         # Reshard the FSDP2 modules. SimpleFSDP modules are not FSDPModule and keep no unsharded copy.
-        if self.engine.engine_config.data_parallel_shard_size > 1:
+        if (
+            self.engine.engine_config.data_parallel_shard_size > 1
+            or self.engine.engine_config.context_parallel_size > 1
+        ):
             for module in self.engine.module:
                 for submodule in module.modules():
                     if isinstance(submodule, FSDPModule):
@@ -169,7 +175,8 @@ class TorchTitanTPUEngine(BaseEngine):
         from torchtitan.components.loss import CrossEntropyLoss
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
         from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
-        from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+        from torchtitan.distributed.activation_checkpoint import FullAC
+        from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
         from torchtitan.trainer import Trainer
 
         super().__init__()
@@ -178,9 +185,6 @@ class TorchTitanTPUEngine(BaseEngine):
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
-
-        if engine_config.context_parallel_size > 1:
-            raise NotImplementedError("context parallelism is not supported by the TPU TorchTitan engine")
 
         (
             self._use_splash_attention,
@@ -252,6 +256,8 @@ class TorchTitanTPUEngine(BaseEngine):
             spmd_backend=self.engine_config.spmd_backend,
             use_simple_fsdp=self._use_simple_fsdp,
         )
+        if parallelism.context_parallel_degree > 1:
+            self._enable_context_parallel(parallelism, model_spec.model)
         # interval=1: save whenever verl calls save_checkpoint (TorchTitan's default 500 skips the other steps).
         checkpoint = CheckpointManager.Config(
             enable=True, interval=1, initial_load_in_hf=True, initial_load_path=model_config.path
@@ -285,14 +291,24 @@ class TorchTitanTPUEngine(BaseEngine):
         # on the autograd backward thread where the thread-local SPMD mesh is inactive,
         # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
         # (or enable torch.compile, which recomputes in-graph) in that configuration.
+        ac_mode = self.engine_config.activation_checkpoint
+        if parallelism.spmd_backend == "spmd_types" and not self.engine_config.use_torch_compile and ac_mode != "none":
+            logger.warning(
+                "Disabling activation_checkpoint=%r because spmd_backend='spmd_types' with "
+                "use_torch_compile=False does not support eager AC recomputation.",
+                ac_mode,
+            )
+            ac_mode = "none"
         if self.engine_config.forward_only:
             activation_checkpoint = None
         else:
             activation_checkpoint = {
-                "selective": SelectiveAC.Config,
+                # torchtitan's TPU SelectiveAC also saves the wait of each saved collective (e.g. the Ulysses
+                # all-to-all), which torch-tpu's compiler needs in the same graph as the collective.
+                "selective": TPUSelectiveAC.Config,
                 "full": FullAC.Config,
                 "none": lambda: None,
-            }[self.engine_config.activation_checkpoint]()
+            }[ac_mode]()
 
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
@@ -399,6 +415,60 @@ class TorchTitanTPUEngine(BaseEngine):
             cp_mesh = self.parallel_dims.get_optional_mesh("cp")
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
         return is_collect
+
+    def _enable_context_parallel(self, parallelism: Any, model: Any) -> None:
+        """Turn on TPU context parallelism the way a torchtitan CP recipe does.
+
+        Like ``torchtitan_recipes/muse_glimmer.py`` and the TPU ``qwen3_*_cp*`` recipes: set the SPMD backend and
+        the load balancer, swap in the TPU CP inner attention with core ``ContextParallelTransform``, then check the
+        TPU-specific rules. Core ``Trainer.Config`` validates the rest when it is built. The strategy comes from
+        ``context_parallel_strategy`` so verl keeps CP as a config option.
+        """
+        from torchtitan.config.transform import ContextParallelTransform, transform_model_config_
+        from torchtitan.experiments.tpu.cp_attention import (
+            install_tpu_cp_patches,
+            tpu_cp_inner_attention,
+            tpu_cp_load_balancer,
+            validate_tpu_context_parallel,
+        )
+
+        strategy = getattr(self.engine_config, "context_parallel_strategy", "all_gather") or "all_gather"
+        parallelism.spmd_backend = "spmd_types"
+        parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(strategy)
+        inner_attention = model.first_full_attention_backend
+        cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
+        transform_model_config_(model, [ContextParallelTransform(inner_attention=cp_inner_attention)])
+        validate_tpu_context_parallel(model, parallelism)
+        # Runtime FSDP workaround for torch without spmd_types FSDP (see install_tpu_cp_patches).
+        install_tpu_cp_patches()
+
+    def _cp_attention_owner(self) -> Any:
+        """Return the CP inner-attention class whose ``cp_shard`` shards model inputs.
+
+        Mirrors torchtitan's ``Decoder._cp_shard_inputs``: ``_enable_context_parallel`` swaps the inner attention
+        config for a CP variant when ``cp > 1``, and that variant's owner class knows how its strategy shards inputs.
+        """
+        inner_attention = self.config.model_spec.model.first_full_attention_backend
+        owner = getattr(inner_attention, "_owner", None)
+        if owner is None or not callable(getattr(owner, "cp_shard", None)):
+            raise RuntimeError(
+                f"Context parallelism is enabled but the inner attention {type(inner_attention).__name__} "
+                "has no cp_shard; _enable_context_parallel must run before the model is built."
+            )
+        return owner
+
+    def _gather_context_parallel(self, tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """All-gather a per-token tensor sharded along dim 0 by CP and restore the original token order."""
+        load_balancer_type = self.trainer.config.parallelism.context_parallel_load_balancer
+        load_balancer = None
+        if load_balancer_type == "headtail":
+            load_balancer = _HeadTailLoadBalancer(seq_len, self.parallel_dims.cp, tensor.device)
+        elif load_balancer_type is not None:
+            raise NotImplementedError(f"context_parallel_load_balancer={load_balancer_type!r} is not supported")
+        gathered = ContextParallelGather.apply(tensor, self.get_context_parallel_group())
+        if load_balancer is not None:
+            gathered = gathered[load_balancer._generate_indices(restore=True)[0]]
+        return gathered
 
     def _build_dp_gloo_group(self):
         """Build a host-side Gloo ProcessGroup per data-parallel slice when model parallelism is active.
@@ -530,10 +600,14 @@ class TorchTitanTPUEngine(BaseEngine):
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
-        tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
+        tu.assign_non_tensor(
+            data, sp_size=self.engine_config.tensor_parallel_size * self.engine_config.context_parallel_size
+        )
 
         dp_group = self.get_data_parallel_group()
-        batch_num_tokens = compute_global_batch_num_tokens(data, dp_group, self.engine_config.tensor_parallel_size)
+        batch_num_tokens = compute_global_batch_num_tokens(
+            data, dp_group, self.engine_config.tensor_parallel_size, self.engine_config.context_parallel_size
+        )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
@@ -542,7 +616,7 @@ class TorchTitanTPUEngine(BaseEngine):
             dp_group=dp_group,
             same_micro_num_in_dp=True,
         )
-        if self._use_simple_fsdp:
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled:
             align_micro_batch_shapes_across_ranks(
                 micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
             )
@@ -557,14 +631,16 @@ class TorchTitanTPUEngine(BaseEngine):
                         micro_batch, loss_function=loss_function, forward_only=forward_only
                     )
                     if not forward_only:
-                        if self._simple_fsdp_loss_scale is not None:
-                            loss = loss * self._simple_fsdp_loss_scale
-                        tpu_synchronize(loss, wait=False)
-                        loss.backward()
-                        del loss
-                        tpu_synchronize(wait=True)
+                        with spmd_no_typecheck_context():
+                            if self._simple_fsdp_loss_scale is not None:
+                                loss = loss * self._simple_fsdp_loss_scale
+                            tpu_synchronize(loss, wait=False)
+                            loss.backward()
+                            del loss
+                            tpu_synchronize(wait=True)
                     else:
                         del loss
+                        tpu_synchronize(wait=True)
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -843,11 +919,50 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             output_args["batch_size"] = batch_size
             output_args["max_seq_len"] = max_seq_len
 
+        output_args["padded_seq_len"] = int(input_ids.shape[-1])
+        extra_kwargs: dict[str, Any] = {}
+        if self.parallel_dims.cp_enabled:
+            cp_batch: dict[str, Any] = {"input": input_ids, "positions": position_ids}
+            if use_remove_padding:
+                cp_batch["labels"] = labels
+            # Shard through the CP inner attention's own ``cp_shard``, as torchtitan's ``Decoder._cp_shard_inputs``
+            # does, so strategy-specific input handling (load balancing, the all_gather CP-rank tensor) applies.
+            cp_batch = self._cp_attention_owner().cp_shard(
+                cp_batch,
+                None,
+                self.parallel_dims.get_mesh("cp"),
+                self.trainer.config.parallelism.context_parallel_load_balancer,
+                self.trainer.config.parallelism.context_parallel_ptrr_mask_key,
+            )
+            input_ids = cp_batch.pop("input")
+            position_ids = cp_batch.pop("positions")
+            if use_remove_padding:
+                labels = cp_batch.pop("labels")
+            extra_kwargs.update(cp_batch)
+
         # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
         extra_inputs = {"positions": position_ids, **multi_modal_inputs}
         extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
+        extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
         output_args["labels"] = labels
-        return input_ids.contiguous(), extra_inputs, {}, output_args
+        input_ids = input_ids.contiguous()
+
+        if getattr(self.trainer.config.parallelism, "spmd_backend", None) == "spmd_types":
+            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+            from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+
+            spmd_inputs: dict[str, Any] = {"input": input_ids, "positions": extra_inputs["positions"]}
+            if use_remove_padding:
+                spmd_inputs["labels"] = labels
+            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, decoder_input_sharding())
+
+        return input_ids, extra_inputs, extra_kwargs, output_args
+
+    def _maybe_gather_context_parallel(self, tensor: torch.Tensor, output_args: dict) -> torch.Tensor:
+        """Under CP, gather this rank's token shard into the full bucket-padded sequence (original token order)."""
+        if not getattr(self.parallel_dims, "cp_enabled", False):
+            return tensor
+        return self._gather_context_parallel(tensor, output_args["padded_seq_len"])
 
     def prepare_model_outputs(self, logits: torch.Tensor, output_args: dict, micro_batch: TensorDict):
         """Convert TPU model logits into jagged log_probs/entropy while retaining bucket-padded device buffers."""
@@ -882,6 +997,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     temperature=temperature,
                 )
                 if not calculate_entropy:
+                    fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
             # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
@@ -933,12 +1049,20 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 del logits_rmpad
 
             orig_seq_len = output_args.get("orig_seq_len")
-            log_probs = _to_jagged(log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs, cu_seqlens, orig_seq_len)
+            log_probs = self._maybe_gather_context_parallel(
+                log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs, output_args
+            )
+            log_probs = _to_jagged(log_probs, cu_seqlens, orig_seq_len)
             if calculate_entropy:
+                entropy_rmpad = self._maybe_gather_context_parallel(entropy_rmpad, output_args)
                 entropy = _to_jagged(entropy_rmpad, cu_seqlens, orig_seq_len)
         else:
             if isinstance(logits, DTensor):
                 logits = logits.full_tensor()
+            if getattr(self.parallel_dims, "cp_enabled", False):
+                logits = self._maybe_gather_context_parallel(
+                    logits.squeeze(0) if logits.dim() > 2 else logits, output_args
+                )
             if logits.dim() == 2 and "batch_size" in output_args and "max_seq_len" in output_args:
                 logits = logits.view(output_args["batch_size"], output_args["max_seq_len"], -1)
             logits = (logits / temperature).float()  # fp32 log-softmax and entropy, as above
@@ -973,35 +1097,36 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            model_output = self.prepare_model_outputs(
-                logits=self.model_forward_step(
-                    inputs=input_ids,
-                    extra_inputs=extra_inputs,
-                    extra_kwargs=extra_kwargs,
-                    return_dtensor=True,
-                ),
-                output_args=output_args,
-                micro_batch=micro_batch,
+            logits = self.model_forward_step(
+                inputs=input_ids,
+                extra_inputs=extra_inputs,
+                extra_kwargs=extra_kwargs,
+                return_dtensor=True,
             )
-
-            if loss_function is not None:
-                loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
-                loss, metrics = loss_function(
-                    model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+            # verl's output and loss ops carry no spmd_types annotations (CP runs under spmd_types).
+            with spmd_no_typecheck_context():
+                model_output = self.prepare_model_outputs(
+                    logits=logits, output_args=output_args, micro_batch=micro_batch
                 )
-            else:
-                assert forward_only, "loss_function must be provided when not forward_only"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
 
-            for value in model_output.values():
-                if hasattr(value, TPU_PADDED_VALUES_ATTR):
-                    delattr(value, TPU_PADDED_VALUES_ATTR)
+                if loss_function is not None:
+                    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+                    loss, metrics = loss_function(
+                        model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+                    )
+                else:
+                    assert forward_only, "loss_function must be provided when not forward_only"
+                    loss = torch.tensor(1.0, device=device_name)
+                    metrics = {}
 
-            output = {
-                "model_output": detach_tree(model_output),
-                "loss": loss.detach().item(),
-                "metrics": metrics,
-            }
+                for value in model_output.values():
+                    if hasattr(value, TPU_PADDED_VALUES_ATTR):
+                        delattr(value, TPU_PADDED_VALUES_ATTR)
+
+                output = {
+                    "model_output": detach_tree(model_output),
+                    "loss": loss.detach().item(),
+                    "metrics": metrics,
+                }
 
         return loss, output

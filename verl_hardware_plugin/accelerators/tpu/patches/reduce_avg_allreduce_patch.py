@@ -56,6 +56,7 @@ def apply() -> None:
         return
 
     original_all_reduce = dist.all_reduce
+    original_all_gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
 
     def _patched_all_reduce(tensor, op=None, group=None, async_op=False):
         # Forward `op` only when the caller passed one. Under torch.compile, dynamo rewrites the original
@@ -81,6 +82,21 @@ def apply() -> None:
         return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
     dist.all_reduce = _patched_all_reduce
+
+    if callable(original_all_gather_into_tensor):
+
+        def _patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+            # Same staging as all_reduce: a Gloo-only group (e.g. the CP-aware DP group) cannot take TPU tensors.
+            if not async_op and _is_gloo_only_group_with_tpu_tensor(input_tensor, group):
+                cpu_out = output_tensor.detach().cpu()
+                result = original_all_gather_into_tensor(
+                    cpu_out, input_tensor.detach().cpu(), group=group, async_op=False
+                )
+                output_tensor.copy_(cpu_out)
+                return result
+            return original_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
+
+        dist.all_gather_into_tensor = _patched_all_gather_into_tensor
 
     _applied = True
     logger.info("[verl_hardware_plugin] Patched torch.distributed.all_reduce for TPU tensors on Gloo-only groups")

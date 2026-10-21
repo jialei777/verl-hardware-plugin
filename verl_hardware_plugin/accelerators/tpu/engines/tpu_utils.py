@@ -16,7 +16,7 @@ import logging
 import os
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_engine_options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -187,12 +188,19 @@ def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
 
 
 def extend_torchtitan_engine_config() -> None:
-    """Register TPU-specific optional fields on ``TorchtitanEngineConfig`` for Hydra/OmegaConf."""
+    """Register TPU fields on ``TorchtitanEngineConfig`` for Hydra/OmegaConf.
+
+    ``engine_kwargs`` holds the TPU options under ``engine_kwargs.tpu`` (see ``tpu_engine_options``). The other
+    TPU fields are deprecated aliases, kept so existing recipes keep working.
+    TODO(tpu): drop this patch once verl's ``TorchtitanEngineConfig`` has an ``engine_kwargs`` field.
+    """
     extras: list[tuple[str, Any, Any]] = [
+        ("engine_kwargs", dict[str, Any], field(default_factory=dict)),
+        # Deprecated: use engine_kwargs.tpu.<name>.
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
         ("use_fused_linear_cross_entropy", Optional[bool], None),
-        ("fuse_qkv", bool, True),
+        ("fuse_qkv", Optional[bool], None),
         ("tpu_eager_mode", Optional[str], None),
         ("pad_to_length", bool, False),
         ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),
@@ -217,31 +225,20 @@ def extend_torchtitan_engine_config() -> None:
 extend_torchtitan_engine_config()
 
 
-def _resolve_option(env_name: str, cfg_value: Any, default: bool) -> bool:
-    """``env_name`` (1/true/yes/on or 0/false/no/off) > ``cfg_value`` when not ``None`` > ``default``."""
-    env = os.environ.get(env_name, "").strip().lower()
-    if env in ("1", "true", "yes", "on"):
-        return True
-    if env in ("0", "false", "no", "off"):
-        return False
-    return default if cfg_value is None else bool(cfg_value)
+def _or_default(value: Optional[bool], default: bool) -> bool:
+    return default if value is None else bool(value)
 
 
 def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Optional[str]]:
     """Resolve ``(use_splash_attention, use_simple_fsdp, tpu_eager_mode)`` for TPU TorchTitan.
 
-    Precedence for each option:
-    1. Explicit environment variable override (``VERL_TPU_USE_SPLASH_ATTENTION``,
-       ``VERL_TPU_USE_SIMPLE_FSDP``, ``VERL_TPU_EAGER_MODE``).
-    2. Explicit ``engine_config`` field value when non-``None``.
-    3. Automatic TPU defaults based on ``engine_config.use_torch_compile``:
-       when ``use_torch_compile=True``, enables ``TPUSplashAttention``, ``SimpleFSDP``
-       (for FSDP/HSDP with optional TP where PP/CP/EP == 1), and ``DEFER_AND_FUSE``.
+    Each option comes from ``engine_kwargs.tpu`` (see ``get_tpu_engine_options``), else defaults from
+    ``engine_config.use_torch_compile``: with ``use_torch_compile=True``, ``TPUSplashAttention``, ``SimpleFSDP``
+    (for FSDP/HSDP with optional TP where PP/CP/EP == 1) and ``DEFER_AND_FUSE``.
     """
+    options = get_tpu_engine_options(engine_config)
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
-    use_splash_attention = _resolve_option(
-        "VERL_TPU_USE_SPLASH_ATTENTION", getattr(engine_config, "use_splash_attention", None), use_torch_compile
-    )
+    use_splash_attention = _or_default(options.use_splash_attention, use_torch_compile)
     if use_torch_compile and not use_splash_attention:
         raise ValueError(
             "use_torch_compile=True on TPU requires use_splash_attention=True: torch_tpu's compiled "
@@ -253,21 +250,16 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     simple_fsdp_compatible = all(
         getattr(engine_config, f"{dim}_parallel_size", 1) == 1 for dim in ("pipeline", "context", "expert")
     )
-    use_simple_fsdp = _resolve_option(
-        "VERL_TPU_USE_SIMPLE_FSDP",
-        getattr(engine_config, "use_simple_fsdp", None),
-        use_torch_compile and simple_fsdp_compatible,
-    )
+    use_simple_fsdp = _or_default(options.use_simple_fsdp, use_torch_compile and simple_fsdp_compatible)
     if use_simple_fsdp and not simple_fsdp_compatible:
         raise ValueError(
             "use_simple_fsdp supports FSDP/HSDP (+ optional TP) only (pipeline/context/expert parallel size 1)"
         )
 
-    eager = os.environ.get("VERL_TPU_EAGER_MODE", "").strip() or getattr(engine_config, "tpu_eager_mode", None)
-    if eager is None:
+    if options.tpu_eager_mode is None:
         tpu_eager_mode = "DEFER_AND_FUSE" if use_torch_compile else None
     else:
-        tpu_eager_mode = str(eager).strip().upper()
+        tpu_eager_mode = options.tpu_eager_mode.strip().upper()
         tpu_eager_mode = None if tpu_eager_mode in ("", "NONE", "NULL") else tpu_eager_mode
     if tpu_eager_mode not in (None, "DEFER_AND_FUSE", "DEFER_NEVER"):
         raise ValueError(f"tpu_eager_mode {tpu_eager_mode!r} not supported")
@@ -286,9 +278,8 @@ def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
     """
     if getattr(engine_config, "tensor_parallel_size", 1) > 1:
         return False
-    return _resolve_option(
-        "VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY",
-        getattr(engine_config, "use_fused_linear_cross_entropy", None),
+    return _or_default(
+        get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy,
         bool(getattr(engine_config, "use_torch_compile", False)),
     )
 
@@ -602,18 +593,14 @@ def get_tpu_seq_bucket_size(engine_config: Any = None) -> int:
     """Return the sequence length bucket multiple used on TPU to bound XLA compilations.
 
     Precedence:
-    1. ``VERL_TPU_SEQ_BUCKET_SIZE`` environment variable when set and positive.
+    1. ``engine_kwargs.tpu.seq_bucket_size`` (``get_tpu_engine_options``; also reads the deprecated
+       ``VERL_TPU_SEQ_BUCKET_SIZE``).
     2. ``engine_config.pad_to_length_bucket`` when ``engine_config.pad_to_length`` is enabled.
     3. ``_DEFAULT_TPU_SEQ_BUCKET_SIZE`` (256).
     """
-    env_raw = os.environ.get("VERL_TPU_SEQ_BUCKET_SIZE")
-    if env_raw is not None and env_raw.strip() != "":
-        try:
-            val = int(env_raw)
-            if val > 0:
-                return val
-        except ValueError:
-            pass
+    seq_bucket_size = get_tpu_engine_options(engine_config).seq_bucket_size
+    if seq_bucket_size is not None:
+        return seq_bucket_size
     if engine_config is not None and bool(getattr(engine_config, "pad_to_length", False)):
         cfg_bucket = getattr(engine_config, "pad_to_length_bucket", None)
         if isinstance(cfg_bucket, int) and cfg_bucket > 0:

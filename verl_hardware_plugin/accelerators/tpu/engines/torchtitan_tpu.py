@@ -13,7 +13,8 @@ decoupled from core verl's GPU TorchTitan engine:
 - ``TPUSplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
-- ``OptimizersContainer.Config(implementation="fused")`` (``VERL_TPU_OPTIM_IMPL`` overrides) and ``foreach=False``
+- ``OptimizersContainer.Config(implementation="fused")`` (``engine_kwargs.tpu.optim_impl`` overrides) and
+  ``foreach=False``
   grad norm clipping
 - Host-side global token counting (avoiding eager device collectives inside the XLA SPMD trace)
 - Graph-break loss synchronization between forward and backward
@@ -58,6 +59,7 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_engine_options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     align_micro_batch_shapes_across_ranks,
@@ -195,13 +197,15 @@ class TorchTitanTPUEngine(BaseEngine):
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
+        tpu_options = get_tpu_engine_options(self.engine_config)
+
         # Get ModelSpec from model registry
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=self.engine_config.attn_type,
             seq_len=self.engine_config.max_seq_len,
-            **({} if self.engine_config.fuse_qkv else {"fuse_qkv": False}),
+            **({} if tpu_options.fuse_qkv is not False else {"fuse_qkv": False}),
         )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
@@ -214,7 +218,7 @@ class TorchTitanTPUEngine(BaseEngine):
         # Under 2D (dp_shard, tp) SimpleFSDP, parameters have heterogeneous 2D DTensor placements
         # ((_StridedShard(0), Shard(0)), (Shard(0), Shard(1)), (Replicate(), Replicate())), so default to "for-loop".
         default_optim_impl = "for-loop" if self.engine_config.tensor_parallel_size > 1 else "fused"
-        optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", default_optim_impl)
+        optim_impl = tpu_options.optim_impl or default_optim_impl
         optimizer = OptimizersContainer.Config(
             implementation=optim_impl,
             param_groups=[

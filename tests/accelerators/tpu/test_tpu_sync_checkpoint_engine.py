@@ -7,7 +7,7 @@ tpu-sync, torch_tpu and vLLM are not installed on CI. A fake ``tpu_sync`` stands
 library: its controller "transfers" by copying the trainer's bound tensors into the rollout workers'
 receive buffers, resharded as the variable metadata registered by both sides describes, so the
 end-to-end tests check that this metadata is consistent. Ray actor handles are in-process stand-ins
-around the real ``RayWeightRegistryState``.
+around the real ``TpuSyncRendezvousState``.
 """
 
 import asyncio
@@ -38,9 +38,16 @@ for _mod_name in ("uvicorn", "fastapi"):
 # Imported up front, so that no test imports (and registers) them a second time. Importing
 # tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines import ray_weight_registry, tpu_checkpoint_engine  # noqa: E402, F401
+from verl_hardware_plugin.accelerators.tpu.engines import (  # noqa: E402, F401
+    ray_weight_registry,
+    tpu_checkpoint_engine,
+    tpu_sync_rendezvous,  # noqa: E402
+)
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_parity as parity  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_rendezvous import TpuSyncRendezvousState  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights  # noqa: E402
 
 TPU_RAIDEN = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden"
 RaidenId = namedtuple("RaidenId", ["job_name", "job_replica_id", "data_name"])
@@ -138,14 +145,19 @@ class _FakeTpuSync:
         self.tpu_syncs = 0
         self.fail_tpu_sync = False
         self.ports = itertools.count(20000)
-        self.registry_state = RayWeightRegistryState()
+        self.registry_state = TpuSyncRendezvousState()
         self.registry = _FakeActorHandle(self.registry_state)
-        self.registry_resets = 0
+        self.rendezvous_creations = 0
+        self.rendezvous_lookups = []
 
-    def reset_registry(self):
-        """Stands in for ``reset_ray_weight_registry``: a fresh registry actor, the old one's entries gone."""
-        self.registry_resets += 1
-        self.registry_state.clear()
+    def create_rendezvous(self):
+        """Stands in for ``create_tpu_sync_rendezvous``: this job's rendezvous actor and its name."""
+        self.rendezvous_creations += 1
+        return self.registry, "TpuSyncRendezvous-test"
+
+    def get_rendezvous(self, name=None):
+        """Stands in for ``get_tpu_sync_rendezvous``; records the name the caller looked up."""
+        self.rendezvous_lookups.append(name)
         return self.registry
 
     def synchronizer_at(self, address):
@@ -393,7 +405,7 @@ def _trainer_engine(rank, **engine_kwargs):
     return engine
 
 
-class _LocalShardWeights:
+class _LocalShardWeights(TrainerWeights):
     """Stands in for ``TrainerWeights`` on trainer rank ``rank`` of ``world`` FSDP ranks.
 
     ``local_shards()`` yields this rank's dim-0 block of every tensor not in ``full`` and the whole tensor of those in
@@ -511,12 +523,17 @@ def fake_tpu_sync(monkeypatch):
     for name, module in world.modules().items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(raiden, "RAIDEN_DEVICE", "cpu")
-    monkeypatch.setattr(raiden, "get_ray_weight_registry", lambda: world.registry)
-    monkeypatch.setattr(raiden, "reset_ray_weight_registry", world.reset_registry)
+    monkeypatch.setattr(raiden, "get_tpu_sync_rendezvous", world.get_rendezvous)
+    monkeypatch.setattr(raiden, "create_tpu_sync_rendezvous", world.create_rendezvous)
+    monkeypatch.setattr(parity, "get_tpu_sync_rendezvous", world.get_rendezvous)
     monkeypatch.setattr("ray.util.get_node_ip_address", lambda: "10.0.0.1")
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     monkeypatch.delenv("RANK", raising=False)
-    return world
+    # The parity results are logged by tpu_sync_parity; let INFO through to caplog like the engine's own logger.
+    parity_level = parity.logger.level
+    parity.logger.setLevel(logging.INFO)
+    yield world
+    parity.logger.setLevel(parity_level)
 
 
 @pytest.fixture
@@ -527,7 +544,7 @@ def tpu_raiden(fake_tpu_sync, monkeypatch):
     monkeypatch.setitem(sys.modules, "verl.workers.rollout.vllm_rollout.utils", utils)
     sys.modules.pop(TPU_RAIDEN, None)
     module = importlib.import_module(TPU_RAIDEN)
-    monkeypatch.setattr(module, "get_ray_weight_registry", lambda: fake_tpu_sync.registry)
+    monkeypatch.setattr(module, "get_tpu_sync_rendezvous", fake_tpu_sync.get_rendezvous)
     monkeypatch.setattr(module, "_REGISTRY_POLL_INTERVAL_S", 0.0)
     yield module
     sys.modules.pop(TPU_RAIDEN, None)
@@ -628,9 +645,7 @@ def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
 
     lookups[:] = [ValueError("Failed to look up actor")]
     assert ray_weight_registry.get_ray_weight_registry() is created
-    assert options_calls == [
-        {"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached", "scheduling_strategy": "DEFAULT"}
-    ]
+    assert options_calls == [{"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached"}]
 
     # Another process creates the actor between the lookup and the creation.
     lookups[:] = [ValueError("Failed to look up actor"), existing]
@@ -638,51 +653,58 @@ def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
     assert ray_weight_registry.get_ray_weight_registry() is existing
 
 
-def test_registry_rank_stats():
-    reg = RayWeightRegistryState()
-    reg.set_rank_stats(1, 0, {"l1_norm": 1.0})
-    reg.set_rank_stats(1, 1, {"l1_norm": 2.0})
-    assert reg.get_stats(1) == {"ranks": {0: {"l1_norm": 1.0}, 1: {"l1_norm": 2.0}}}
-    for step in range(2, 2 + reg.MAX_STATS_STEPS):
-        reg.set_rank_stats(step, 0, {})
-    assert reg.get_stats(1) is None  # pruned like set_stats
+def test_rendezvous_state():
+    state = TpuSyncRendezvousState()
+    assert (state.get_controller_address(), state.get_global_shapes(), state.get_stats(1)) == (None, {}, None)
+    state.set_controller_address("10.0.0.1:7777")
+    state.set_global_shapes({"w": [2, 3]})
+    state.set_stats(1, {"l1_norm": 1.0})
+    state.set_rank_stats(2, 0, {"l1_norm": 1.0})
+    state.set_rank_stats(2, 1, {"l1_norm": 2.0})
+    assert state.get_controller_address() == "10.0.0.1:7777" and state.get_global_shapes() == {"w": [2, 3]}
+    assert state.get_stats(1) == {"master": {"l1_norm": 1.0}}
+    assert state.get_stats(2) == {"ranks": {0: {"l1_norm": 1.0}, 1: {"l1_norm": 2.0}}}
+    for step in range(3, 3 + state.MAX_STATS_STEPS):
+        state.set_rank_stats(step, 0, {})
+    assert state.get_stats(1) is None and state.get_stats(2) is None  # only the latest steps are kept
 
 
-def test_reset_ray_weight_registry_replaces_stale_actor(monkeypatch):
-    stale, fresh = object(), object()
-    killed = []
-    create_results: list = [ValueError("Actor name is already taken"), fresh]  # the name frees up asynchronously
+def test_rendezvous_is_named_after_the_job_and_not_detached(monkeypatch):
+    """Each job gets its own actor, owned by the driver: jobs sharing a cluster never touch each other's."""
+    actors: dict = {}
+    options_calls = []
 
     def get_actor(name, namespace=None):
-        assert (name, namespace) == ("RayWeightRegistry", "verl")
-        return stale
+        assert namespace == "verl"
+        if name not in actors:
+            raise ValueError(f"Failed to look up actor {name}")
+        return actors[name]
 
     def options(**kwargs):
-        assert kwargs["scheduling_strategy"] == "DEFAULT" and kwargs["lifetime"] == "detached"
+        options_calls.append(kwargs)
 
         def remote():
-            result = create_results.pop(0)
-            if isinstance(result, Exception):
-                raise result
-            return result
+            actors[kwargs["name"]] = handle = object()
+            return handle
 
         return SimpleNamespace(remote=remote)
 
+    job = {"id": "01000000"}
     monkeypatch.setattr(ray, "get_actor", get_actor)
-    monkeypatch.setattr(ray, "kill", lambda actor, no_restart: killed.append((actor, no_restart)))
-    monkeypatch.setattr(ray_weight_registry, "RayWeightRegistry", SimpleNamespace(options=options))
-    monkeypatch.setattr(ray_weight_registry, "_RESET_POLL_S", 0.0)
+    monkeypatch.setattr(ray, "get_runtime_context", lambda: SimpleNamespace(get_job_id=lambda: job["id"]))
+    monkeypatch.setattr(tpu_sync_rendezvous, "TpuSyncRendezvous", SimpleNamespace(options=options))
 
-    assert ray_weight_registry.reset_ray_weight_registry() is fresh
-    assert killed == [(stale, True)]
+    handle, name = tpu_sync_rendezvous.create_tpu_sync_rendezvous()
+    assert name == "TpuSyncRendezvous-01000000"
+    assert options_calls == [{"name": name, "namespace": "verl", "scheduling_strategy": "DEFAULT"}]  # no lifetime
+    assert tpu_sync_rendezvous.create_tpu_sync_rendezvous() == (handle, name)  # reused within the job
+    assert tpu_sync_rendezvous.get_tpu_sync_rendezvous() is handle
+    assert tpu_sync_rendezvous.get_tpu_sync_rendezvous(name) is handle  # e.g. from vLLM's workers
 
-    # No actor left behind: nothing to kill. A name that never frees up raises after the timeout.
-    monkeypatch.setattr(ray, "get_actor", lambda name, namespace=None: (_ for _ in ()).throw(ValueError("none")))
-    monkeypatch.setattr(ray_weight_registry, "_RESET_TIMEOUT_S", 0.0)
-    create_results[:] = [ValueError("Actor name is already taken")]
-    with pytest.raises(ValueError, match="already taken"):
-        ray_weight_registry.reset_ray_weight_registry()
-    assert killed == [(stale, True)]
+    job["id"] = "02000000"  # another job on the same cluster gets its own actor
+    other, other_name = tpu_sync_rendezvous.create_tpu_sync_rendezvous()
+    assert other_name == "TpuSyncRendezvous-02000000" and other is not handle
+    assert len(options_calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +751,7 @@ def test_validate_and_sanitize_tensors():
 def test_compute_tensor_stats():
     weights = _trainer_weights()
     names = ("model.embed_tokens.weight", "model.norm.weight")
-    stats = raiden.compute_tensor_stats([(name, weights[name]) for name in names])
+    stats = parity.compute_tensor_stats([(name, weights[name]) for name in names])
     assert (stats["total_numel"], stats["num_tensors"]) == (VOCAB * HIDDEN + HIDDEN, 2)
     l1 = sum(float(weights[name].float().abs().sum()) for name in names)
     l2_sq = sum(float(weights[name].float().pow(2).sum()) for name in names)
@@ -739,7 +761,7 @@ def test_compute_tensor_stats():
     assert (embed["numel"], embed["shape"], embed["dtype"]) == (VOCAB * HIDDEN, [VOCAB, HIDDEN], "torch.bfloat16")
     assert embed["l2"] == pytest.approx(embed["l2_sq"] ** 0.5)
 
-    unnamed = raiden.compute_tensor_stats([torch.ones(2, 2)])
+    unnamed = parity.compute_tensor_stats([torch.ones(2, 2)])
     assert (unnamed["total_numel"], unnamed["l1_norm"], unnamed["per_tensor"]) == (4, 4.0, {})
 
 
@@ -759,11 +781,12 @@ def test_setup_raiden_controller_publishes_address(fake_tpu_sync):
     state = fake_tpu_sync.registry_state
     state.set_controller_address("10.9.9.9:1")  # left behind in the detached actor by a previous job
 
-    controller, server, address = raiden.setup_raiden_controller()
+    controller, server, address, rendezvous, rendezvous_name = raiden.setup_raiden_controller()
     assert address == "10.0.0.1:7777"
     assert server.controller is controller is fake_tpu_sync.controller
     assert state.get_controller_address() == address
-    assert fake_tpu_sync.registry_resets == 1  # every job starts with a fresh registry actor
+    assert rendezvous_name == "TpuSyncRendezvous-test" and fake_tpu_sync.rendezvous_creations == 1
+    assert rendezvous is fake_tpu_sync.registry
 
 
 def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatch):
@@ -771,7 +794,7 @@ def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatc
         raise ValueError("registry unavailable")
 
     broken = _FakeActorHandle(SimpleNamespace(set_controller_address=fail))
-    monkeypatch.setattr(raiden, "reset_ray_weight_registry", lambda: broken)
+    monkeypatch.setattr(raiden, "create_tpu_sync_rendezvous", lambda: (broken, "TpuSyncRendezvous-test"))
     with pytest.raises(RuntimeError, match=r"Failed to store RaidenController address \(10\.0\.0\.1:7777\)") as err:
         raiden.setup_raiden_controller()
     assert isinstance(err.value.__cause__, ValueError)
@@ -954,9 +977,9 @@ def test_merge_rank_stats_matches_full_tensor_stats():
     for rank in range(world):
         shards = _LocalShardWeights(weights, rank, world).local_shards()
         items = [(n, t) for n, t, shard in shards if shard is not None or rank == 0]
-        rank_stats[rank] = raiden.compute_tensor_stats(items)
-    merged = raiden.merge_rank_stats(rank_stats)
-    reference = raiden.compute_tensor_stats(list(weights.items()))
+        rank_stats[rank] = parity.compute_tensor_stats(items)
+    merged = parity.merge_rank_stats(rank_stats)
+    reference = parity.compute_tensor_stats(list(weights.items()))
     assert (merged["total_numel"], merged["num_tensors"]) == (reference["total_numel"], reference["num_tensors"])
     for key in ("l1_norm", "l2_norm", "l2_sq"):
         assert merged[key] == pytest.approx(reference[key], rel=1e-6)
@@ -1000,6 +1023,9 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     for rank, model in enumerate(models):
         _assert_state(model, _expected_vllm_state(weights["current"], rank, tp, lm_head_from_embed=tie_word_embeddings))
     assert server.global_steps == 0
+    # The manager holds the rendezvous handle: the actor is not detached, so Ray would destroy it otherwise.
+    assert manager._tpu_sync_rendezvous is fake_tpu_sync.registry
+    assert set(fake_tpu_sync.rendezvous_lookups) <= {None, "TpuSyncRendezvous-test"}
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
@@ -1146,7 +1172,7 @@ def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatc
     monkeypatch.setattr(raiden.asyncio, "sleep", lambda _: real_sleep(0))
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+        asyncio.run(raiden._verify_parity(manager, global_steps=1))
     assert "Incomplete stats data for step 1" in caplog.text
     assert "PARITY VERIFIED" not in caplog.text
     ranks[1] = missing
@@ -1155,7 +1181,7 @@ def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatc
     samplers[1]._raiden_staging["model.embed_tokens.weight"].zero_()
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+        asyncio.run(raiden._verify_parity(manager, global_steps=1))
     assert "RAIDEN PARITY MISMATCH | Step 1" in caplog.text
     assert "model.embed_tokens.weight" in caplog.text
 
@@ -1175,7 +1201,7 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
 
     samplers[1]._raiden_staging["model.embed_tokens.weight"].zero_()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+        asyncio.run(raiden._verify_parity(manager, global_steps=1))
     assert "RAIDEN PARITY MISMATCH | Step 1" in caplog.text
     assert "model.embed_tokens.weight" in caplog.text
 
@@ -1218,7 +1244,7 @@ def test_update_raiden_weights_syncs_several_replicas_in_one_transfer(fake_tpu_s
     samplers[1][0]._raiden_staging["model.embed_tokens.weight"].zero_()
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger=raiden.__name__):
-        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+        asyncio.run(raiden._verify_parity(manager, global_steps=1))
     assert "[RAIDEN PARITY MISMATCH | Step 1 | replica 1]" in caplog.text
     assert "replica 0" not in caplog.text
 

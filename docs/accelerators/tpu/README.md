@@ -15,11 +15,14 @@ engines that send the trainer's weights to it (`ray-plasma-store` and `tpu-sync`
 verl_hardware_plugin/accelerators/tpu/
 ├── platform_tpu.py                  # TPU platform settings
 ├── engines/
-│   ├── ray_weight_registry.py        # Ray actor where trainer and rollout exchange weight-sync metadata
+│   ├── ray_weight_registry.py        # Ray actor holding the `ray-plasma-store` weight ObjectRefs
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
 │   ├── tpu_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
 │   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout (Raiden)
+│   ├── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
+│   ├── tpu_sync_rendezvous.py        # Per-job actor: Raiden controller address, tensor shapes, parity stats
 │   ├── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
+│   ├── weight_export.py              # Exports the trainer's weights as local FSDP shards or full tensors
 │   └── weight_sync_backends.py       # Weight sync backend names and their deprecated aliases
 └── rollout/
     ├── tpu_raiden.py                 # vLLM worker extension that receives Raiden weight syncs

@@ -19,15 +19,21 @@ The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEn
 for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
-2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`: its own FSDP shard of every
-   weight that is split evenly on dim 0 (the FSDP `Shard(0)` layout), registered as its block of the full
-   tensor, and the full tensor for everything else (replicated weights, uneven cuts, FSDP x TP layouts and
-   fused expert stacks, which it all-gathers). The trainer therefore does not gather the model, and Raiden
-   reshards the blocks for the rollout. On the first sync it creates that synchronizer and registers it with
-   the Raiden controller, which the driver starts at the same time; later syncs rebind the new tensors to the
-   existing synchronizer, as long as the tensor names, shapes, dtypes and shard layout do not change. The
-   trainer also publishes the full shape of every tensor in the `RayWeightRegistry` actor, which the driver
-   re-creates at the start of every job.
+2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`
+   (`engines/weight_export.py` decides how each weight is exported):
+   - an FSDP shard (`Shard(0)` on a 1-D mesh, dim 0 divisible by the mesh size) is registered as this rank's
+     block of the full tensor; Raiden reshards the blocks of all ranks for the rollout, so no rank gathers it;
+   - a replicated weight (e.g. q/k/v_proj in torchtitan's current Qwen3 layout) is already full on every rank
+     and is registered full, without any communication;
+   - every other layout (uneven cuts, FSDP x TP or HSDP 2-D meshes, fused expert stacks) is all-gathered and
+     registered full. Each such tensor is logged at INFO, with a per-sync summary line.
+
+   On the first sync it creates that synchronizer and registers it with the Raiden controller, which the
+   driver starts at the same time; later syncs rebind the new tensors to the existing synchronizer, as long as
+   the tensor names, shapes, dtypes and shard layout do not change. The trainer also publishes the full shape
+   of every tensor in the job's `TpuSyncRendezvous` actor (`engines/tpu_sync_rendezvous.py`). The driver
+   creates that actor once per job, named after the Ray job and not detached, so jobs sharing a cluster never
+   see each other's.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
    and registers them.
 4. The controller moves the weights from the trainer chips, through the trainer hosts, to the rollout hosts.

@@ -861,7 +861,7 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
     import torch.distributed as dist
     from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
 
-    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TrainerWeights, even_dim0_shard
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights, fsdp_dim0_shard
 
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
     try:
@@ -884,9 +884,9 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
         params["lm_head.weight"] = params["model.embed_tokens.weight"]  # tied: one DTensor under two names
         stack_dt = distribute_tensor(stack, mesh, [Shard(0)])
 
-        assert even_dim0_shard(params["a.even"]) == (world, rank)
+        assert fsdp_dim0_shard(params["a.even"]) == (world, rank)
         for name in ("b.uneven", "c.cols", "d.replicated", "e.plain"):
-            assert even_dim0_shard(params[name]) is None, name
+            assert fsdp_dim0_shard(params[name]) is None, name
 
         def weights() -> TrainerWeights:
             return TrainerWeights(dict(params), [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu")
@@ -905,6 +905,15 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
                 assert torch.equal(tensor, expected), name
         # The exported block is a copy: an optimizer step after the export must not change what is sent.
         assert exported[0][1].data_ptr() != params["a.even"].to_local().data_ptr()
+
+        # Single use: the parameters are released as they are exported.
+        once = weights()
+        list(once.local_shards())
+        try:
+            list(once)
+            raise AssertionError("a second export must raise")
+        except RuntimeError as e:
+            assert "only be exported once" in str(e)
 
         gathered = list(weights())  # plain iteration: every tensor full, as verl expects
         assert [name for name, _ in gathered] == [*params, "x.0", "x.1"]

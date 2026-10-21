@@ -28,12 +28,13 @@ import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden
-from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import (
     _get_parent_module,
     _resolve_model_key,
     _to_target_layout,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_parity import compute_tensor_stats
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -123,12 +124,16 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         worker: Any = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def _wait_for_raiden_registry(self, rank_val: int) -> tuple[str, dict[str, list[int]]]:
-        """Returns the controller address and the trainer's global tensor shapes from ``RayWeightRegistry``."""
-        registry = get_ray_weight_registry()
+    def _wait_for_raiden_registry(
+        self, rank_val: int, rendezvous_name: Optional[str] = None
+    ) -> tuple[str, dict[str, list[int]]]:
+        """Returns the controller address and the trainer's global tensor shapes from the job's rendezvous actor."""
         for _ in range(_REGISTRY_POLL_ATTEMPTS):
             try:
-                addr, shapes = ray.get([registry.get_controller_address.remote(), registry.get_global_shapes.remote()])
+                rendezvous = get_tpu_sync_rendezvous(rendezvous_name)
+                addr, shapes = ray.get(
+                    [rendezvous.get_controller_address.remote(), rendezvous.get_global_shapes.remote()]
+                )
                 if addr and shapes:
                     return addr, shapes
             except Exception as e:
@@ -136,17 +141,21 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             time.sleep(_REGISTRY_POLL_INTERVAL_S)
         raise RuntimeError(
             f"Raiden Sampler Rank {rank_val}: No RaidenController address or "
-            f"global shapes found in RayWeightRegistry after timeout"
+            f"global shapes found in the tpu-sync rendezvous {rendezvous_name!r} after timeout"
         )
 
     def init_raiden_sync_on_worker(
-        self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM, job_name: str = "sampler0"
+        self,
+        parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM,
+        job_name: str = "sampler0",
+        rendezvous_name: Optional[str] = None,
     ) -> bool:
         """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
 
         ``job_name`` is the Raiden job this worker's replica registers under (the driver names every rollout
         replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
-        the controller. Only the first call does work: the receive buffers, the synchronizer and the
+        the controller. ``rendezvous_name`` is the job's ``TpuSyncRendezvous`` actor, which the driver names.
+        Only the first call does work: the receive buffers, the synchronizer and the
         registration are reused by every later sync.
         """
         if getattr(self, "_raiden_ws", None) is not None:
@@ -165,8 +174,8 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
         listener_port = 0
 
-        # 1. Fetch RaidenController address and un-fused global shapes from RayWeightRegistry
-        controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val)
+        # 1. Fetch RaidenController address and un-fused global shapes from the job's rendezvous
+        controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val, rendezvous_name)
 
         # 2. Determine tensor parallel size from vLLM V1 config
         worker: Any = getattr(self, "worker", self)
@@ -366,7 +375,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
                 f"but self._sorted_vllm_params is not initialized on worker rank {getattr(self, 'rank', 'unknown')}!"
             )
 
-        res = raiden.compute_tensor_stats(self._sorted_vllm_params)
+        res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = getattr(self, "rank", 0)
         # How many TP ranks hold each tensor's slice, so the parity check counts every slice once.
         res["replicas"] = dict(getattr(self, "_raiden_replicas", None) or {})

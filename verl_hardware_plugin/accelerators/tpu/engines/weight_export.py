@@ -1,0 +1,176 @@
+# Copyright (c) 2026 Google LLC. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+
+"""Exporting the trainer's weights for the weight sync, with or without gathering the FSDP shards.
+
+``TorchTitanTPUEngine.get_per_tensor_param`` returns a ``TrainerWeights``. Iterating it yields full tensors (every
+sharded DTensor all-gathered), which is what verl and the ``ray-plasma-store`` engine expect. The ``tpu-sync`` engine
+calls ``TrainerWeights.local_shards()`` instead, which keeps each parameter that Raiden can place from its local
+block (``fsdp_dim0_shard``) on this rank and returns every other parameter full. See ``fsdp_dim0_shard`` for which
+layouts are exported locally and which are gathered.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections import Counter
+from typing import Any, Iterator, Optional
+
+import torch
+from torch.distributed.tensor import DTensor, Shard
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
+    """``(num_shards, shard_index)`` if this rank holds one of ``num_shards`` equal-size dim-0 blocks of ``param``.
+
+    A receiver that knows the full shape places the local block from these two numbers alone (block
+    ``shard_index`` of ``num_shards``), which is all Raiden needs to reshard it for the rollout. Layouts:
+
+    * **FSDP** (``Shard(0)`` on a 1-D mesh) with dim 0 divisible by the mesh size: a block, exported locally.
+    * **FSDP + CP**: torchtitan shards parameters over the flattened ``dp_shard`` x ``cp`` mesh dimension (CP splits
+      activations, not parameters), so the parameters are again ``Shard(0)`` on a 1-D mesh: exported locally.
+    * **Replicated** (``Replicate()`` placements, or a plain tensor): ``None``. Every rank already holds the full
+      tensor, so it is exported full without any communication (e.g. q/k/v_proj in torchtitan's current Qwen3
+      layout).
+    * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
+      the equal-block layout Raiden assumes.
+    * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
+      blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once Raiden is confirmed to describe them.
+    * **EP**: fused expert stacks never reach this function; ``TrainerWeights`` gathers them and splits them into
+      one HF tensor per expert. TODO: export expert blocks locally.
+
+    Every tensor that ends up gathered is logged by ``TrainerWeights.local_shards()``.
+    """
+    if not isinstance(param, DTensor):
+        return None
+    mesh = param.device_mesh
+    if mesh.ndim != 1 or len(param.placements) != 1:
+        return None
+    placement = param.placements[0]
+    # type() rather than isinstance(): _StridedShard subclasses Shard but permutes which block a rank holds.
+    if type(placement) is not Shard or placement.dim != 0:
+        return None
+    num_shards = mesh.size(0)
+    full_rows = int(param.shape[0])
+    if num_shards <= 1 or full_rows % num_shards:
+        return None
+    if int(param.to_local().shape[0]) != full_rows // num_shards:
+        return None
+    coordinate = mesh.get_coordinate()
+    if coordinate is None:
+        return None
+    return num_shards, int(coordinate[0])
+
+
+def _is_replicated(param: Any) -> bool:
+    """True if every rank already holds the whole of ``param``, so exporting it full needs no communication."""
+    return not isinstance(param, DTensor) or all(p.is_replicate() for p in param.placements)
+
+
+def _bf16_on(tensor: torch.Tensor, device: Any) -> torch.Tensor:
+    """A bf16 copy of ``tensor`` on ``device`` that never aliases the trainer's parameter storage."""
+    out = tensor.to(device, dtype=torch.bfloat16, non_blocking=True)
+    if out is tensor:
+        # Already bf16 on the device: .to() returned the parameter itself. The receiver reads the exported tensor
+        # after the export returns, so it must not change under a later optimizer step.
+        out = out.clone()
+    return out
+
+
+class TrainerWeights:
+    """HF-named weights returned by ``TorchTitanTPUEngine.get_per_tensor_param``, exported lazily and only once.
+
+    Iterating yields ``(hf_name, full_tensor)`` pairs: every sharded DTensor is all-gathered, as verl expects from
+    ``get_per_tensor_param``. ``local_shards()`` yields ``(hf_name, tensor, shard)`` instead, where ``tensor`` is this
+    rank's local block and ``shard`` its ``(num_shards, shard_index)`` for parameters that ``fsdp_dim0_shard``
+    recognizes, and the full tensor with ``shard=None`` for every other parameter. Both paths run the same
+    collectives in the same order on every rank. A second export raises: the parameters are released as they go.
+    """
+
+    def __init__(
+        self,
+        dense: dict[str, Any],
+        expert_stacks: list[tuple[Any, list[tuple[str, tuple]]]],
+        device: Any,
+    ) -> None:
+        self._dense = dense
+        self._expert_stacks = expert_stacks
+        self._device = device
+        self._iter: Optional[Iterator[tuple[str, torch.Tensor]]] = None
+        self._exported = False
+
+    def __iter__(self) -> TrainerWeights:
+        return self
+
+    def __next__(self) -> tuple[str, torch.Tensor]:
+        if self._iter is None:
+            self._iter = ((name, tensor) for name, tensor, _ in self._export(local=False))
+        return next(self._iter)
+
+    def local_shards(self) -> Iterator[tuple[str, torch.Tensor, Optional[tuple[int, int]]]]:
+        """Yields ``(hf_name, tensor, shard)``; see the class docstring."""
+        return self._export(local=True)
+
+    def _export(self, local: bool) -> Iterator[tuple[str, torch.Tensor, Optional[tuple[int, int]]]]:
+        if self._exported:
+            raise RuntimeError("TrainerWeights can only be exported once; call get_per_tensor_param() again")
+        self._exported = True
+        device = self._device
+        # A parameter reachable under several names (tied input embedding and LM head) is exported once.
+        exported: dict[int, tuple[torch.Tensor, Optional[tuple[int, int]]]] = {}
+        names_per_param = Counter(id(p) for p in self._dense.values())
+        counts = {"local": 0, "replicated": 0, "gathered": 0}
+        for name in list(self._dense.keys()):
+            param = self._dense.pop(name)
+            pid = id(param)
+            if pid in exported:
+                tensor, shard = exported[pid]
+            elif isinstance(param, DTensor):
+                shard = fsdp_dim0_shard(param) if local else None
+                if shard is not None:
+                    tensor = _bf16_on(param.to_local(), device)
+                    counts["local"] += 1
+                else:
+                    if local:
+                        kind = "replicated" if _is_replicated(param) else "gathered"
+                        counts[kind] += 1
+                        if kind == "gathered":
+                            logger.info(
+                                f"{name}: all-gathered for the weight sync (mesh ndim={param.device_mesh.ndim}, "
+                                f"placements={param.placements}, shape={tuple(param.shape)}, "
+                                f"local={tuple(param.to_local().shape)})"
+                            )
+                    tensor = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                if names_per_param[pid] > 1:
+                    exported[pid] = (tensor, shard)
+            else:
+                tensor, shard = param.to(torch.bfloat16, non_blocking=True), None
+                if local:
+                    counts["replicated"] += 1
+            yield name, tensor, shard
+            del tensor, param
+        exported.clear()
+        # Fused expert stacks are always gathered, then split into one HF tensor per expert.
+        while self._expert_stacks:
+            stack, slots = self._expert_stacks.pop(0)
+            if local and isinstance(stack, DTensor) and not _is_replicated(stack):
+                counts["gathered"] += 1
+                logger.info(
+                    f"Expert stack of {len(slots)} experts ({slots[0][0]}, ...): all-gathered for the weight sync"
+                )
+            full = stack.to(device, non_blocking=True)
+            if isinstance(full, DTensor):
+                full = full.full_tensor()
+            full = full.to(torch.bfloat16, non_blocking=True)
+            for e, (hf_name, _shape) in enumerate(slots):
+                yield hf_name, full[e].clone(), None
+            del full
+        if local:
+            logger.info(
+                f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (no "
+                f"communication), {counts['gathered']} all-gathered"
+            )

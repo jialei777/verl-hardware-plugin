@@ -1131,19 +1131,16 @@ class TestVtuneProfilerRegistration:
 
 
 class TestReduceAvgAllReducePatchTPU:
-    """torch.distributed.all_reduce passthrough (AVG is native on tpu_dist), Gloo-only group staging, and
-    all_gather_object Gloo routing, scoped to tpu_dist process groups.
+    """torch.distributed.all_reduce: passthrough on tpu_dist (AVG is native since torch-tpu 0.2.0) and CPU
+    staging of TPU tensors on Gloo-only groups. all_gather_object is no longer patched.
     """
 
     @pytest.fixture(autouse=True)
     def _reset_patch_state(self):
         original_all_reduce = dist.all_reduce
-        original_all_gather_object = getattr(dist, "all_gather_object", None)
         tpu_patch_mod._applied = False
         yield
         dist.all_reduce = original_all_reduce
-        if original_all_gather_object is not None:
-            dist.all_gather_object = original_all_gather_object
         tpu_patch_mod._applied = False
 
     def test_noop_when_tpu_unavailable(self):
@@ -1205,23 +1202,12 @@ class TestReduceAvgAllReducePatchTPU:
 
         fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="cpu_group", async_op=False)
 
-    def test_all_gather_object_routes_full_world_tpu_dist_group_to_default_gloo(self):
-        fake_all_gather_obj = mock.MagicMock()
+    def test_all_gather_object_is_not_patched(self):
+        before = dist.all_gather_object
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
-            with mock.patch.object(dist, "all_gather_object", fake_all_gather_obj):
-                tpu_patch_mod.apply()
-                out = [None, None]
-                with (
-                    mock.patch.object(
-                        dist,
-                        "get_backend",
-                        side_effect=lambda g=None: "tpu_dist" if g == "dp_group" else "cpu:gloo,tpu:tpu_dist",
-                    ),
-                    mock.patch.object(dist, "get_world_size", return_value=2),
-                ):
-                    dist.all_gather_object(out, {"lr": 1e-4}, group="dp_group")
+            tpu_patch_mod.apply()
 
-        fake_all_gather_obj.assert_called_once_with(out, {"lr": 1e-4}, group=None)
+        assert dist.all_gather_object is before
 
     def test_idempotent(self):
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
@@ -1255,8 +1241,6 @@ class TestReduceAvgAllReducePatchTPU:
                 tensor.mul_(4.0)
 
         def _fake_all_gather_object(object_list, obj, group=None):
-            if group == "dp_group":
-                raise RuntimeError("tpu_dist group does not support all_gather_object")
             for idx in range(len(object_list)):
                 object_list[idx] = dict(obj)
 
@@ -1310,7 +1294,7 @@ class TestReduceAvgAllReducePatchTPU:
         assert raw_all_reduce.call_count == 2
         assert raw_all_reduce.call_args_list[0].kwargs["op"] == dist.ReduceOp.AVG
         assert raw_all_gather_obj.call_count == 2
-        assert raw_all_gather_obj.call_args_list[0].kwargs["group"] is None
+        assert raw_all_gather_obj.call_args_list[0].kwargs["group"] == "dp_group"
         assert res["metrics"]["loss"] == pytest.approx(4.0)
         assert res["metrics"]["custom_metric"] == [0.5, 0.5, 0.5, 0.5]
         assert val_res["metrics"]["loss"] == pytest.approx(3.0)

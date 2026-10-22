@@ -16,12 +16,9 @@ from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_p
 @pytest.fixture(autouse=True)
 def _reset_patch_state():
     original_all_reduce = dist.all_reduce
-    original_all_gather_object = getattr(dist, "all_gather_object", None)
     tpu_patch_mod._applied = False
     yield
     dist.all_reduce = original_all_reduce
-    if original_all_gather_object is not None:
-        dist.all_gather_object = original_all_gather_object
     tpu_patch_mod._applied = False
 
 

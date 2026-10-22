@@ -34,8 +34,8 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     * **FSDP + CP**: torchtitan shards parameters over the flattened ``dp_shard`` x ``cp`` mesh dimension (CP splits
       activations, not parameters), so the parameters are again ``Shard(0)`` on a 1-D mesh: exported locally.
     * **Replicated** (``Replicate()`` placements, or a plain tensor): ``None``. Every rank already holds the full
-      tensor, so it is exported full without any communication (e.g. q/k/v_proj in torchtitan's current Qwen3
-      layout).
+      tensor, so it is exported full without any communication (e.g. ``FusedQKVLinear`` weights when ``n_kv_heads``
+      is not divisible by the FSDP shard degree).
     * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
       the equal-block layout Raiden assumes.
     * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D

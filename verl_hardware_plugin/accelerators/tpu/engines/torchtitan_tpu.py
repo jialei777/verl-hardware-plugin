@@ -83,10 +83,84 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     tpu_synchronize,
     unwrap_metadata,
 )
-from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights, fsdp_dim0_shard
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _install_local_split_qkv_on_save() -> None:
+    """Patch ``FusedQKVLinear._split_qkv_on_save`` to split 1-D ``Shard(0)`` ``wqkv`` locally without an all-gather.
+
+    In TorchTitan's ``FusedQKVLinear``, ``wqkv`` packs ``n_kv_heads`` groups of ``(R + 2)`` heads of size
+    ``head_dim`` along dimension 0: ``(n_kv_heads * (R + 2) * head_dim, dim)``. When ``wqkv`` is FSDP-sharded on
+    dimension 0 across ``num_shards`` ranks and ``n_kv_heads % num_shards == 0``, each rank holds
+    ``n_kv_heads // num_shards`` complete ``(Q_group, K_head, V_head)`` head-groups. Splitting ``tensor.to_local()``
+    into ``wq``, ``wk``, and ``wv`` local slices and wrapping each as a ``Shard(0)`` ``DTensor`` produces the exact
+    same ``wq``, ``wk``, ``wv`` ``Shard(0)`` ``DTensor``s as ``QKVLinear``, avoiding the ``redistribute([Replicate()])``
+    all-gather in ``state_dict()`` and allowing ``TrainerWeights.local_shards()`` to export local shards.
+    """
+    from torchtitan.models.common.attention import FusedQKVLinear
+
+    orig_fn = getattr(FusedQKVLinear, "_split_qkv_on_save", None)
+    if orig_fn is None or getattr(orig_fn, "_verl_local_split_patched", False):
+        return
+
+    def _local_split_qkv_on_save(module, state_dict, prefix, local_metadata) -> None:
+        wqkv_key = f"{prefix}wqkv.weight"
+        if wqkv_key not in state_dict:
+            return orig_fn(module, state_dict, prefix, local_metadata)
+
+        hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
+
+        for suffix in ("weight", "bias"):
+            fused_key = f"{prefix}wqkv.{suffix}"
+            if fused_key not in state_dict:
+                continue
+            tensor = state_dict[fused_key]
+            shard = fsdp_dim0_shard(tensor)
+            n_kv = int(tensor.shape[0]) // (r * hd)
+            if shard is not None and n_kv % shard[0] == 0:
+                del state_dict[fused_key]
+                num_shards, _ = shard
+                local_n_kv = n_kv // num_shards
+                loc = tensor.to_local()
+                tail = loc.shape[1:]
+                grouped = loc.reshape(local_n_kv, r, hd, *tail)
+                wq_loc = grouped[:, :hpk].reshape(local_n_kv * hpk * hd, *tail).contiguous()
+                wk_loc = grouped[:, hpk].reshape(local_n_kv * hd, *tail).contiguous()
+                wv_loc = grouped[:, hpk + 1].reshape(local_n_kv * hd, *tail).contiguous()
+                mesh = tensor.device_mesh
+                placements = tensor.placements
+                state_dict[f"{prefix}wq.{suffix}"] = DTensor.from_local(
+                    wq_loc,
+                    mesh,
+                    placements,
+                    run_check=False,
+                    shape=torch.Size((n_kv * hpk * hd, *tail)),
+                    stride=wq_loc.stride(),
+                )
+                state_dict[f"{prefix}wk.{suffix}"] = DTensor.from_local(
+                    wk_loc,
+                    mesh,
+                    placements,
+                    run_check=False,
+                    shape=torch.Size((n_kv * hd, *tail)),
+                    stride=wk_loc.stride(),
+                )
+                state_dict[f"{prefix}wv.{suffix}"] = DTensor.from_local(
+                    wv_loc,
+                    mesh,
+                    placements,
+                    run_check=False,
+                    shape=torch.Size((n_kv * hd, *tail)),
+                    stride=wv_loc.stride(),
+                )
+            else:
+                return orig_fn(module, state_dict, prefix, local_metadata)
+
+    _local_split_qkv_on_save._verl_local_split_patched = True  # type: ignore[attr-defined]
+    FusedQKVLinear._split_qkv_on_save = staticmethod(_local_split_qkv_on_save)
 
 
 def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
@@ -202,6 +276,7 @@ class TorchTitanTPUEngine(BaseEngine):
             attn_backend=self.engine_config.attn_type,
             seq_len=self.engine_config.max_seq_len,
         )
+        _install_local_split_qkv_on_save()
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
@@ -773,9 +848,9 @@ class TorchTitanTPUEngine(BaseEngine):
         dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
         params.clear()
 
-        # torchtitan's current Qwen3 layout keeps q/k/v_proj replicated (Replicate() placements) rather than FSDP
-        # sharded, so every rank exports them full, without communication; see weight_export.fsdp_dim0_shard.
-        # TODO(tpu): once they are FSDP sharded, they are exported as local shards like the other weights.
+        # _install_local_split_qkv_on_save splits 1-D Shard(0) FusedQKVLinear weights locally when n_kv_heads is
+        # divisible by num_shards, so q/k/v_proj are exported as local shards like the other FSDP weights; see
+        # weight_export.fsdp_dim0_shard.
         return TrainerWeights(dense, expert_stacks, get_device_id()), None
 
 

@@ -929,3 +929,89 @@ def test_trainer_weights_exports_local_fsdp_shards_or_gathers(tmp_path):
     torch.multiprocessing.start_processes(
         _trainer_weights_worker, args=(2, str(tmp_path / "pg")), nprocs=2, join=True, start_method="fork"
     )
+
+
+def _local_split_qkv_worker(rank: int, world: int, init_file: str) -> None:
+    """One trainer rank of ``test_local_split_qkv_on_save_preserves_fsdp_shard0``."""
+    import torch.distributed as dist
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _install_local_split_qkv_on_save
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import fsdp_dim0_shard
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+        gen = torch.Generator().manual_seed(42)
+
+        orig_calls = []
+
+        class _FakeFusedQKVLinear:
+            @staticmethod
+            def _split_qkv_on_save(module, state_dict, prefix, local_metadata):
+                orig_calls.append(prefix)
+                hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
+                for suffix in ("weight", "bias"):
+                    key = f"{prefix}wqkv.{suffix}"
+                    if key not in state_dict:
+                        continue
+                    t = state_dict.pop(key)
+                    if isinstance(t, torch.distributed.tensor.DTensor):
+                        t = t.redistribute(placements=[Replicate()] * t.device_mesh.ndim)
+                    n_kv = int(t.shape[0]) // (r * hd)
+                    tail = t.shape[1:]
+                    grouped = t.reshape(n_kv, r, hd, *tail)
+                    state_dict[f"{prefix}wq.{suffix}"] = grouped[:, :hpk].reshape(n_kv * hpk * hd, *tail).contiguous()
+                    state_dict[f"{prefix}wk.{suffix}"] = grouped[:, hpk].reshape(n_kv * hd, *tail).contiguous()
+                    state_dict[f"{prefix}wv.{suffix}"] = grouped[:, hpk + 1].reshape(n_kv * hd, *tail).contiguous()
+
+        fake_attn = types.ModuleType("torchtitan.models.common.attention")
+        fake_attn.FusedQKVLinear = _FakeFusedQKVLinear  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"torchtitan.models.common.attention": fake_attn}):
+            _install_local_split_qkv_on_save()
+            # Idempotent second call
+            _install_local_split_qkv_on_save()
+
+        # Case 1: n_kv_heads=4 divisible by world=2, heads_per_kv=2, r_dim=4, head_dim=8, dim=16
+        mod_even = SimpleNamespace(head_dim=8, heads_per_kv=2, r_dim=4)
+        full_w = torch.randn(4 * 4 * 8, 16, generator=gen)
+        full_b = torch.randn(4 * 4 * 8, generator=gen)
+        sd_loc = {
+            "layers.0.attention.qkv_linear.wqkv.weight": distribute_tensor(full_w, mesh, [Shard(0)]),
+            "layers.0.attention.qkv_linear.wqkv.bias": distribute_tensor(full_b, mesh, [Shard(0)]),
+        }
+        _FakeFusedQKVLinear._split_qkv_on_save(mod_even, sd_loc, "layers.0.attention.qkv_linear.", {})
+        assert orig_calls == []
+        # Compare with reference unsharded split
+        orig_calls.clear()
+        sd_ref_unsharded = {
+            "layers.0.attention.qkv_linear.wqkv.weight": full_w.clone(),
+            "layers.0.attention.qkv_linear.wqkv.bias": full_b.clone(),
+        }
+        _FakeFusedQKVLinear._split_qkv_on_save(mod_even, sd_ref_unsharded, "layers.0.attention.qkv_linear.", {})
+        assert orig_calls == ["layers.0.attention.qkv_linear."]
+
+        for proj in ("wq", "wk", "wv"):
+            for suffix in ("weight", "bias"):
+                k = f"layers.0.attention.qkv_linear.{proj}.{suffix}"
+                dt = sd_loc[k]
+                assert fsdp_dim0_shard(dt) == (world, rank), k
+                assert torch.equal(dt.full_tensor(), sd_ref_unsharded[k]), k
+
+        # Case 2: n_kv_heads=3 not divisible by world=2 -> falls back to orig_fn
+        orig_calls.clear()
+        mod_odd = SimpleNamespace(head_dim=8, heads_per_kv=2, r_dim=4)
+        full_w_odd = torch.randn(3 * 4 * 8, 16, generator=gen)
+        sd_odd = {"layers.1.attention.qkv_linear.wqkv.weight": distribute_tensor(full_w_odd, mesh, [Shard(0)])}
+        _FakeFusedQKVLinear._split_qkv_on_save(mod_odd, sd_odd, "layers.1.attention.qkv_linear.", {})
+        assert orig_calls == ["layers.1.attention.qkv_linear."]
+        assert fsdp_dim0_shard(sd_odd["layers.1.attention.qkv_linear.wq.weight"]) is None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_local_split_qkv_on_save_preserves_fsdp_shard0(tmp_path):
+    """``_install_local_split_qkv_on_save`` splits 1-D ``Shard(0)`` ``wqkv`` locally without an all-gather."""
+    torch.multiprocessing.start_processes(
+        _local_split_qkv_worker, args=(2, str(tmp_path / "pg_qkv")), nprocs=2, join=True, start_method="fork"
+    )

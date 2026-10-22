@@ -960,7 +960,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
     def _maybe_gather_context_parallel(self, tensor: torch.Tensor, output_args: dict) -> torch.Tensor:
         """Under CP, gather this rank's token shard into the full bucket-padded sequence (original token order)."""
-        if not getattr(self.parallel_dims, "cp_enabled", False):
+        if not self.parallel_dims.cp_enabled:
             return tensor
         return self._gather_context_parallel(tensor, output_args["padded_seq_len"])
 
@@ -1059,7 +1059,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         else:
             if isinstance(logits, DTensor):
                 logits = logits.full_tensor()
-            if getattr(self.parallel_dims, "cp_enabled", False):
+            if self.parallel_dims.cp_enabled:
                 logits = self._maybe_gather_context_parallel(
                     logits.squeeze(0) if logits.dim() > 2 else logits, output_args
                 )

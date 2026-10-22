@@ -921,7 +921,7 @@ def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pa
     fused_values = torch.full((total,), -0.25)
 
     engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
-    engine.parallel_dims = SimpleNamespace(tp_enabled=False)
+    engine.parallel_dims = SimpleNamespace(tp_enabled=False, cp_enabled=False)
     engine.engine_config = SimpleNamespace(entropy_checkpointing=False, entropy_from_logits_with_chunking=False)
     engine.compute_entropy_from_logits = verl_F.entropy_from_logits
 

@@ -954,8 +954,9 @@ def install_tpu_attention(modules: Any, use_splash: bool) -> int:
 
     CP inner attentions (``set_local_attention``) keep their communication and take the TPU attention as their
     local attention, as in torchtitan's ``use_splash_attention_patch``; KV all-gather CP without splash keeps its
-    own ``local_forward``. Must run before the first forward: per-block ``torch.compile`` traces lazily, so the
-    swapped module is what gets compiled. Returns the number of replaced modules.
+    own ``local_forward`` (torchtitan warns when that reference attention runs off CPU). Must run before the first
+    forward: per-block ``torch.compile`` traces lazily, so the swapped module is what gets compiled. Returns the
+    number of replaced modules.
     """
     model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
     tpu_attention_types = (TPUVarlenAttention, _splash_attention_cls())

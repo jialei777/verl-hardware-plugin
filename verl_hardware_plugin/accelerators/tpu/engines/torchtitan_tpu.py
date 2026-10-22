@@ -77,6 +77,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
+    resolve_tpu_fuse_qkv,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
     tpu_eager_mode_context,
@@ -188,6 +189,7 @@ class TorchTitanTPUEngine(BaseEngine):
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
         self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
+        self._fuse_qkv = resolve_tpu_fuse_qkv(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
@@ -201,6 +203,9 @@ class TorchTitanTPUEngine(BaseEngine):
             torchtitan_flavor,
             attn_backend=self.engine_config.attn_type,
             seq_len=self.engine_config.max_seq_len,
+            # Only pass ``fuse_qkv`` when disabled so the default path also works with TorchTitan builds that
+            # predate the option (google-pytorch/torchtitan#56).
+            **({} if self._fuse_qkv else {"fuse_qkv": False}),
         )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(

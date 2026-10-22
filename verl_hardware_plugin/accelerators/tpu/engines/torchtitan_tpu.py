@@ -201,6 +201,7 @@ class TorchTitanTPUEngine(BaseEngine):
             torchtitan_flavor,
             attn_backend=self.engine_config.attn_type,
             seq_len=self.engine_config.max_seq_len,
+            **({} if self.engine_config.fuse_qkv else {"fuse_qkv": False}),
         )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(

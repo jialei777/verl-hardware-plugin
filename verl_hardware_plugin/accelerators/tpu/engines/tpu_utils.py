@@ -192,6 +192,7 @@ def extend_torchtitan_engine_config() -> None:
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
         ("use_fused_linear_cross_entropy", Optional[bool], None),
+        ("fuse_qkv", Optional[bool], None),
         ("tpu_eager_mode", Optional[str], None),
         ("pad_to_length", bool, False),
         ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),
@@ -290,6 +291,16 @@ def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
         getattr(engine_config, "use_fused_linear_cross_entropy", None),
         bool(getattr(engine_config, "use_torch_compile", False)),
     )
+
+
+def resolve_tpu_fuse_qkv(engine_config: Any) -> bool:
+    """Resolve whether TorchTitan builds a fused ``wqkv`` projection (``FusedQKVLinear``) or separate ``wq/wk/wv``.
+
+    Defaults to ``True`` (TorchTitan's default). Set ``VERL_TPU_FUSE_QKV=0`` or ``engine.fuse_qkv=False`` to use
+    ``QKVLinear``, which avoids the fused-QKV relayout copies in training and the full-tensor FSDP all-gather in
+    ``FusedQKVLinear._split_qkv_on_save`` during weight sync.
+    """
+    return _resolve_option("VERL_TPU_FUSE_QKV", getattr(engine_config, "fuse_qkv", None), True)
 
 
 _PARALLEL_DIMS_CACHE: dict[tuple[Any, ...], Any] = {}

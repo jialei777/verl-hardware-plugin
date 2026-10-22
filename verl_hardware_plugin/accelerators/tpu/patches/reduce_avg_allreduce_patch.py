@@ -4,11 +4,9 @@
 """Monkeypatches for Google TPU (``tpu_dist``) distributed collectives and runtime helpers.
 
 Why this is needed:
-1. ``torch_tpu``'s ``ProcessGroupTPU`` (``tpu_dist``) implements ``ReduceOp.SUM``,
-   ``ReduceOp.MAX``, ``ReduceOp.MIN``, and ``ReduceOp.PRODUCT``, but does not
-   implement ``ReduceOp.AVG``. Call sites in verl-core (``verl/workers/engine_workers.py``,
-   ``verl/trainer/sft_trainer.py``, and ``verl/utils/profiler/performance.py::reduce_timing``)
-   call ``torch.distributed.all_reduce(x, op=ReduceOp.AVG, ...)`` directly.
+1. A TPU tensor can reach a process group that only has a ``cpu:gloo`` backend. ``all_reduce`` then
+   stages it through CPU; Gloo has no ``ReduceOp.AVG``, so AVG becomes SUM + divide on that path.
+   (``ReduceOp.AVG`` on ``tpu_dist`` itself is native since torch-tpu 0.2.0 and passes through.)
 2. Subgroups created by ``init_device_mesh("tpu", ...)`` register only the ``tpu`` device
    (``tpu_dist``), not ``cpu:gloo``. Calling ``torch.distributed.all_gather_object(..., group=dp_group)``
    (via ``allgather_dict_into_dict`` in ``TrainingWorker._postprocess_output``) routes object
@@ -49,16 +47,6 @@ def _tpu_available() -> bool:
     from verl_hardware_plugin.accelerators.tpu import device_api
 
     return device_api.is_available()
-
-
-def _is_tpu_all_reduce(tensor: Any, group: Any) -> bool:
-    backend = str(dist.get_backend(group))
-    if backend == "tpu_dist":
-        return True
-    if "tpu:tpu_dist" in backend:
-        device = getattr(tensor, "device", None)
-        return getattr(device, "type", None) == "tpu"
-    return False
 
 
 def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
@@ -158,13 +146,8 @@ def apply() -> None:
             return result
         if op is None:
             return original_all_reduce(tensor, group=group, async_op=async_op)
-        if op != dist.ReduceOp.AVG or async_op or not _is_tpu_all_reduce(tensor, group):
-            return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
-
-        world_size = dist.get_world_size(group=group)
-        result = original_all_reduce(tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
-        tensor.div_(world_size)
-        return result
+        # torch-tpu >= 0.2.0 implements ReduceOp.AVG on tpu_dist natively (SUM + divide inside the HLO).
+        return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
     dist.all_reduce = _patched_all_reduce
 
@@ -207,5 +190,5 @@ def apply() -> None:
 
     _applied = True
     logger.info(
-        "[verl_hardware_plugin] Patched torch.distributed.all_reduce(op=AVG) and all_gather_object for tpu_dist"
+        "[verl_hardware_plugin] Patched torch.distributed.all_reduce (gloo groups) and all_gather_object for tpu_dist"
     )

@@ -1131,7 +1131,7 @@ class TestVtuneProfilerRegistration:
 
 
 class TestReduceAvgAllReducePatchTPU:
-    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide and
+    """torch.distributed.all_reduce passthrough (AVG is native on tpu_dist), Gloo-only group staging, and
     all_gather_object Gloo routing, scoped to tpu_dist process groups.
     """
 
@@ -1153,7 +1153,8 @@ class TestReduceAvgAllReducePatchTPU:
 
         assert dist.all_reduce is before
 
-    def test_avg_becomes_sum_plus_divide_on_tpu_dist(self):
+    def test_avg_passes_through_natively_on_tpu_dist(self):
+        """torch-tpu >= 0.2.0 implements ReduceOp.AVG on tpu_dist, so the patch no longer rewrites it."""
         fake_original = mock.MagicMock()
         tensor = torch.tensor([8.0])
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
@@ -1163,13 +1164,12 @@ class TestReduceAvgAllReducePatchTPU:
                 assert patched is not fake_original
 
                 with mock.patch.object(dist, "get_backend", return_value="tpu_dist"):
-                    with mock.patch.object(dist, "get_world_size", return_value=4):
-                        patched(tensor, op=dist.ReduceOp.AVG, group="dp_group")
+                    patched(tensor, op=dist.ReduceOp.AVG, group="dp_group")
 
-        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group="dp_group", async_op=False)
-        assert tensor.item() == 2.0
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="dp_group", async_op=False)
+        assert tensor.item() == 8.0
 
-    def test_avg_becomes_sum_plus_divide_on_composite_backend_with_tpu_tensor(self):
+    def test_avg_passes_through_on_composite_backend_with_tpu_tensor(self):
         fake_original = mock.MagicMock()
         fake_tpu_tensor = mock.MagicMock()
         fake_tpu_tensor.device = SimpleNamespace(type="tpu")
@@ -1177,11 +1177,10 @@ class TestReduceAvgAllReducePatchTPU:
             with mock.patch.object(dist, "all_reduce", fake_original):
                 tpu_patch_mod.apply()
                 with mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"):
-                    with mock.patch.object(dist, "get_world_size", return_value=8):
-                        dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG)
 
-        fake_original.assert_called_once_with(fake_tpu_tensor, op=dist.ReduceOp.SUM, group=None, async_op=False)
-        fake_tpu_tensor.div_.assert_called_once_with(8)
+        fake_original.assert_called_once_with(fake_tpu_tensor, op=dist.ReduceOp.AVG, group=None, async_op=False)
+        fake_tpu_tensor.div_.assert_not_called()
 
     def test_composite_backend_with_cpu_tensor_passes_through(self):
         fake_original = mock.MagicMock()
@@ -1251,9 +1250,9 @@ class TestReduceAvgAllReducePatchTPU:
 
     def test_training_worker_postprocess_output_uses_tpu_patches(self):
         def _fake_tpu_dist_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-            if op == dist.ReduceOp.AVG:
-                raise RuntimeError("tpu_dist does not support ReduceOp.AVG")
-            tensor.mul_(4.0)
+            # Native tpu_dist semantics over 4 ranks holding the same value: SUM multiplies, AVG keeps it.
+            if op == dist.ReduceOp.SUM:
+                tensor.mul_(4.0)
 
         def _fake_all_gather_object(object_list, obj, group=None):
             if group == "dp_group":
@@ -1309,7 +1308,7 @@ class TestReduceAvgAllReducePatchTPU:
                 )
 
         assert raw_all_reduce.call_count == 2
-        assert raw_all_reduce.call_args_list[0].kwargs["op"] == dist.ReduceOp.SUM
+        assert raw_all_reduce.call_args_list[0].kwargs["op"] == dist.ReduceOp.AVG
         assert raw_all_gather_obj.call_count == 2
         assert raw_all_gather_obj.call_args_list[0].kwargs["group"] is None
         assert res["metrics"]["loss"] == pytest.approx(4.0)

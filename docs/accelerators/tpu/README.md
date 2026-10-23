@@ -6,28 +6,34 @@ This document describes Google TPU support in `verl-hardware-plugin`.
 
 The plugin registers the TPU platform (`PlatformTPU`: device metadata, Ray resource configuration,
 and the PJRT worker environment), the TorchTitan TPU training engine (`TorchTitanTPUEngineWithLMHead`
-under `verl_hardware_plugin/accelerators/tpu/engines/torchtitan_tpu.py`), a vLLM rollout for TPU, and two checkpoint
+under `verl_hardware_plugin/accelerators/tpu/trainer/torchtitan_tpu.py`), a vLLM rollout for TPU, and two checkpoint
 engines that send the trainer's weights to it (`ray-plasma-store` and `tpu-sync`).
 
 ## Directory Structure
 
 ```text
 verl_hardware_plugin/accelerators/tpu/
-├── platform_tpu.py                  # TPU platform settings
-├── engines/
-│   ├── ray_weight_registry.py        # Ray actor holding the `ray-plasma-store` weight ObjectRefs
-│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
-│   ├── tpu_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
-│   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout (Raiden)
-│   ├── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
-│   ├── tpu_sync_rendezvous.py        # Per-job actor: Raiden controller address, tensor shapes, parity stats
+├── __init__.py                       # Registers the TPU platform
+├── registration.py                   # Registers the trainer, the weight sync engines and the rollout hook
+├── platform_tpu.py                   # PlatformTPU: device queries, Ray resources, PJRT mesh environment
+├── device_api.py                     # torch.accelerator / torch.tpu device functions
+├── patches/
+│   └── reduce_avg_allreduce_patch.py # all_reduce workaround for TPU tensors on Gloo-only groups
+├── rollout/
+│   ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
+│   ├── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+│   └── tpu_sync_worker_extension.py  # vLLM worker extension that receives `tpu-sync` weight syncs
+├── trainer/
+│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
+│   ├── tpu_engine_options.py         # TPU engine options (engine_kwargs.tpu)
 │   ├── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
-│   ├── weight_export.py              # Exports the trainer's weights as local FSDP shards or full tensors
-│   └── weight_sync_backends.py       # Weight sync backend names and their deprecated aliases
-└── rollout/
-    ├── tpu_raiden.py                 # vLLM worker extension that receives Raiden weight syncs
-    ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
-    └── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+│   └── weight_export.py              # Exports the trainer's weights as local FSDP shards or full tensors
+└── weight_sync/
+    ├── weight_sync_backends.py       # Weight sync backend names, shared helpers and manager dispatch hook
+    ├── ray_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
+    ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout
+    ├── tpu_sync_rendezvous.py        # Per-job actor: controller address, tensor shapes, parity stats
+    └── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
 ```
 
 ```text

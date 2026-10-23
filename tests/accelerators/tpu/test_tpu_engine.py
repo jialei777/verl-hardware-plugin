@@ -20,7 +20,21 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.config import ActorConfig, TorchtitanEngineConfig
 from verl.workers.utils.losses import ppo_loss, sft_loss
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
+    PlatformTPU,
+    configure_ray_worker_tpu7x_env,
+    configure_torchrun_tpu_env,
+    get_tpu_chip_hbm_bytes,
+    gke_tpu_slice_topology,
+    is_tpu_v7x,
+    ray_tpu_accelerator_name,
+    resolve_tpu_topology_bounds,
+    resolve_tpu_v7x_topology,
+    tpu_generation,
+    tpu_mesh_env,
+    tpu_v7x_process_env,
+)
+from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     TPUSplashAttention,
     TPUVarlenAttention,
@@ -36,20 +50,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     resolve_tpu_torchtitan_options,
     splash_block_size_for,
     unwrap_metadata,
-)
-from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
-    PlatformTPU,
-    configure_ray_worker_tpu7x_env,
-    configure_torchrun_tpu_env,
-    get_tpu_chip_hbm_bytes,
-    gke_tpu_slice_topology,
-    is_tpu_v7x,
-    ray_tpu_accelerator_name,
-    resolve_tpu_topology_bounds,
-    resolve_tpu_v7x_topology,
-    tpu_generation,
-    tpu_mesh_env,
-    tpu_v7x_process_env,
 )
 
 
@@ -765,8 +765,8 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     from torch.distributed.fsdp import FSDPModule
 
     from verl.workers.engine.base import BaseEngine
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_utils
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    from verl_hardware_plugin.accelerators.tpu.trainer import torchtitan_tpu, tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
         derive_torchtitan_name_and_flavor,
         enable_fsdp_gradient_division,
     )
@@ -802,7 +802,7 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
 
 def test_fused_linear_cross_entropy_tpu_and_logprobs():
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
         fused_linear_logprobs_tpu,
         resolve_tpu_use_fused_linear_cross_entropy,
     )
@@ -867,7 +867,7 @@ def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pa
     PPO ratio is exactly 1. Entropy is taken from the logits in fp32, as on GPU.
     """
     import verl.utils.torch_functional as verl_F
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.trainer import torchtitan_tpu
 
     seq_lens, hidden_dim, vocab = [3, 5], 4, 6
     total = sum(seq_lens)
@@ -907,7 +907,7 @@ def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(t
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, Shard, init_device_mesh
 
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import move_tpu_params_
+    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import move_tpu_params_
 
     owns_group = not dist.is_initialized()
     if owns_group:
@@ -941,7 +941,7 @@ def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(t
 
 def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
     from verl.utils.torch_functional import logprobs_from_logits_naive
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import compute_tpu_logprobs_chunked
+    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import compute_tpu_logprobs_chunked
 
     torch.manual_seed(0)
     logits_ref = torch.randn(1, 20, 32, dtype=torch.bfloat16, requires_grad=True)
@@ -960,7 +960,7 @@ def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
 
 
 def test_install_parallel_dims_cache_for_tpu_reuses_parallel_dims_and_mesh():
-    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.trainer import tpu_utils
 
     build_calls = []
 
@@ -1023,7 +1023,7 @@ def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
     import torch.distributed.tensor._dispatch as dt_disp
     import torch.distributed.tensor._redistribute as redist_mod
 
-    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.trainer import tpu_utils
 
     seen = []
 
@@ -1047,7 +1047,7 @@ def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
 
 
 def test_build_dp_gloo_group_creates_host_gloo_subgroups_when_tp_enabled():
-    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.trainer.torchtitan_tpu import TorchTitanTPUEngine
 
     engine = object.__new__(TorchTitanTPUEngine)
     engine.engine_config = SimpleNamespace(
@@ -1086,7 +1086,7 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
     import torch.distributed as dist
     from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
 
-    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights, fsdp_dim0_shard
+    from verl_hardware_plugin.accelerators.tpu.trainer.weight_export import TrainerWeights, fsdp_dim0_shard
 
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
     try:

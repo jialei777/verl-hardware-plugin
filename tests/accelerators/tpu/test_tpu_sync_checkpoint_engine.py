@@ -36,20 +36,15 @@ for _mod_name in ("uvicorn", "fastapi"):
             sys.modules[_mod_name] = _stub
 
 # Imported up front, so that no test imports (and registers) them a second time. Importing
-# tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
+# tpu_sync_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines import (  # noqa: E402, F401
-    ray_weight_registry,
-    tpu_checkpoint_engine,
-    tpu_sync_rendezvous,  # noqa: E402
-)
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_parity as parity  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_rendezvous import TpuSyncRendezvousState  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.trainer.weight_export import TrainerWeights  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as raiden  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_parity as parity  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_rendezvous  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import TpuSyncRendezvousState  # noqa: E402
 
-TPU_RAIDEN = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden"
+TPU_RAIDEN = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension"
 RaidenId = namedtuple("RaidenId", ["job_name", "job_replica_id", "data_name"])
 TIMING_KEYS = {
     f"timing_s/tpu-sync/{phase}"
@@ -400,7 +395,7 @@ def _make_manager(
 
 
 def _trainer_engine(rank, **engine_kwargs):
-    engine = raiden.RaidenCheckpointEngine(is_master=rank == 0, **engine_kwargs)
+    engine = raiden.TPUSyncCheckpointEngine(is_master=rank == 0, **engine_kwargs)
     engine.rank = rank
     return engine
 
@@ -506,7 +501,7 @@ class _WorkerExtensionBase:
 
 def _make_sampler(module, rank, tp, model):
     """A vLLM worker with the Raiden extension: rank ``rank`` of a TP=``tp`` engine serving ``model``."""
-    sampler = module.vLLMRaidenWorkerExtension()
+    sampler = module.vLLMTPUSyncWorkerExtension()
     sampler.rank = rank
     sampler.model_runner = SimpleNamespace(model=model)
     sampler.vllm_config = SimpleNamespace(
@@ -522,7 +517,7 @@ def fake_tpu_sync(monkeypatch):
     world = _FakeTpuSync()
     for name, module in world.modules().items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(raiden, "RAIDEN_DEVICE", "cpu")
+    monkeypatch.setattr(raiden, "TPU_SYNC_DEVICE", "cpu")
     monkeypatch.setattr(raiden, "get_tpu_sync_rendezvous", world.get_rendezvous)
     monkeypatch.setattr(raiden, "create_tpu_sync_rendezvous", world.create_rendezvous)
     monkeypatch.setattr(parity, "get_tpu_sync_rendezvous", world.get_rendezvous)
@@ -556,9 +551,9 @@ def tpu_raiden(fake_tpu_sync, monkeypatch):
 
 
 def test_tpu_sync_engine_registered():
-    assert ckpt_base.CheckpointEngineRegistry.get("tpu-sync") is raiden.RaidenCheckpointEngine
+    assert ckpt_base.CheckpointEngineRegistry.get("tpu-sync") is raiden.TPUSyncCheckpointEngine
     # Former name of the backend, still accepted.
-    assert ckpt_base.CheckpointEngineRegistry.get("raiden") is raiden.RaidenCheckpointEngine
+    assert ckpt_base.CheckpointEngineRegistry.get("raiden") is raiden.TPUSyncCheckpointEngine
 
 
 @pytest.mark.parametrize(
@@ -571,86 +566,24 @@ def test_tpu_sync_engine_registered():
         ("tpu-sync", {}, {}),
     ],
 )
-def test_raiden_engine_kwargs_follow_configured_backend(backend, engine_kwargs, expected):
+def test_tpu_sync_engine_kwargs_follow_configured_backend(backend, engine_kwargs, expected):
     config = SimpleNamespace(backend=backend, engine_kwargs=engine_kwargs)
-    assert raiden._raiden_engine_kwargs(config, backend) == expected
-    assert raiden._raiden_engine_kwargs(config) == expected
+    assert raiden._tpu_sync_engine_kwargs(config, backend) == expected
+    assert raiden._tpu_sync_engine_kwargs(config) == expected
 
 
 def test_engine_kwargs(monkeypatch):
     monkeypatch.setenv("RANK", "3")
-    engine = raiden.RaidenCheckpointEngine(bucket_size=16, is_master=True)
+    engine = raiden.TPUSyncCheckpointEngine(bucket_size=16, is_master=True)
     assert (engine.bucket_size, engine.is_master, engine.rank) == (16, True, 3)
     assert (engine.parallelism, engine.verify_parity, engine.tie_word_embeddings) == (8, False, None)
 
     # Command-line overrides may arrive as strings.
-    engine = raiden.RaidenCheckpointEngine(parallelism="4", verify_parity="true", tie_word_embeddings="1")
+    engine = raiden.TPUSyncCheckpointEngine(parallelism="4", verify_parity="true", tie_word_embeddings="1")
     assert (engine.parallelism, engine.verify_parity, engine.tie_word_embeddings) == (4, True, True)
 
     with pytest.raises(NotImplementedError):
         engine.receive_weights()
-
-
-def test_registry_state_raiden_fields():
-    reg = RayWeightRegistryState()
-    assert (reg.get_controller_address(), reg.get_global_shapes(), reg.get_stats(1)) == (None, {}, None)
-
-    reg.set_controller_address("10.0.0.1:7777")
-    reg.set_global_shapes({"w": [2, 3]})
-    reg.set_stats(1, {"l1_norm": 1.0})
-    assert reg.get_controller_address() == "10.0.0.1:7777"
-    assert reg.get_global_shapes() == {"w": [2, 3]}
-    assert reg.get_stats(1) == {"master": {"l1_norm": 1.0}}
-
-    latest = list(range(3, 3 + reg.MAX_STATS_STEPS))
-    for step in latest:
-        reg.set_stats(step, {})
-    assert sorted(reg.stats) == latest  # only the latest steps are kept
-
-    reg.set_weights(0, ["ref"])
-    reg.clear()
-    assert (reg.get_weights(0), reg.get_controller_address()) == (None, None)
-    assert (reg.get_global_shapes(), reg.stats) == ({}, {})
-
-
-def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
-    existing, created = object(), object()
-    lookups: list = []
-    create_error: list = []
-    options_calls = []
-
-    def get_actor(name, namespace=None):
-        assert (name, namespace) == ("RayWeightRegistry", "verl")
-        result = lookups.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    def options(**kwargs):
-        options_calls.append(kwargs)
-
-        def remote():
-            if create_error:
-                raise create_error[0]
-            return created
-
-        return SimpleNamespace(remote=remote)
-
-    monkeypatch.setattr(ray, "get_actor", get_actor)
-    monkeypatch.setattr(ray_weight_registry, "RayWeightRegistry", SimpleNamespace(options=options))
-
-    lookups[:] = [existing]
-    assert ray_weight_registry.get_ray_weight_registry() is existing
-    assert options_calls == []
-
-    lookups[:] = [ValueError("Failed to look up actor")]
-    assert ray_weight_registry.get_ray_weight_registry() is created
-    assert options_calls == [{"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached"}]
-
-    # Another process creates the actor between the lookup and the creation.
-    lookups[:] = [ValueError("Failed to look up actor"), existing]
-    create_error[:] = [ValueError("Actor name is already taken")]
-    assert ray_weight_registry.get_ray_weight_registry() is existing
 
 
 def test_rendezvous_state():
@@ -777,11 +710,11 @@ def test_tpu_synchronize_strict_and_lenient(fake_tpu_sync, caplog):
     assert "Could not synchronize via torch_tpu" in caplog.text
 
 
-def test_setup_raiden_controller_publishes_address(fake_tpu_sync):
+def test_setup_tpu_sync_controller_publishes_address(fake_tpu_sync):
     state = fake_tpu_sync.registry_state
     state.set_controller_address("10.9.9.9:1")  # left behind in the detached actor by a previous job
 
-    controller, server, address, rendezvous, rendezvous_name = raiden.setup_raiden_controller()
+    controller, server, address, rendezvous, rendezvous_name = raiden.setup_tpu_sync_controller()
     assert address == "10.0.0.1:7777"
     assert server.controller is controller is fake_tpu_sync.controller
     assert state.get_controller_address() == address
@@ -789,24 +722,24 @@ def test_setup_raiden_controller_publishes_address(fake_tpu_sync):
     assert rendezvous is fake_tpu_sync.registry
 
 
-def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatch):
+def test_setup_tpu_sync_controller_wraps_registry_errors(fake_tpu_sync, monkeypatch):
     def fail(address):
         raise ValueError("registry unavailable")
 
     broken = _FakeActorHandle(SimpleNamespace(set_controller_address=fail))
     monkeypatch.setattr(raiden, "create_tpu_sync_rendezvous", lambda: (broken, "TpuSyncRendezvous-test"))
     with pytest.raises(RuntimeError, match=r"Failed to store RaidenController address \(10\.0\.0\.1:7777\)") as err:
-        raiden.setup_raiden_controller()
+        raiden.setup_tpu_sync_controller()
     assert isinstance(err.value.__cause__, ValueError)
 
 
 # ---------------------------------------------------------------------------
-# Trainer side: RaidenCheckpointEngine.send_weights
+# Trainer side: TPUSyncCheckpointEngine.send_weights
 # ---------------------------------------------------------------------------
 
 
 def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu_sync):
-    raiden.setup_raiden_controller()
+    raiden.setup_tpu_sync_controller()
     weights = _trainer_weights()
     names = sorted(weights)  # lm_head is sent unless the model is known to tie it
     engine = _trainer_engine(rank=0)
@@ -866,7 +799,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
 
 
 def test_release_sync_buffers_is_noop_when_disabled_or_before_first_sync(fake_tpu_sync):
-    raiden.setup_raiden_controller()
+    raiden.setup_tpu_sync_controller()
     engine = _trainer_engine(rank=0, release_buffers_after_sync=False)
     assert engine.release_sync_buffers() == {}  # nothing bound yet
 
@@ -879,7 +812,7 @@ def test_release_sync_buffers_is_noop_when_disabled_or_before_first_sync(fake_tp
 
 
 def test_release_sync_buffers_falls_back_to_destroying_synchronizer_without_unbind(fake_tpu_sync, caplog):
-    raiden.setup_raiden_controller()
+    raiden.setup_tpu_sync_controller()
     engine = _trainer_engine(rank=0)
     weights = _trainer_weights()
     asyncio.run(engine.send_weights(iter(weights.items()), global_steps=1))
@@ -913,11 +846,11 @@ def test_release_buffers_flag_from_kwargs_and_env(monkeypatch, kwargs, env, expe
         monkeypatch.delenv("VERL_RAIDEN_RELEASE_BUFFERS", raising=False)
     else:
         monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", env)
-    assert raiden.RaidenCheckpointEngine(**kwargs).release_buffers_after_sync is expected
+    assert raiden.TPUSyncCheckpointEngine(**kwargs).release_buffers_after_sync is expected
 
 
 def test_send_weights_drops_tied_lm_head(fake_tpu_sync):
-    raiden.setup_raiden_controller()
+    raiden.setup_tpu_sync_controller()
     engine = _trainer_engine(rank=0, tie_word_embeddings=True)
     asyncio.run(engine.send_weights(_trainer_weights(), global_steps=1))  # a dict works too
 
@@ -927,7 +860,7 @@ def test_send_weights_drops_tied_lm_head(fake_tpu_sync):
 
 
 def test_send_weights_registers_local_shards(fake_tpu_sync):
-    raiden.setup_raiden_controller()
+    raiden.setup_tpu_sync_controller()
     rank, world = 1, 2
     weights = _trainer_weights()
     names = sorted(weights)
@@ -990,12 +923,12 @@ def test_merge_rank_stats_matches_full_tensor_stats():
 
 
 # ---------------------------------------------------------------------------
-# Driver side: update_raiden_weights, end to end through the fake transfer
+# Driver side: update_tpu_sync_weights, end to end through the fake transfer
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("tie_word_embeddings", [False, True])
-def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie_word_embeddings):
+def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie_word_embeddings):
     tp = trainer_ranks = 2
     weights = {"current": _trainer_weights(seed=0)}
     engines = [
@@ -1011,12 +944,12 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
 
     # Initial sync (step 0): nothing to abort and no parity check.
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        metrics = asyncio.run(raiden.update_raiden_weights(manager, global_steps=0))
+        metrics = asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=0))
     assert events == [
         "update_weights",
-        "init_raiden_sync_on_worker",
+        "init_tpu_sync_on_worker",
         "release_sync_buffers",
-        "install_raiden_weights",
+        "install_tpu_sync_weights",
         "set_global_steps",
         "resume",
     ]
@@ -1047,13 +980,13 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     weights["current"] = _trainer_weights(seed=1)
     events.clear()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        metrics = asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+        metrics = asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
     assert events == [
         "abort",
         "update_weights",
-        "init_raiden_sync_on_worker",
+        "init_tpu_sync_on_worker",
         "release_sync_buffers",
-        "install_raiden_weights",
+        "install_tpu_sync_weights",
         "set_global_steps",
         "get_model_weights_stats",
         "resume",
@@ -1075,7 +1008,7 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
 
 
 @pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])
-def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden, backend):
+def test_update_tpu_sync_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden, backend):
     """Every trainer rank registers the full tensors; vLLM ranks get TP shards, also of transposed parameters.
 
     Also with the deprecated backend name ``raiden``, whose engine kwargs live under ``engine_kwargs.raiden``.
@@ -1092,7 +1025,7 @@ def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_t
         backend=backend,
         parallelism=3,
     )
-    asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+    asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
 
     assert [sampler._raiden_ws.parallelism for sampler in samplers] == [3] * tp
     for rank, model in enumerate(models):
@@ -1107,7 +1040,7 @@ def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_t
 
 @pytest.mark.parametrize(("trainer_ranks", "tp"), [(2, 2), (4, 2), (2, 4)])
 @pytest.mark.parametrize("tie_word_embeddings", [False, True])
-def test_update_raiden_weights_from_local_shards(
+def test_update_tpu_sync_weights_from_local_shards(
     fake_tpu_sync, tpu_raiden, caplog, trainer_ranks, tp, tie_word_embeddings
 ):
     """Every trainer rank registers only its FSDP blocks; the controller reassembles and reshards them for vLLM TP.
@@ -1133,7 +1066,7 @@ def test_update_raiden_weights_from_local_shards(
         weights["current"] = _trainer_weights(seed=step)
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=raiden.__name__):
-            asyncio.run(raiden.update_raiden_weights(manager, global_steps=step))
+            asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=step))
         for rank, model in enumerate(models):
             expected = _expected_vllm_state(weights["current"], rank, tp, lm_head_from_embed=tie_word_embeddings)
             _assert_state(model, expected)
@@ -1161,7 +1094,7 @@ def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatc
         [],
         verify_parity=True,
     )
-    asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+    asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
     state = fake_tpu_sync.registry_state
     assert sorted(state.get_stats(1)["ranks"]) == list(range(trainer_ranks))
 
@@ -1197,7 +1130,7 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
         [],
         verify_parity=True,
     )
-    asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+    asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
 
     samplers[1]._raiden_staging["model.embed_tokens.weight"].zero_()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
@@ -1206,7 +1139,7 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
     assert "model.embed_tokens.weight" in caplog.text
 
 
-def test_update_raiden_weights_syncs_several_replicas_in_one_transfer(fake_tpu_sync, tpu_raiden, caplog):
+def test_update_tpu_sync_weights_syncs_several_replicas_in_one_transfer(fake_tpu_sync, tpu_raiden, caplog):
     """Two TP=2 replicas: a job name and a port range per replica, one transfer, the parity check per replica."""
     tp, trainer_ranks, num_replicas = 2, 2, 2
     weights = _trainer_weights()
@@ -1222,12 +1155,12 @@ def test_update_raiden_weights_syncs_several_replicas_in_one_transfer(fake_tpu_s
         verify_parity=True,
     )
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+        asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
 
     for group in models:
         for rank, model in enumerate(group):
             _assert_state(model, _expected_vllm_state(weights, rank, tp))
-    assert events.count("init_raiden_sync_on_worker") == num_replicas
+    assert events.count("init_tpu_sync_on_worker") == num_replicas
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
     assert transfer["dst_units"] == [
@@ -1270,11 +1203,11 @@ def test_wait_for_registration_times_out():
 def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
     calls = []
 
-    async def fake_update_raiden_weights(manager, global_steps=None):
+    async def fake_update_tpu_sync_weights(manager, global_steps=None):
         calls.append((manager.backend, global_steps))
         return {"timing_s/tpu-sync/total_sync": 1.0}
 
-    monkeypatch.setattr(raiden, "update_raiden_weights", fake_update_raiden_weights)
+    monkeypatch.setattr(raiden, "update_tpu_sync_weights", fake_update_tpu_sync_weights)
     assert getattr(ckpt_base, "_verl_tpu_ckpt_patched", False)
     result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend=backend), global_steps=3)
     assert result == {"timing_s/tpu-sync/total_sync": 1.0}
@@ -1282,7 +1215,7 @@ def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
 
 
 # ---------------------------------------------------------------------------
-# Rollout side: vLLMRaidenWorkerExtension
+# Rollout side: vLLMTPUSyncWorkerExtension
 # ---------------------------------------------------------------------------
 
 
@@ -1318,7 +1251,7 @@ def test_sampler_sharding_gqa_kv_heads(tpu_raiden):
 
 
 @pytest.mark.parametrize("verify_parity", [False, True])
-def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden, caplog, verify_parity):
+def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden, caplog, verify_parity):
     """TP=4 with 2 KV heads: each rank receives one whole KV head, and the parity check counts each head once."""
     tp = 4
     assert tp > KV_HEADS
@@ -1333,7 +1266,7 @@ def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden
         verify_parity=verify_parity,
     )
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+        asyncio.run(raiden.update_tpu_sync_weights(manager, global_steps=1))
 
     for rank, model in enumerate(models):
         _assert_state(model, _expected_vllm_state(weights, rank, tp))
@@ -1359,7 +1292,7 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
         }
     )
     sampler = _make_sampler(tpu_raiden, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
     assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
@@ -1386,7 +1319,7 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     }
 
     # Later syncs reuse the receive buffers and the registration.
-    assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
     assert len(fake_tpu_sync.synchronizers) == 1
 
 
@@ -1394,7 +1327,7 @@ def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, tpu_ra
     fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
     fake_tpu_sync.registry_state.set_global_shapes({"model.norm.weight": [128]})
     sampler = _make_sampler(tpu_raiden, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_raiden_sync_on_worker(parallelism=4, job_name="sampler1") is True
+    assert sampler.init_tpu_sync_on_worker(parallelism=4, job_name="sampler1") is True
 
     (ws,) = fake_tpu_sync.synchronizers
     assert RaidenId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
@@ -1406,12 +1339,12 @@ def test_sampler_init_times_out_without_registry(fake_tpu_sync, tpu_raiden, monk
     monkeypatch.setattr(tpu_raiden, "_REGISTRY_POLL_ATTEMPTS", 2)
     sampler = _make_sampler(tpu_raiden, rank=0, tp=2, model=_FakeVllmModel(2))
     with pytest.raises(RuntimeError, match="No RaidenController address"):
-        sampler.init_raiden_sync_on_worker()
+        sampler.init_tpu_sync_on_worker()
     assert fake_tpu_sync.synchronizers == []
 
 
 def test_sampler_methods_before_init(tpu_raiden):
     sampler = _make_sampler(tpu_raiden, rank=0, tp=2, model=_FakeVllmModel(2))
-    assert sampler.install_raiden_weights() == {}
+    assert sampler.install_tpu_sync_weights() == {}
     with pytest.raises(RuntimeError, match="only supported for Raiden after initialization"):
         sampler.get_model_weights_stats()

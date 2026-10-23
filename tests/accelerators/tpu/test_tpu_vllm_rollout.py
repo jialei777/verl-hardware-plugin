@@ -148,11 +148,11 @@ def test_server_worker_extension_defers_to_upstream(tpu_vllm):
 def test_server_worker_extension_for_tpu_sync(tpu_vllm, backend):
     server = tpu_vllm.TPUvLLMHttpServer()
     server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend=backend))
-    assert server._get_worker_extension_cls() == tpu_vllm.RAIDEN_WORKER_EXTENSION_CLS
-    module_name, cls_name = tpu_vllm.RAIDEN_WORKER_EXTENSION_CLS.rsplit(".", 1)
+    assert server._get_worker_extension_cls() == tpu_vllm.TPU_SYNC_WORKER_EXTENSION_CLS
+    module_name, cls_name = tpu_vllm.TPU_SYNC_WORKER_EXTENSION_CLS.rsplit(".", 1)
     assert (module_name, cls_name) == (
-        "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden",
-        "vLLMRaidenWorkerExtension",
+        "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension",
+        "vLLMTPUSyncWorkerExtension",
     )
 
 

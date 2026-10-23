@@ -1,20 +1,14 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Monkeypatches for Google TPU (``tpu_dist``) distributed collectives and runtime helpers.
+"""Monkeypatch of ``torch.distributed.all_reduce`` for TPU tensors sent to Gloo-only process groups.
 
-Why this is needed:
-1. A TPU tensor can reach a process group that only has a ``cpu:gloo`` backend. ``all_reduce`` then
-   stages it through CPU; Gloo has no ``ReduceOp.AVG``, so AVG becomes SUM + divide on that path.
-   With torch-tpu >= 0.2.0, ``ReduceOp.AVG`` on ``tpu_dist`` is native and ``all_gather_object`` on
-   ``tpu_dist`` groups works (``aten::resize_`` is implemented), so both pass through unpatched.
-2. ``verl.utils.distributed.set_numa_affinity`` queries ``pynvml`` (NVIDIA NVML) when
-   ``libnuma.so`` is present, and ``verl.utils.torch_functional.logprobs_from_logits``
-   falls back to row-wise Python loops (``logprobs_from_logits_v2``) instead of vectorized
-   ``logprobs_from_logits_naive`` (run in fp32, as on GPU) on TPU.
+Why this is needed: with model parallelism (``dp_size < world_size``) the TorchTitan TPU engine returns a
+host-side Gloo data-parallel group, and verl's ``TrainingWorker._postprocess_output`` all-reduces a TPU tensor with
+``ReduceOp.AVG`` on it. Gloo cannot take TPU tensors and has no AVG, so the tensor is staged through CPU and AVG
+becomes SUM + divide. Every other call passes through unchanged (torch-tpu >= 0.2.0 implements AVG on ``tpu_dist``).
 
-All patches are applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the
-``tpu`` platform is selected for the process).
+Applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the ``tpu`` platform is selected).
 """
 
 import logging
@@ -24,14 +18,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-import verl.utils.distributed as verl_dist
-import verl.utils.torch_functional as verl_tf
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
-_runtime_helpers_applied = False
 
 
 def _tpu_available() -> bool:
@@ -58,48 +48,8 @@ def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
     return "gloo" in backend and "tpu_dist" not in backend
 
 
-def _noop_numa_affinity() -> None:
-    return None
-
-
-def _apply_verl_runtime_helpers() -> None:
-    global _runtime_helpers_applied
-    if _runtime_helpers_applied:
-        return
-
-    try:
-        if hasattr(verl_dist, "set_numa_affinity"):
-            try:
-                verl_dist.set_numa_affinity.__code__ = _noop_numa_affinity.__code__
-            except Exception:
-                pass
-            verl_dist.set_numa_affinity = _noop_numa_affinity
-    except Exception as e:
-        logger.debug("Skipping set_numa_affinity TPU patch: %s", e)
-
-    try:
-        orig_logprobs = getattr(verl_tf, "logprobs_from_logits", None)
-        naive_logprobs = getattr(verl_tf, "logprobs_from_logits_naive", None)
-        if callable(orig_logprobs) and callable(naive_logprobs) and not getattr(orig_logprobs, "_tpu_patched", False):
-
-            def _patched_logprobs_from_logits(logits, labels, inplace_backward=True):
-                device = getattr(logits, "device", None)
-                if getattr(device, "type", None) == "tpu":
-                    # fp32 log-softmax, as flash-attn's cross entropy computes it on GPU.
-                    return naive_logprobs(logits.float(), labels)
-                return orig_logprobs(logits, labels, inplace_backward=inplace_backward)
-
-            _patched_logprobs_from_logits._tpu_patched = True  # type: ignore[attr-defined]
-            verl_tf.logprobs_from_logits = _patched_logprobs_from_logits
-    except Exception as e:
-        logger.debug("Skipping logprobs_from_logits TPU patch: %s", e)
-
-    _runtime_helpers_applied = True
-
-
 def apply() -> None:
     global _applied
-    _apply_verl_runtime_helpers()
     if _applied:
         return
     if not _tpu_available():

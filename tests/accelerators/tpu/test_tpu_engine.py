@@ -1315,7 +1315,9 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
             ("validate", parallelism.spmd_backend, parallelism.context_parallel_load_balancer)
         ),
     )
-    engine = SimpleNamespace(engine_config=SimpleNamespace(context_parallel_strategy=strategy))
+    engine = SimpleNamespace(
+        engine_config=SimpleNamespace(context_parallel_strategy=strategy), _use_splash_attention=True
+    )
     parallelism = SimpleNamespace(
         context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer="headtail"
     )
@@ -1341,6 +1343,48 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
         ("validate", "spmd_types", expected_lb),
         "patches",
     ]
+
+
+def test_enable_context_parallel_all_gather_requires_splash():
+    """KV all-gather CP fails before the model is built when splash is off; torchtitan would refuse it on TPU."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    fake_transform = SimpleNamespace(
+        ContextParallelTransform=lambda inner_attention: inner_attention,
+        transform_model_config_=lambda model, transforms: model,
+    )
+    fake_cp_attention = SimpleNamespace(
+        install_tpu_cp_patches=lambda: None,
+        tpu_cp_inner_attention=lambda base, strat: base,
+        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
+        validate_tpu_context_parallel=lambda model, parallelism: None,
+    )
+    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object))
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torchtitan": SimpleNamespace(),
+            "torchtitan.config": SimpleNamespace(transform=fake_transform),
+            "torchtitan.config.transform": fake_transform,
+            "torchtitan.experiments": SimpleNamespace(),
+            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+        },
+    ):
+        for strategy, raises in (("all_gather", True), ("ulysses", False)):
+            engine = SimpleNamespace(
+                engine_config=SimpleNamespace(context_parallel_strategy=strategy), _use_splash_attention=False
+            )
+            parallelism = SimpleNamespace(
+                context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
+            )
+            if raises:
+                with pytest.raises(ValueError, match="needs use_splash_attention=True"):
+                    TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+                assert parallelism.spmd_backend == "partial_dtensor"
+            else:
+                TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+                assert parallelism.spmd_backend == "spmd_types"
 
 
 def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():

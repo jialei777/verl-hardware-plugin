@@ -433,6 +433,14 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         strategy = getattr(self.engine_config, "context_parallel_strategy", "all_gather") or "all_gather"
+        if strategy == "all_gather" and not self._use_splash_attention:
+            # torchtitan refuses to run its plain-PyTorch reference attention for KV all-gather CP on TPU: it builds
+            # the full (S / cp, S) score matrix. Fail here, before the model is built.
+            raise ValueError(
+                "context_parallel_strategy='all_gather' on TPU needs use_splash_attention=True: torchtitan's KV "
+                "all-gather CP has no other TPU attention kernel. Turn splash on, or use "
+                "context_parallel_strategy='ulysses'."
+            )
         parallelism.spmd_backend = "spmd_types"
         parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(strategy)
         inner_attention = model.first_full_attention_backend

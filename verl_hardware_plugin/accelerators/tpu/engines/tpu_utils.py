@@ -17,6 +17,7 @@ import os
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
@@ -89,6 +90,67 @@ def get_torchtitan_model_module_name(torchtitan_name: str) -> str:
 def torchtitan_model_attn_backend(torchtitan_name: str, attn_type: str) -> str:
     """``attn_backend`` to build torchtitan model ``torchtitan_name`` with, given the engine's ``attn_type``."""
     return "sdpa" if torchtitan_name in _SDPA_ONLY_TORCHTITAN_MODELS else attn_type
+
+
+# Optional torchtitan TPU kernels of a model (``VERL_TPU_MODEL_KERNELS``, comma-separated, or ``all``), as in
+# torchtitan's Qwen3.5-35B-A3B benchmark recipe (``qwen35_moe_35b_split_tokamax_benchmark``):
+# * ``moe``: TPU MoE converters (grouped experts, all-to-all dispatcher) with Pallas paired grouped matmuls on
+#   kernel-native expert weights, 512-row tiles and the fused route-score backward;
+# * ``kda``: Tokamax's Mosaic KDA kernels for the GatedDeltaNet (needs a Tokamax build with the KDA op; the
+#   packed-document resets go through Tokamax's ``segment_ids``);
+# * ``lce``: fused linear cross-entropy tiles (1024, 2048, 640).
+# The Pallas gated RMSNorm runs by default; the Pallas causal conv1d only runs without document resets, which RL
+# keeps on.
+_TPU_MODEL_KERNELS = {"qwen3_5": frozenset({"moe", "kda", "lce"})}
+_LCE_BLOCK_SIZES = {"b_block_size": 1024, "h_block_size": 2048, "v_block_size": 640}
+
+
+def resolve_tpu_model_kernels(torchtitan_name: str) -> frozenset[str]:
+    """The optional TPU kernels (``VERL_TPU_MODEL_KERNELS``) that torchtitan model ``torchtitan_name`` supports."""
+    supported = _TPU_MODEL_KERNELS.get(torchtitan_name, frozenset())
+    requested = {k.strip().lower() for k in os.environ.get("VERL_TPU_MODEL_KERNELS", "").split(",") if k.strip()}
+    if "all" in requested:
+        return supported
+    unknown = requested - supported
+    if unknown:
+        raise ValueError(f"VERL_TPU_MODEL_KERNELS: {sorted(unknown)} not supported for {torchtitan_name}")
+    return frozenset(requested)
+
+
+def tpu_model_kernel_registry_kwargs(kernels: frozenset[str]) -> dict[str, Any]:
+    """Extra ``model_registry`` kwargs for ``kernels`` (the TPU MoE converters for ``moe``)."""
+    if "moe" not in kernels:
+        return {}
+    from torchtitan.experiments.tpu.qwen3_5.config_registry import _TPU_MOE_CONVERTERS
+
+    return {"converters": list(_TPU_MOE_CONVERTERS)}
+
+
+def configure_tpu_model_kernels(model_spec: Any, kernels: frozenset[str]) -> None:
+    """Sets the per-model-config kernel options of ``kernels`` on ``model_spec.model`` in place."""
+    if "moe" not in kernels:
+        return
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+    from torchtitan.experiments.tpu.qwen3_5.config_registry import _use_tpu_moe_kernels
+
+    _use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
+    for _, experts, _, _ in model_spec.model.traverse(TpuGroupedExperts.Config):
+        experts.pallas_grouped_mm_tile_m = 512
+        experts.pallas_grouped_mm_tgmm_tiling = (512, 0, 0)
+
+
+def tpu_model_kernel_override_imports(kernels: frozenset[str]) -> list[str]:
+    """torchtitan ``override.imports`` of ``kernels`` (Tokamax's GatedDeltaNet kernel for ``kda``)."""
+    if "kda" not in kernels:
+        return []
+    from torchtitan.experiments.tpu.qwen3_5.config_registry import TOKAMAX_GATED_DELTA_OVERRIDE
+
+    return [TOKAMAX_GATED_DELTA_OVERRIDE]
+
+
+def tpu_model_kernel_lce_block_sizes(kernels: frozenset[str]) -> dict[str, int]:
+    """Fused linear cross-entropy block sizes of ``kernels`` (empty: the kernel defaults)."""
+    return dict(_LCE_BLOCK_SIZES) if "lce" in kernels else {}
 
 
 def get_text_config(hf_config: Any) -> Any:

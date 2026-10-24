@@ -66,6 +66,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     compute_global_batch_num_tokens,
     compute_tpu_logprobs_chunked,
     configure_torch_compile_for_tpu,
+    configure_tpu_model_kernels,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
@@ -79,10 +80,14 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
+    resolve_tpu_model_kernels,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
+    tpu_model_kernel_lce_block_sizes,
+    tpu_model_kernel_override_imports,
+    tpu_model_kernel_registry_kwargs,
     tpu_synchronize,
     unwrap_metadata,
 )
@@ -240,12 +245,15 @@ class TorchTitanTPUEngine(BaseEngine):
 
         # Get ModelSpec from model registry
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
+        self._tpu_kernels = resolve_tpu_model_kernels(torchtitan_name)
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
             seq_len=self.engine_config.max_seq_len,
             **({} if self.engine_config.fuse_qkv else {"fuse_qkv": False}),
+            **tpu_model_kernel_registry_kwargs(self._tpu_kernels),
         )
+        configure_tpu_model_kernels(model_spec, self._tpu_kernels)
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
@@ -359,6 +367,9 @@ class TorchTitanTPUEngine(BaseEngine):
 
             if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
                 self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+        for override_import in tpu_model_kernel_override_imports(self._tpu_kernels):
+            if override_import not in self.config.override.imports:
+                self.config.override.imports.append(override_import)
         install_parallel_dims_cache_for_tpu()
         self.trainer = Trainer(self.config)
         self.parallel_dims = self.trainer.parallel_dims
@@ -1033,6 +1044,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     labels,
                     lm_head_weight_t,
                     temperature=temperature,
+                    **tpu_model_kernel_lce_block_sizes(getattr(self, "_tpu_kernels", frozenset())),
                 )
                 if not calculate_entropy:
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))

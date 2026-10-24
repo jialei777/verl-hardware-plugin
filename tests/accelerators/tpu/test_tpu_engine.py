@@ -1263,3 +1263,26 @@ def test_document_ids_are_int32_for_the_splash_kernel():
     assert segment_ids.dtype == torch.int32
     assert segment_ids.tolist() == [0, 0, 0, 1, 1, 2]
     assert _document_ids(None, None) is None
+
+
+def test_resolve_tpu_model_kernels(monkeypatch):
+    """``VERL_TPU_MODEL_KERNELS`` selects the optional torchtitan TPU kernels a model supports."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    monkeypatch.delenv("VERL_TPU_MODEL_KERNELS", raising=False)
+    assert tpu_utils.resolve_tpu_model_kernels("qwen3_5") == frozenset()
+    monkeypatch.setenv("VERL_TPU_MODEL_KERNELS", "all")
+    assert tpu_utils.resolve_tpu_model_kernels("qwen3_5") == {"moe", "kda", "lce"}
+    assert tpu_utils.resolve_tpu_model_kernels("qwen3") == frozenset()
+    monkeypatch.setenv("VERL_TPU_MODEL_KERNELS", "moe, lce")
+    kernels = tpu_utils.resolve_tpu_model_kernels("qwen3_5")
+    assert kernels == {"moe", "lce"}
+    assert tpu_utils.tpu_model_kernel_override_imports(kernels) == []
+    assert tpu_utils.tpu_model_kernel_lce_block_sizes(kernels) == {
+        "b_block_size": 1024,
+        "h_block_size": 2048,
+        "v_block_size": 640,
+    }
+    monkeypatch.setenv("VERL_TPU_MODEL_KERNELS", "bogus")
+    with pytest.raises(ValueError, match="not supported"):
+        tpu_utils.resolve_tpu_model_kernels("qwen3_5")

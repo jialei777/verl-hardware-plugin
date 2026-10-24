@@ -41,8 +41,8 @@ import ray
 import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import tpu_synchronize
-from verl_hardware_plugin.accelerators.tpu.engine.weight_export import TrainerWeights
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import post_trainer_stats, verify_rollout_parity
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import (
     create_tpu_sync_rendezvous,

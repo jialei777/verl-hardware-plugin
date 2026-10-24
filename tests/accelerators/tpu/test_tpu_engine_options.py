@@ -11,9 +11,9 @@ from omegaconf import OmegaConf
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import TorchtitanEngineConfig
-from verl_hardware_plugin.accelerators.tpu.engine import engine_options
-from verl_hardware_plugin.accelerators.tpu.engine.engine_options import TPUEngineOptions, get_tpu_engine_options
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
+from verl_hardware_plugin.accelerators.tpu.engines import engine_options
+from verl_hardware_plugin.accelerators.tpu.engines.engine_options import TPUEngineOptions, get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
     resolve_tpu_torchtitan_options,

@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import TPU_PADDED_VALUES_ATTR, unwrap_metadata
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, unwrap_metadata
 
 
 class _TPUPaddedJaggedProxy:

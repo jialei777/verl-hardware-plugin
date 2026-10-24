@@ -25,7 +25,7 @@ import torch
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import extend_torchtitan_engine_config
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
 extend_torchtitan_engine_config()

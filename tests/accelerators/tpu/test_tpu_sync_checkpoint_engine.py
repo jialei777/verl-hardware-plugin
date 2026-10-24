@@ -38,7 +38,7 @@ for _mod_name in ("uvicorn", "fastapi"):
 # Imported up front, so that no test imports (and registers) them a second time. Importing
 # tpu_sync_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engine.weight_export import TrainerWeights  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.weight_sync import (  # noqa: E402
     tpu_sync_checkpoint_engine as tpu_sync_engine,
 )

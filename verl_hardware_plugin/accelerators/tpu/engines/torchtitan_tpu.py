@@ -59,8 +59,8 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl_hardware_plugin.accelerators.tpu.engine.engine_options import get_tpu_engine_options
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
+from verl_hardware_plugin.accelerators.tpu.engines.engine_options import get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     align_micro_batch_shapes_across_ranks,
     bucket_length,
@@ -84,8 +84,8 @@ from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
     tpu_synchronize,
     unwrap_metadata,
 )
-from verl_hardware_plugin.accelerators.tpu.engine.weight_export import TrainerWeights
-from verl_hardware_plugin.accelerators.tpu.utils.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

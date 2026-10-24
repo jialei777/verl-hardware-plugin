@@ -11,8 +11,8 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.config import ActorConfig
 from verl.workers.utils.losses import ppo_loss, sft_loss
-from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import TPU_PADDED_VALUES_ATTR, bucket_length
-from verl_hardware_plugin.accelerators.tpu.utils.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, bucket_length
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
 
 
 def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():

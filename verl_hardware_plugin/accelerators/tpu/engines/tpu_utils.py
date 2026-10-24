@@ -30,7 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
-from verl_hardware_plugin.accelerators.tpu.engine.engine_options import get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.engines.engine_options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

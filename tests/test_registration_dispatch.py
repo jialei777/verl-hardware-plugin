@@ -51,7 +51,7 @@ ENGINES = {
     "enflame": ("fsdp_enflame", "megatron_enflame"),
     "iluvatar": ("fsdp_iluvatar", "megatron_iluvatar"),
     "musa": ("fsdp_musa", "megatron_musa"),
-    "tpu": ("engine.torchtitan_tpu", "weight_sync.ray_checkpoint_engine", "weight_sync.tpu_sync_checkpoint_engine"),
+    "tpu": ("torchtitan_tpu", "weight_sync.ray_checkpoint_engine", "weight_sync.tpu_sync_checkpoint_engine"),
     "supa": ("fsdp_supa", "megatron_supa"),
 }
 
@@ -194,7 +194,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         ("accelerators.mlu.profilers.torch_profile_mlu", ("profiler:config", "profiler:torch")),
         ("profiler:config", ("profiler:torch",)),
         ("profiler:torch", ()),
-        ("accelerators.tpu.engine.torchtitan_tpu", ()),
+        ("accelerators.tpu.engines.torchtitan_tpu", ()),
         ("accelerators.tpu.weight_sync.ray_checkpoint_engine", ()),
         ("accelerators.tpu.weight_sync.tpu_sync_checkpoint_engine", ()),
         ("rollout:vllm", ()),

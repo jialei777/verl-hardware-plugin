@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 try:
-    from verl_hardware_plugin.accelerators.tpu.engine import torchtitan_tpu  # noqa: F401
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu  # noqa: F401
 except Exception as exc:
     logger.debug("TPU TorchTitan engine registration failed: %s", exc)
 

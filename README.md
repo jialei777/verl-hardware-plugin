@@ -54,11 +54,12 @@ For platform-specific usage and configuration, please refer to each platform's d
 
 Accelerator-specific code is grouped in `verl_hardware_plugin/accelerators/<backend>/`,
 with each backend owning its platform module and any `engines/`, `rollout/`,
-`profilers/`, `patches/`, or `utils/` subdirectories it needs. A backend may split
-`engines/` by role when that is clearer: Google TPU mirrors verl core with `engine/`
-(training engine, `verl/workers/engine`), `rollout/` (`verl/workers/rollout`) and
-`weight_sync/` (checkpoint engines, `verl/checkpoint_engine`). The layout applies
-equally to domestic and international hardware, including Intel XPU and Google TPU.
+`profilers/`, `patches/`, or `utils/` subdirectories it needs. A backend may add
+subdirectories for other verl components; Google TPU keeps its training engine in
+`engines/` and adds `losses/` (`verl/workers/utils/losses.py`), `rollout/`
+(`verl/workers/rollout`) and `weight_sync/` (checkpoint engines, `verl/checkpoint_engine`).
+The layout applies equally to domestic and international hardware, including Intel XPU
+and Google TPU.
 
 ```text
 verl_hardware_plugin/

@@ -502,7 +502,7 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
     for name in list(os.environ):
-        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith(("VERL_TPU_", "VERL_RAIDEN_")):
+        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith(("VERL_TPU_", "VERL_RAIDEN_", "TPU_VLLM_")):
             monkeypatch.delenv(name)
 
 
@@ -519,6 +519,7 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
     monkeypatch.setenv("XLA_FLAGS", "")  # empty: not forwarded, it would replace the workers' own value
     monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
     monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", "0")
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
     monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
     env_vars = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]
     assert env_vars == {
@@ -526,6 +527,7 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
         "LIBTPU_INIT_ARGS": flags,
         "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
         "VERL_RAIDEN_RELEASE_BUFFERS": "0",
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0",
     }
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/xla")
     assert PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"
@@ -1098,11 +1100,18 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
             "c.cols": torch.randn(4, 6, generator=generator),
             "d.replicated": torch.randn(4, generator=generator),
             "e.plain": torch.randn(3, generator=generator),
+            "f.norm": torch.randn(8, generator=generator),  # 1-D: always exported whole
             "model.embed_tokens.weight": torch.randn(6, 4, generator=generator),
         }
         full["lm_head.weight"] = full["model.embed_tokens.weight"]
         stack = torch.randn(2, 3, 4, generator=generator)
-        placements = {"a.even": Shard(0), "b.uneven": Shard(0), "c.cols": Shard(1), "d.replicated": Replicate()}
+        placements = {
+            "a.even": Shard(0),
+            "b.uneven": Shard(0),
+            "c.cols": Shard(1),
+            "d.replicated": Replicate(),
+            "f.norm": Shard(0),
+        }
         placements["model.embed_tokens.weight"] = Shard(0)
         params = {name: distribute_tensor(full[name], mesh, [p]) for name, p in placements.items()}
         params["e.plain"] = full["e.plain"]
@@ -1110,7 +1119,7 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
         stack_dt = distribute_tensor(stack, mesh, [Shard(0)])
 
         assert fsdp_dim0_shard(params["a.even"]) == (world, rank)
-        for name in ("b.uneven", "c.cols", "d.replicated", "e.plain"):
+        for name in ("b.uneven", "c.cols", "d.replicated", "e.plain", "f.norm"):
             assert fsdp_dim0_shard(params[name]) is None, name
 
         def weights() -> TrainerWeights:
@@ -1140,6 +1149,14 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
         except RuntimeError as e:
             assert "only be exported once" in str(e)
 
+        # The dense parameters may come as several dicts (one per layer), consumed lazily; same export.
+        names = list(params)
+        chunks = iter([{n: params[n] for n in names[:2]}, {n: params[n] for n in names[2:]}])
+        chunked = list(TrainerWeights(chunks, [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu").local_shards())
+        assert [(n, s) for n, _, s in chunked] == [(n, s) for n, _, s in exported]
+        for (name, tensor, _), (_, ref, _) in zip(chunked, exported, strict=True):
+            assert torch.equal(tensor, ref), name
+
         gathered = list(weights())  # plain iteration: every tensor full, as verl expects
         assert [name for name, _ in gathered] == [*params, "x.0", "x.1"]
         for name, tensor in gathered:
@@ -1154,3 +1171,95 @@ def test_trainer_weights_exports_local_fsdp_shards_or_gathers(tmp_path):
     torch.multiprocessing.start_processes(
         _trainer_weights_worker, args=(2, str(tmp_path / "pg")), nprocs=2, join=True, start_method="fork"
     )
+
+
+def test_chunked_optimizer_step_matches_unchunked_adamw():
+    """Chunked ``optimizer_step`` produces the exact same grad_norm and parameter updates as un-chunked AdamW."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import (
+        TorchTitanTPUEngine,
+        _partition_params_into_chunks,
+    )
+
+    torch.manual_seed(0)
+    names = ["tok_embeddings.weight"] + [f"layers.{i}.wq.weight" for i in range(8)] + ["norm.weight"]
+    params_a = [torch.nn.Parameter(torch.randn(4, 4)) for _ in names]
+    params_b = [torch.nn.Parameter(p.detach().clone()) for p in params_a]
+    for pa, pb in zip(params_a, params_b, strict=True):
+        g = torch.randn_like(pa) * 2.0
+        pa.grad = g.clone()
+        pb.grad = g.clone()
+
+    chunks = _partition_params_into_chunks(params_a, names, layers_per_chunk=4)
+    # 2 four-layer chunks (layers 0..3, layers 4..7) + 1 non-layer chunk (tok_embeddings, norm)
+    assert [len(c) for c in chunks] == [4, 4, 2]
+
+    opt_a = torch.optim.AdamW([{"params": params_a, "param_names": names, "lr": 1e-2, "foreach": True}])
+    opt_b = torch.optim.AdamW([{"params": params_b, "param_names": names, "lr": 1e-2, "foreach": True}])
+
+    ref_norm = torch.nn.utils.clip_grad_norm_(params_b, max_norm=1.0, foreach=False).item()
+    opt_b.step()
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params_a, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt_a], zero_grad=opt_a.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+    )
+    chunked_norm = TorchTitanTPUEngine.optimizer_step(fake_engine)
+    assert chunked_norm == pytest.approx(ref_norm, rel=1e-6, abs=1e-6)
+    for pa, pb in zip(params_a, params_b, strict=True):
+        torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-6)
+        assert pa.grad is None
+    assert opt_a.param_groups[0]["params"] == params_a
+
+
+def test_to_hf_named_param_chunks_converts_one_layer_at_a_time():
+    """``get_per_tensor_param`` converts the state dict to HF names one transformer layer at a time, lazily."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    calls = []
+
+    class _Adapter:
+        def to_hf(self, sd):
+            calls.append(sorted(sd))
+            return {f"hf.{k}": v for k, v in sd.items()}
+
+    engine = SimpleNamespace(checkpointer=SimpleNamespace(sd_adapter=_Adapter()))
+    engine._to_hf_named_params = lambda params: TorchTitanTPUEngine._to_hf_named_params(engine, params)
+    names = [
+        "tok_embeddings.weight",
+        "layers.0.attn.wq.weight",
+        "layers.0.moe.w1",
+        "layers.1.attn.wq.weight",
+        "layers.10.attn.wq.weight",
+        "vision_encoder.layers.0.attn.wq.weight",
+        "norm.weight",
+    ]
+    params = {n: torch.zeros(1) for n in names}
+    chunks = TorchTitanTPUEngine._to_hf_named_param_chunks(engine, params)
+    assert params == {} and calls == []  # nothing is converted before the export asks for it
+    first = next(chunks)
+    assert calls == [["norm.weight", "tok_embeddings.weight"]] and set(first) == {
+        "hf.norm.weight",
+        "hf.tok_embeddings.weight",
+    }
+    rest = list(chunks)
+    assert calls[1:] == [
+        ["layers.0.attn.wq.weight", "layers.0.moe.w1"],
+        ["layers.1.attn.wq.weight"],
+        ["layers.10.attn.wq.weight"],
+        ["vision_encoder.layers.0.attn.wq.weight"],
+    ]
+    assert sum(len(c) for c in rest) == 5
+
+
+def test_document_ids_are_int32_for_the_splash_kernel():
+    """Segment ids derived from (int64) positions are int32, the only dtype the splash kernel takes."""
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import _document_ids
+
+    positions = torch.tensor([0, 1, 2, 0, 1, 0], dtype=torch.int64)
+    segment_ids = _document_ids(positions, None)
+    assert segment_ids.dtype == torch.int32
+    assert segment_ids.tolist() == [0, 0, 0, 1, 1, 2]
+    assert _document_ids(None, None) is None

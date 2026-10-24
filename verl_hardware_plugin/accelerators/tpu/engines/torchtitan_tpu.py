@@ -27,10 +27,11 @@ import dataclasses
 import gc
 import importlib
 import logging
+import math
 import os
 import re
 from contextlib import nullcontext
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 import torch.distributed
@@ -69,6 +70,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     fused_linear_logprobs_tpu,
+    get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
     install_parallel_dims_cache_for_tpu,
@@ -79,6 +81,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     prepare_tpu_loss_inputs,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    torchtitan_model_attn_backend,
     tpu_eager_mode_context,
     tpu_synchronize,
     unwrap_metadata,
@@ -99,6 +102,46 @@ def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Opt
     jagged = torch.nested.nested_tensor_from_jagged(padded.detach().cpu()[:orig_seq_len], cu_seqlens.detach().cpu())
     setattr(jagged, TPU_PADDED_VALUES_ATTR, padded)
     return jagged
+
+
+_LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# FQN prefix of one transformer layer (e.g. ``layers.3`` or ``vision_encoder.layers.3``).
+_LAYER_PREFIX_RE = re.compile(r"^(.*?(?:^|\.)layers\.\d+)\.")
+_OPTIMIZER_STEP_LAYERS_PER_CHUNK = 4
+_OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK = 64
+
+
+def _partition_params_into_chunks(
+    params: list[torch.nn.Parameter],
+    param_names: list[str] | None = None,
+    *,
+    layers_per_chunk: int = _OPTIMIZER_STEP_LAYERS_PER_CHUNK,
+    max_params_per_chunk: int = _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK,
+) -> list[list[torch.nn.Parameter]]:
+    """Group parameters into bounded chunks (by 4-layer block when FQNs are available).
+
+    Under ``DEFER_AND_FUSE``, clipping and stepping all parameters of a large MoE model in a single
+    un-synchronized graph fuses 500+ parameter updates into one giant HLO module whose live input/output
+    temporaries exceed TPU HBM (``CompileTimeHbmOom``). Grouping by 4-layer cycle keeps each HLO module
+    small and gives identical parameter shapes across repeating hybrid layer blocks for XLA cache hits.
+    """
+    if not params:
+        return []
+    if param_names is None or len(param_names) != len(params):
+        return [params[i : i + max_params_per_chunk] for i in range(0, len(params), max_params_per_chunk)]
+
+    buckets: dict[tuple[int, int], list[torch.nn.Parameter]] = {}
+    for p, name in zip(params, param_names, strict=True):
+        m = _LAYER_FQN_RE.search(name)
+        key = (0, int(m.group(1)) // layers_per_chunk) if m is not None else (1, 0)
+        buckets.setdefault(key, []).append(p)
+
+    chunks: list[list[torch.nn.Parameter]] = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        for i in range(0, len(bucket), max_params_per_chunk):
+            chunks.append(bucket[i : i + max_params_per_chunk])
+    return chunks
 
 
 class TPUEngineEvalModeCtx(BaseEngineCtx):
@@ -196,10 +239,10 @@ class TorchTitanTPUEngine(BaseEngine):
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
         # Get ModelSpec from model registry
-        model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
+        model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
         model_spec = model_module.model_registry(
             torchtitan_flavor,
-            attn_backend=self.engine_config.attn_type,
+            attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
             seq_len=self.engine_config.max_seq_len,
             **({} if self.engine_config.fuse_qkv else {"fuse_qkv": False}),
         )
@@ -455,7 +498,15 @@ class TorchTitanTPUEngine(BaseEngine):
         """Free torchtitan ``ModelWrapper.cached_state_dict`` after the initial HF load."""
         from torchtitan.components.checkpointer import MODEL
 
-        self.checkpointer.states[MODEL].cached_state_dict = {}
+        states = getattr(self.checkpointer, "states", {})
+        wrapper = states.get(MODEL)
+        if wrapper is not None and hasattr(wrapper, "cached_state_dict"):
+            wrapper.cached_state_dict = {}
+        if self.engine_config.forward_only:
+            # Forward-only (reference) engines never save a checkpoint: drop the optimizer / lr-scheduler states.
+            for k in list(states):
+                if k != MODEL:
+                    states.pop(k, None)
 
     def initialize(self):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
@@ -469,11 +520,21 @@ class TorchTitanTPUEngine(BaseEngine):
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
         else:
+            # torchtitan's trainer builds an optimizer for the reference model too; release it and every
+            # reference to it, so the HBM of its (lazily created) state is never held.
+            if getattr(self.trainer, "optimizers", None) is not None:
+                for opt in getattr(self.trainer.optimizers, "optimizers", []):
+                    opt.state.clear()
+                    opt.param_groups.clear()
             self.optimizer = None
             self.lr_scheduler = None
             for part in self.module:
                 for p in part.parameters():
                     p.requires_grad_(False)
+            self.trainer.optimizers = None
+            self.trainer.lr_schedulers = None
+            if hasattr(self.trainer, "metrics_processor"):
+                self.trainer.metrics_processor.optimizers = None
 
         self.to(
             device="cpu",
@@ -602,27 +663,105 @@ class TorchTitanTPUEngine(BaseEngine):
         """Zero gradients."""
         self.optimizer.zero_grad()
 
+    @torch.no_grad()
     def optimizer_step(self):
-        """Clip gradients using the per-tensor norm path (``foreach=False``) and step the optimizer."""
-        from torchtitan.distributed import utils as dist_utils
-
+        """Clip gradients and step the optimizer in bounded layer chunks under TPU SPMD execution."""
         with tpu_eager_mode_context(self._tpu_eager_mode):
-            grad_norm = dist_utils.clip_grad_norm_(
-                [p for m in self.module for p in m.parameters()],
-                self.config.training.max_norm,
-                foreach=False,
-                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
-                ep_enabled=self.parallel_dims.ep_enabled,
-            )
+            name_by_id = {id(p): name for m in self.module for name, p in m.named_parameters()}
+            opt_group_chunks: list[
+                tuple[
+                    Any,
+                    list[tuple[dict[str, Any], list[torch.nn.Parameter], list[list[torch.nn.Parameter]]]],
+                ]
+            ] = []
+            chunk_norms: list[torch.Tensor] = []
 
-            grad_norm_val = grad_norm.item()
-            tpu_synchronize(wait=True)
-            if not torch.isfinite(grad_norm):
-                logger.warning("grad_norm is not finite (%s); skipping this optimizer step", grad_norm)
-                self.optimizer.zero_grad()
+            for opt in self.optimizer.optimizers:
+                group_entries = []
+                for group in opt.param_groups:
+                    orig_params = list(group["params"])
+                    param_names = group.get("param_names")
+                    if param_names is None or len(param_names) != len(orig_params):
+                        param_names = [name_by_id.get(id(p), "") for p in orig_params]
+                    chunks = _partition_params_into_chunks(orig_params, param_names)
+                    group_entries.append((group, orig_params, chunks))
+                    for chunk_params in chunks:
+                        grads = [p.grad for p in chunk_params if p.grad is not None]
+                        if not grads:
+                            continue
+                        if self.parallel_dims.ep_enabled and any(isinstance(g, DTensor) for g in grads):
+                            ep_grads = [
+                                g
+                                for g in grads
+                                if isinstance(g, DTensor) and "ep" in (g.device_mesh.mesh_dim_names or ())
+                            ]
+                            non_ep_grads = [
+                                g
+                                for g in grads
+                                if not (isinstance(g, DTensor) and "ep" in (g.device_mesh.mesh_dim_names or ()))
+                            ]
+                            grad_sublists = [g_list for g_list in (ep_grads, non_ep_grads) if g_list]
+                        else:
+                            grad_sublists = [grads]
+                        for sub_grads in grad_sublists:
+                            sub_norm = torch.nn.utils.get_total_norm(
+                                sub_grads, norm_type=2.0, error_if_nonfinite=False, foreach=False
+                            )
+                            if isinstance(sub_norm, DTensor):
+                                sub_norm = sub_norm.full_tensor()
+                            tpu_synchronize(sub_norm, wait=False)
+                            chunk_norms.append(sub_norm)
+                opt_group_chunks.append((opt, group_entries))
+
+            if chunk_norms:
+                grad_norm = torch.nn.utils.get_total_norm(
+                    chunk_norms, norm_type=2.0, error_if_nonfinite=False, foreach=False
+                )
             else:
-                self.optimizer.step()
-            tpu_synchronize(wait=True)
+                grad_norm = torch.tensor(0.0, device=get_device_name())
+
+            pp_mesh = self.parallel_dims.get_optional_mesh("pp")
+            if pp_mesh is not None:
+                grad_norm = grad_norm**2.0
+                torch.distributed.all_reduce(grad_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
+                grad_norm = grad_norm**0.5
+
+            tpu_synchronize(grad_norm, wait=True)
+            grad_norm_val = grad_norm.item()
+
+            if not math.isfinite(grad_norm_val):
+                logger.warning("grad_norm is not finite (%s); skipping this optimizer step", grad_norm_val)
+                self.optimizer.zero_grad()
+                if grad_norm.device.type == "tpu":
+                    tpu_synchronize(wait=True)
+                return grad_norm_val
+
+            for hook in getattr(self.optimizer, "_optimizer_step_pre_hooks", {}).values():
+                hook(self.optimizer, (), {})
+
+            max_norm = self.config.training.max_norm
+            for opt, group_entries in opt_group_chunks:
+                for group, _, _ in group_entries:
+                    group["params"] = []
+                try:
+                    for group, _, chunks in group_entries:
+                        for chunk_params in chunks:
+                            if not any(p.grad is not None for p in chunk_params):
+                                continue
+                            torch.nn.utils.clip_grads_with_norm_(chunk_params, max_norm, grad_norm, foreach=False)
+                            group["params"] = chunk_params
+                            opt.step()
+                            if grad_norm.device.type == "tpu":
+                                tpu_synchronize(wait=True)
+                            for p in chunk_params:
+                                p.grad = None
+                            group["params"] = []
+                finally:
+                    for group, orig_params, _ in group_entries:
+                        group["params"] = orig_params
+
+            for hook in getattr(self.optimizer, "_optimizer_step_post_hooks", {}).values():
+                hook(self.optimizer, (), {})
 
             return grad_norm_val
 
@@ -732,6 +871,20 @@ class TorchTitanTPUEngine(BaseEngine):
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
         return params
 
+    def _to_hf_named_param_chunks(self, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """``_to_hf_named_params`` of ``params``, lazily, one transformer layer (and the non-layer rest) at a time.
+
+        State-dict adapters fuse tensors within a layer, e.g. Qwen3.5's MoE ``w1`` / ``w3`` into ``gate_up_proj`` and
+        its GatedDeltaNet q/k/v into ``in_proj_qkv``, which materializes new tensors. Converting each layer only when
+        the export reaches it keeps one layer's fused copies alive instead of the whole model's.
+        """
+        groups: dict[str, dict[str, Any]] = {}
+        for name, param in params.items():
+            m = _LAYER_PREFIX_RE.match(name)
+            groups.setdefault(m.group(1) if m else "", {})[name] = param
+        params.clear()
+        return (self._to_hf_named_params(groups.pop(key)) for key in list(groups))
+
     def _expert_stack_slots(self, name: str, param: Any) -> Optional[list[tuple[str, tuple]]]:
         """If ``name`` is a fused expert stack, enumerate ALL its experts' HF tensors, else ``None``."""
         sd_adapter = self.checkpointer.sd_adapter
@@ -771,7 +924,7 @@ class TorchTitanTPUEngine(BaseEngine):
             if slots is not None:
                 stacks[name] = slots
         expert_stacks = [(params[name], slots) for name, slots in stacks.items()]
-        dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
+        dense = self._to_hf_named_param_chunks({k: v for k, v in params.items() if k not in stacks})
         params.clear()
 
         # q/k/v_proj arrive here replicated, but not for free: torchtitan's FusedQKVLinear (fuse_qkv=True) keeps

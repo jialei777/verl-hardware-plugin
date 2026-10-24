@@ -53,13 +53,50 @@ _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
     "llama": "llama3",
     "deepseek_v3": "deepseek_v3",
     "gpt_oss": "gpt_oss",
+    # Qwen3.5 (hybrid GatedDeltaNet + full attention, dense or MoE). The multimodal ``qwen3_5[_moe]``
+    # configs keep the language model in ``text_config``; only the text model is trained.
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
 }
+
+# torchtitan model packages that are not ``torchtitan.models.<name>``. Upstream ``torchtitan.models.qwen3_5``
+# runs its GatedDeltaNet with CUDA/Triton kernels; the TPU package swaps in XLA GatedDeltaNet kernels that restart
+# the causal conv1d and the recurrent state at packed-document boundaries (from ``positions``), uses
+# document-masked attention and drops the vision encoder.
+_TORCHTITAN_MODEL_MODULES = {
+    "qwen3_5": "torchtitan.experiments.tpu.qwen3_5",
+}
+
+# torchtitan models whose ``model_registry`` only accepts ``attn_backend="sdpa"``. Their inner attention is
+# replaced by ``TPUSplashAttention`` (or ``TPUVarlenAttention``) after the model is built anyway.
+_SDPA_ONLY_TORCHTITAN_MODELS = frozenset({"qwen3_5"})
 
 # torchtitan TPU recipes whose ``parallelize_fn`` shards with SimpleFSDP when ``parallelism.use_simple_fsdp`` is set.
 _TPU_SIMPLE_FSDP_RECIPES = {
     "qwen3": ("torchtitan.experiments.tpu.qwen3.infra.parallelize", "parallelize_qwen3"),
     "llama3": ("torchtitan.experiments.tpu.llama3.infra.parallelize", "parallelize_llama"),
+    "qwen3_5": ("torchtitan.experiments.tpu.qwen3_5.infra.parallelize", "parallelize_qwen3_5"),
 }
+
+
+def get_torchtitan_model_module_name(torchtitan_name: str) -> str:
+    """Python package holding ``model_registry`` (and the flavor configs) of torchtitan model ``torchtitan_name``."""
+    return _TORCHTITAN_MODEL_MODULES.get(torchtitan_name, f"torchtitan.models.{torchtitan_name}")
+
+
+def torchtitan_model_attn_backend(torchtitan_name: str, attn_type: str) -> str:
+    """``attn_backend`` to build torchtitan model ``torchtitan_name`` with, given the engine's ``attn_type``."""
+    return "sdpa" if torchtitan_name in _SDPA_ONLY_TORCHTITAN_MODELS else attn_type
+
+
+def get_text_config(hf_config: Any) -> Any:
+    """The language-model config of ``hf_config``: ``text_config`` for multimodal configs, else ``hf_config``."""
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None and getattr(text_config, "hidden_size", None) is not None:
+        return text_config
+    return hf_config
 
 
 def create_noop_dataloader_config() -> Any:
@@ -122,26 +159,33 @@ def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
 
     # Import the model package and use model_registry to build each flavor's config.
     # model_registry has sensible defaults for all optional params (attn_backend, etc.).
-    model_module = importlib.import_module(f"torchtitan.models.{name}")
+    module_name = get_torchtitan_model_module_name(name)
+    model_module = importlib.import_module(module_name)
     model_registry = model_module.model_registry
 
     # The configs dict name isn't derivable from the model name
-    # (e.g. gpt_oss -> gptoss_configs), so we find it by convention.
+    # (e.g. gpt_oss -> gptoss_configs), so we find it by convention: ``<name>_configs`` if the package
+    # has it (the TPU qwen3_5 package also imports other ``*_configs`` dicts), else the first dict attribute
+    # ending with ``_configs``.
     flavor_names = None
-    for attr, obj in vars(model_module).items():
-        if attr.endswith("_configs") and isinstance(obj, dict):
-            flavor_names = list(obj.keys())
-            break
+    preferred = getattr(model_module, f"{name}_configs", None)
+    if isinstance(preferred, dict):
+        flavor_names = list(preferred.keys())
+    else:
+        for attr, obj in vars(model_module).items():
+            if attr.endswith("_configs") and isinstance(obj, dict):
+                flavor_names = list(obj.keys())
+                break
 
     if flavor_names is None:
         raise ValueError(
-            f"Could not find model configs dict in torchtitan.models.{name}. "
-            f"Expected a dict attribute ending with '_configs'."
+            f"Could not find model configs dict in {module_name}. Expected a dict attribute ending with '_configs'."
         )
 
-    hidden_size = hf_config.hidden_size
-    num_layers = hf_config.num_hidden_layers
-    vocab_size = hf_config.vocab_size
+    text_config = get_text_config(hf_config)
+    hidden_size = text_config.hidden_size
+    num_layers = text_config.num_hidden_layers
+    vocab_size = text_config.vocab_size
 
     for flavor_name in flavor_names:
         cfg = model_registry(flavor_name).model
@@ -829,7 +873,8 @@ def _document_ids(positions: Optional[torch.Tensor], segment_ids: Optional[torch
     """Per-token document ids: TorchTitan's ``Decoder`` passes ``segment_ids``, else documents restart at position 0."""
     if segment_ids is None and positions is not None:
         segment_ids = torch.cumsum((positions == 0).int(), dim=-1) - 1  # torchtitan's segment_ids_from_positions
-    return segment_ids
+    # The splash kernel takes int32 segment ids; cumsum (and verl's position ids) are int64.
+    return segment_ids.to(torch.int32) if segment_ids is not None else None
 
 
 class TPUVarlenAttention(torch.nn.Module):

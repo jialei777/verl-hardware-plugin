@@ -52,11 +52,12 @@ def _ensure_torch_tpu() -> bool:
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
 
 # Environment variables a recipe exports in the shell that runs the driver and that TPU worker processes
-# read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, ``VERL_RAIDEN_*``). Ray
-# workers start from the raylet's environment, not the driver's, so the platform names them in the job's
-# runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
+# read: the libtpu / XLA compiler flags, the plugin's own knobs (``VERL_TPU_*``, ``VERL_RAIDEN_*``) and
+# vllm-torchtpu's (``TPU_VLLM_*``). Ray workers start from the raylet's environment, not the driver's, so the
+# platform names them in the job's runtime_env for them to reach the trainer workers, the rollout servers and
+# vLLM's engine workers.
 TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
-TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_", "VERL_RAIDEN_")
+TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_", "VERL_RAIDEN_", "TPU_VLLM_")
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471

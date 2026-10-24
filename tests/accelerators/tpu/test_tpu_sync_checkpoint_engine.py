@@ -1317,6 +1317,36 @@ def test_sampler_sharding_gqa_kv_heads(tpu_raiden):
     assert shard(k, [1024, 5120], 32, 13, None) == (["tp", ""], [32, 5120], [32, 1], [], 1)
 
 
+def test_sampler_sharding_load_weights_mode(tpu_raiden):
+    """load_weights mode shards >=2D tensors on dim 0 and keeps 1-D tensors replicated."""
+
+    def shard(name, shape, tp):
+        s = tpu_raiden._sampler_sharding(name, shape, tp, install_mode="load_weights")
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.replicas
+
+    assert shard(LAYER + "linear_attn.norm.weight", [128], 8) == ([""], [128], [1], 8)
+    assert shard(LAYER + "mlp.experts.down_proj", [256, 2048, 512], 8) == (
+        ["tp", "", ""],
+        [32, 2048, 512],
+        [8, 1, 1],
+        1,
+    )
+    # Row-parallel names are still split on dim 0: the install all-gathers them before vLLM's loaders run.
+    assert shard(LAYER + "self_attn.o_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8], [2, 1], 1)
+
+
+def test_resolve_install_mode(tpu_raiden):
+    """``auto`` picks vLLM's loaders for hybrid (linear attention) or MoE models, ``copy`` for dense ones."""
+    dense = {LAYER + "self_attn.q_proj.weight": [16, 8], "model.norm.weight": [8]}
+    moe = {**dense, LAYER + "mlp.experts.down_proj": [4, 8, 2]}
+    model = object()
+    assert tpu_raiden._resolve_install_mode("auto", model, dense) == "copy"
+    assert tpu_raiden._resolve_install_mode("auto", model, moe) == "load_weights"
+    assert tpu_raiden._resolve_install_mode("load_weights", model, dense) == "load_weights"
+    with pytest.raises(ValueError, match="install_mode"):
+        tpu_raiden._resolve_install_mode("bogus", model, dense)
+
+
 @pytest.mark.parametrize("verify_parity", [False, True])
 def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden, caplog, verify_parity):
     """TP=4 with 2 KV heads: each rank receives one whole KV head, and the parity check counts each head once."""

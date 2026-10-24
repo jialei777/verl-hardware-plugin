@@ -315,9 +315,19 @@ def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
     # Pod type wins over the chip count: this job holds 8 of a 16-chip slice.
     assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-16")[0] == "4,4,1"
 
-    # The env var wins over everything, including an unknown chip count.
+    # The env var wins over everything, including an unknown chip count, when its chip count matches total_chips.
     with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "2,3,1"}):
         assert resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)[0] == "2,3,1"
+
+    # When TaskRunner lands on a different TPU slice (e.g. a 4-chip v6e-4 pod with TORCH_TPU_TOPOLOGY=2,2,1),
+    # that pod's webhook variable must not bleed into an 8-chip v6e-8 pool's topology.
+    with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "2,2,1"}):
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-8") == (
+            "2,4,1",
+            "2,4,1",
+            "1,1,1",
+            "4",
+        )
 
     with mock.patch.dict(os.environ, {"VERL_TPU_CHIPS_PER_HOST": "2"}):
         assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2)[3] == "2"

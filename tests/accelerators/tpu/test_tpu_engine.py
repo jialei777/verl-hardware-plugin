@@ -22,9 +22,9 @@ from verl.workers.config import ActorConfig, TorchtitanEngineConfig
 from verl.workers.utils.losses import ppo_loss, sft_loss
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
-    TPUSplashAttention,
     TPUVarlenAttention,
     bucket_length,
+    compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
@@ -34,7 +34,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     resolve_tpu_torchtitan_options,
-    splash_block_size_for,
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
@@ -54,12 +53,14 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
 
 
 def _fake_torchtitan_modules() -> dict[str, types.ModuleType]:
-    """Stand-ins for the two torchtitan modules these CPU tests touch, for ``mock.patch.dict(sys.modules, ...)``.
+    """Stand-ins for the torchtitan modules these CPU tests touch, for ``mock.patch.dict(sys.modules, ...)``.
 
     The TPU engine imports google-pytorch/torchtitan lazily, and this repo's CPU test workflow does not install it.
     """
     attention = types.ModuleType("torchtitan.models.common.attention")
     attention.VarlenInnerAttention = type("VarlenInnerAttention", (torch.nn.Module,), {})  # type: ignore[attr-defined]
+    # Same as torchtitan's: documents restart at position 0.
+    attention.segment_ids_from_positions = lambda positions: (torch.cumsum((positions == 0).int(), dim=-1) - 1).int()  # type: ignore[attr-defined]
 
     simple_fsdp = types.ModuleType("torchtitan.experiments.graph_trainer.simple_fsdp")
     simple_fsdp._active_parametrization = True  # type: ignore[attr-defined]
@@ -76,10 +77,38 @@ def _fake_torchtitan_modules() -> dict[str, types.ModuleType]:
     simple_fsdp.disable_active_parametrization = disable_active_parametrization  # type: ignore[attr-defined]
     graph_trainer = types.ModuleType("torchtitan.experiments.graph_trainer")
     graph_trainer.simple_fsdp = simple_fsdp  # type: ignore[attr-defined]
+
+    class SplashAttention(torch.nn.Module):
+        """Stand-in for torchtitan's TPU SplashAttention: on CPU it always uses the fallback."""
+
+        def __init__(self, is_causal=True, local_window_size=None, original_module=None, auto_block_size=False):
+            super().__init__()
+            self.is_causal = is_causal
+            self.local_window_size = local_window_size
+            self.original_module = original_module
+            self.auto_block_size = auto_block_size
+
+        def forward(self, q, k, v, **kwargs):
+            return self.original_module(q, k, v, **kwargs)
+
+    splash_attention = types.ModuleType("torchtitan.experiments.tpu.kernels.splash_attention")
+    splash_attention.SplashAttention = SplashAttention  # type: ignore[attr-defined]
+
+    class KVAllGatherCPInnerAttention(torch.nn.Module):
+        def set_local_attention(self, fn):
+            self._local_attn_override = fn
+
+        def local_forward(self, q, k, v, **kwargs):
+            return q
+
+    cp_attention = types.ModuleType("torchtitan.experiments.tpu.cp_attention")
+    cp_attention.KVAllGatherCPInnerAttention = KVAllGatherCPInnerAttention  # type: ignore[attr-defined]
     return {
         attention.__name__: attention,
         graph_trainer.__name__: graph_trainer,
         simple_fsdp.__name__: simple_fsdp,
+        splash_attention.__name__: splash_attention,
+        cp_attention.__name__: cp_attention,
     }
 
 
@@ -132,7 +161,8 @@ def test_tpu_varlen_attention_masks_documents_and_padding():
     q, k, v = torch.randn(3, 8, 4, 16).unbind(0)  # [T=8, H=4, D=16], packed docs of lengths 3 and 2 + 3 pads
     k, v = k[:, :2], v[:, :2]  # GQA: 2 kv heads
     positions = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0])
-    out = TPUVarlenAttention()(q, k, v, positions=positions)
+    with mock.patch.dict(sys.modules, _fake_torchtitan_modules()):
+        out = TPUVarlenAttention()(q, k, v, positions=positions)
     assert out.shape == (8, 4, 16)
 
     def reference(lo, hi):  # causal attention restricted to tokens [lo, hi)
@@ -143,15 +173,8 @@ def test_tpu_varlen_attention_masks_documents_and_padding():
         torch.testing.assert_close(out[lo:hi], reference(lo, hi))
     with pytest.raises(NotImplementedError, match="out_transform"):
         TPUVarlenAttention()(q, k, v, positions=positions, out_transform=lambda o, lse: o)
-
-
-def test_splash_block_size_for():
-    assert splash_block_size_for(512) == 512
-    assert splash_block_size_for(1024) == 512
-    assert splash_block_size_for(768) == 256
-    assert splash_block_size_for(256) == 256
-    assert splash_block_size_for(384) == 128
-    assert splash_block_size_for(64) == 0
+    with pytest.raises(ValueError, match="local_forward"):  # Q shorter than K/V belongs to KV all-gather CP
+        TPUVarlenAttention()(q[:4], k, v)
 
 
 def test_install_tpu_attention_splash_with_dense_cpu_fallback():
@@ -166,20 +189,27 @@ def test_install_tpu_attention_splash_with_dense_cpu_fallback():
             self.inner_attention = _DummyInnerAttn()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    assert install_tpu_attention([model], use_splash=True) == 2
-    splash = model[0].inner_attention
-    assert isinstance(splash, TPUSplashAttention)
-    assert splash.local_window_size == 256
-    assert isinstance(splash.fallback, TPUVarlenAttention) and splash.fallback.local_window_size == 256
-    assert install_tpu_attention([model], use_splash=True) == 0  # already installed
+    fake_modules = _fake_torchtitan_modules()
+    SplashAttention = fake_modules["torchtitan.experiments.tpu.kernels.splash_attention"].SplashAttention
+    with mock.patch.dict(sys.modules, fake_modules):
+        assert install_tpu_attention([model], use_splash=True) == 2
+        # torchtitan's SplashAttention, with per-call block sizes for verl's bucketed lengths and the dense fallback.
+        splash = model[0].inner_attention
+        assert isinstance(splash, SplashAttention)
+        assert splash.auto_block_size and splash.local_window_size == 256
+        assert isinstance(splash.original_module, TPUVarlenAttention)
+        assert splash.original_module.local_window_size == 256
+        assert install_tpu_attention([model], use_splash=True) == 0  # already installed
 
-    # On CPU the splash module runs its dense fallback.
-    q = torch.randn(256, 2, 4)
-    positions = torch.cat([torch.arange(100), torch.arange(156)])
-    torch.testing.assert_close(splash(q, q, q, positions=positions), splash.fallback(q, q, q, positions=positions))
+        # On CPU the splash module runs its dense fallback.
+        q = torch.randn(256, 2, 4)
+        positions = torch.cat([torch.arange(100), torch.arange(156)])
+        torch.testing.assert_close(
+            splash(q, q, q, positions=positions), splash.original_module(q, q, q, positions=positions)
+        )
 
-    with pytest.raises(ValueError, match="inner_attention"):
-        install_tpu_attention([torch.nn.Linear(2, 2)], use_splash=True)
+        with pytest.raises(ValueError, match="inner_attention"):
+            install_tpu_attention([torch.nn.Linear(2, 2)], use_splash=True)
 
 
 def test_configure_torch_compile_for_tpu():
@@ -193,6 +223,7 @@ def test_configure_torch_compile_for_tpu():
 def test_resolve_tpu_torchtitan_options_and_config_extension():
     extend_torchtitan_engine_config()
     cfg_compiled = TorchtitanEngineConfig(use_torch_compile=True, attn_type="varlen")
+    assert cfg_compiled.context_parallel_strategy == "all_gather"
     assert resolve_tpu_torchtitan_options(cfg_compiled) == (True, True, "DEFER_AND_FUSE")
 
     cfg_eager = TorchtitanEngineConfig(use_torch_compile=False, attn_type="varlen")
@@ -236,6 +267,19 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
     with pytest.raises(ValueError, match="use_simple_fsdp supports FSDP/HSDP"):
         resolve_tpu_torchtitan_options(cfg_pp)
 
+    # CP: splash defaults on (CP inner attentions run it as their local attention); SimpleFSDP shards over (dp, cp).
+    cfg_cp = SimpleNamespace(
+        use_torch_compile=False,
+        use_splash_attention=None,
+        use_simple_fsdp=True,
+        tpu_eager_mode="DEFER_AND_FUSE",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        context_parallel_size=2,
+        expert_parallel_size=1,
+    )
+    assert resolve_tpu_torchtitan_options(cfg_cp) == (True, True, "DEFER_AND_FUSE")
+
 
 def test_install_tpu_attention_dense():
     class _DummyAttnBlock(torch.nn.Module):
@@ -271,9 +315,19 @@ def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
     # Pod type wins over the chip count: this job holds 8 of a 16-chip slice.
     assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-16")[0] == "4,4,1"
 
-    # The env var wins over everything, including an unknown chip count.
+    # The env var wins over everything, including an unknown chip count, when its chip count matches total_chips.
     with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "2,3,1"}):
         assert resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)[0] == "2,3,1"
+
+    # When TaskRunner lands on a different TPU slice (e.g. a 4-chip v6e-4 pod with TORCH_TPU_TOPOLOGY=2,2,1),
+    # that pod's webhook variable must not bleed into an 8-chip v6e-8 pool's topology.
+    with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "2,2,1"}):
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-8") == (
+            "2,4,1",
+            "2,4,1",
+            "1,1,1",
+            "4",
+        )
 
     with mock.patch.dict(os.environ, {"VERL_TPU_CHIPS_PER_HOST": "2"}):
         assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2)[3] == "2"
@@ -877,7 +931,7 @@ def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pa
     fused_values = torch.full((total,), -0.25)
 
     engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
-    engine.parallel_dims = SimpleNamespace(tp_enabled=False)
+    engine.parallel_dims = SimpleNamespace(tp_enabled=False, cp_enabled=False)
     engine.engine_config = SimpleNamespace(entropy_checkpointing=False, entropy_from_logits_with_chunking=False)
     engine.compute_entropy_from_logits = verl_F.entropy_from_logits
 
@@ -1154,3 +1208,248 @@ def test_trainer_weights_exports_local_fsdp_shards_or_gathers(tmp_path):
     torch.multiprocessing.start_processes(
         _trainer_weights_worker, args=(2, str(tmp_path / "pg")), nprocs=2, join=True, start_method="fork"
     )
+
+
+def test_install_tpu_attention_keeps_cp_wrappers():
+    """CP inner attentions keep their communication and take the TPU attention as their local attention."""
+
+    class _DummyCPInnerAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.window_size = (256, 0)
+
+        def set_local_attention(self, fn):
+            self._local_attn_override = fn
+
+    class _DummyAttnBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner_attention = _DummyCPInnerAttn()
+
+    fake_modules = _fake_torchtitan_modules()
+    SplashAttention = fake_modules["torchtitan.experiments.tpu.kernels.splash_attention"].SplashAttention
+    model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
+    with mock.patch.dict(sys.modules, fake_modules):
+        assert install_tpu_attention([model], use_splash=True) == 2
+        assert isinstance(model[0].inner_attention, _DummyCPInnerAttn)
+        local = model[0].inner_attention._local_attn_override
+        assert isinstance(local, SplashAttention) and local.local_window_size == 256
+        assert isinstance(local.original_module, TPUVarlenAttention)
+        assert install_tpu_attention([model], use_splash=True) == 0
+
+    model_dense = torch.nn.Sequential(_DummyAttnBlock())
+    assert install_tpu_attention([model_dense], use_splash=False) == 1
+    assert isinstance(model_dense[0].inner_attention._local_attn_override, TPUVarlenAttention)
+    assert install_tpu_attention([model_dense], use_splash=False) == 0
+
+
+def test_kv_all_gather_cp_keeps_torchtitan_reference_attention():
+    """KV all-gather CP uses torchtitan's local_forward (Q shorter than K/V), not TPUVarlenAttention."""
+    fake_modules = _fake_torchtitan_modules()
+    KVAllGatherCP = fake_modules["torchtitan.experiments.tpu.cp_attention"].KVAllGatherCPInnerAttention
+
+    class _AttnBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner_attention = KVAllGatherCP()
+
+    model = torch.nn.Sequential(_AttnBlock())
+    with mock.patch.dict(sys.modules, fake_modules):
+        # Dense path: nothing to replace, the CP inner attention keeps its own local_forward.
+        assert install_tpu_attention([model], use_splash=False) == 0
+        assert not hasattr(model[0].inner_attention, "_local_attn_override")
+        # Splash path: the kernel falls back to torchtitan's local_forward.
+        assert install_tpu_attention([model], use_splash=True) == 1
+    assert model[0].inner_attention._local_attn_override.original_module == model[0].inner_attention.local_forward
+
+
+def test_cp_bucket_size_and_token_count():
+    # Sequence bucket size aligns to 2 * cp_size when needed
+    cfg_cp3 = SimpleNamespace(pad_to_length=True, pad_to_length_bucket=256, context_parallel_size=3)
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VERL_TPU_SEQ_BUCKET_SIZE", None)
+        assert get_tpu_seq_bucket_size(cfg_cp3) == 768
+
+    # Under all_gather CP, bucket aligns to 128 * cp_size so local Q shard (S // cp_size) is a multiple of 128
+    cfg_ag_cp4 = SimpleNamespace(
+        pad_to_length=False,
+        pad_to_length_bucket=256,
+        context_parallel_size=4,
+        context_parallel_strategy="all_gather",
+    )
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VERL_TPU_SEQ_BUCKET_SIZE", None)
+        assert get_tpu_seq_bucket_size(cfg_ag_cp4) == 512
+
+    # compute_global_batch_num_tokens divides by tp_size * cp_size when distributed is initialized
+    data = TensorDict({"loss_mask": torch.ones(4, 10, dtype=torch.int64)}, batch_size=[4])
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.all_reduce", side_effect=lambda t, op=None: t.mul_(4)),
+    ):
+        assert compute_global_batch_num_tokens(data, None, tp_size=1, cp_size=2) == 80
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_lb"),
+    [("all_gather", "headtail"), ("ulysses", None)],
+)
+def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected_lb):
+    """Sets SPMD backend + load balancer, applies ContextParallelTransform, validates, patches."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    calls = []
+
+    class _SDPA:
+        pass
+
+    class _CPSDPA:
+        pass
+
+    class _ContextParallelTransform:
+        def __init__(self, inner_attention):
+            self.inner_attention = inner_attention
+
+    def _transform_model_config_(model, transforms):
+        calls.append(("transform", [t.inner_attention for t in transforms]))
+        return model
+
+    fake_transform = SimpleNamespace(
+        ContextParallelTransform=_ContextParallelTransform, transform_model_config_=_transform_model_config_
+    )
+    fake_cp_attention = SimpleNamespace(
+        install_tpu_cp_patches=lambda: calls.append("patches"),
+        tpu_cp_inner_attention=lambda base, strat: calls.append(("inner", base, strat)) or _CPSDPA,
+        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
+        validate_tpu_context_parallel=lambda model, parallelism: calls.append(
+            ("validate", parallelism.spmd_backend, parallelism.context_parallel_load_balancer)
+        ),
+    )
+    engine = SimpleNamespace(
+        engine_config=SimpleNamespace(context_parallel_strategy=strategy), _use_splash_attention=True
+    )
+    parallelism = SimpleNamespace(
+        context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer="headtail"
+    )
+    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=_SDPA))
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torchtitan": SimpleNamespace(),
+            "torchtitan.config": SimpleNamespace(transform=fake_transform),
+            "torchtitan.config.transform": fake_transform,
+            "torchtitan.experiments": SimpleNamespace(),
+            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+        },
+    ):
+        TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+
+    assert parallelism.spmd_backend == "spmd_types"
+    assert parallelism.context_parallel_load_balancer == expected_lb
+    assert calls == [
+        ("inner", _SDPA, strategy),
+        ("transform", [_CPSDPA]),
+        ("validate", "spmd_types", expected_lb),
+        "patches",
+    ]
+
+
+def test_enable_context_parallel_all_gather_requires_splash():
+    """KV all-gather CP fails before the model is built when splash is off; torchtitan would refuse it on TPU."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    fake_transform = SimpleNamespace(
+        ContextParallelTransform=lambda inner_attention: inner_attention,
+        transform_model_config_=lambda model, transforms: model,
+    )
+    fake_cp_attention = SimpleNamespace(
+        install_tpu_cp_patches=lambda: None,
+        tpu_cp_inner_attention=lambda base, strat: base,
+        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
+        validate_tpu_context_parallel=lambda model, parallelism: None,
+    )
+    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object))
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torchtitan": SimpleNamespace(),
+            "torchtitan.config": SimpleNamespace(transform=fake_transform),
+            "torchtitan.config.transform": fake_transform,
+            "torchtitan.experiments": SimpleNamespace(),
+            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+        },
+    ):
+        for strategy, raises in (("all_gather", True), ("ulysses", False)):
+            engine = SimpleNamespace(
+                engine_config=SimpleNamespace(context_parallel_strategy=strategy), _use_splash_attention=False
+            )
+            parallelism = SimpleNamespace(
+                context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
+            )
+            if raises:
+                with pytest.raises(ValueError, match="needs use_splash_attention=True"):
+                    TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+                assert parallelism.spmd_backend == "partial_dtensor"
+            else:
+                TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+                assert parallelism.spmd_backend == "spmd_types"
+
+
+def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    class _CPAttention:
+        @classmethod
+        def cp_shard(cls, input_dict, input_shardings, cp_mesh, load_balancer_type, ptrr_mask_key):
+            return input_dict
+
+    def _engine(inner_attention):
+        model = SimpleNamespace(first_full_attention_backend=inner_attention)
+        return SimpleNamespace(config=SimpleNamespace(model_spec=SimpleNamespace(model=model)))
+
+    cp_inner = SimpleNamespace(_owner=_CPAttention)
+    assert TorchTitanTPUEngine._cp_attention_owner(_engine(cp_inner)) is _CPAttention
+
+    # A non-CP inner attention means _enable_context_parallel did not run: fail loudly
+    # instead of falling back to sharding that ignores the CP strategy.
+    plain_inner = SimpleNamespace(_owner=object)
+    with pytest.raises(RuntimeError, match="has no cp_shard"):
+        TorchTitanTPUEngine._cp_attention_owner(_engine(plain_inner))
+
+
+def test_optimizer_step_synchronizes_clip_and_step_in_lockstep(monkeypatch):
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    events = []
+    fake_dist_utils = SimpleNamespace(
+        clip_grad_norm_=lambda *args, **kwargs: (events.append("clip"), torch.tensor(1.5))[1]
+    )
+    monkeypatch.setitem(sys.modules, "torchtitan", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed", SimpleNamespace(utils=fake_dist_utils))
+    monkeypatch.setitem(sys.modules, "torchtitan.distributed.utils", fake_dist_utils)
+    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: events.append(("sync", kwargs)))
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine._tpu_eager_mode = "DEFER_AND_FUSE"
+    engine.module = [torch.nn.Linear(2, 2)]
+    engine.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
+    engine.parallel_dims = SimpleNamespace(
+        get_optional_mesh=lambda _name: None,
+        ep_enabled=False,
+    )
+    engine.optimizer = SimpleNamespace(
+        step=lambda: events.append("step"),
+        zero_grad=lambda: events.append("zero_grad"),
+    )
+
+    grad_norm_val = engine.optimizer_step()
+    assert grad_norm_val == pytest.approx(1.5)
+    assert events == [
+        "clip",
+        ("sync", {"wait": True}),
+        "step",
+        ("sync", {"wait": True}),
+    ]

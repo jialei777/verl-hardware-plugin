@@ -16,9 +16,12 @@ from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_p
 @pytest.fixture(autouse=True)
 def _reset_patch_state():
     original_all_reduce = dist.all_reduce
+    original_all_gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
     tpu_patch_mod._applied = False
     yield
     dist.all_reduce = original_all_reduce
+    if original_all_gather_into_tensor is not None:
+        dist.all_gather_into_tensor = original_all_gather_into_tensor
     tpu_patch_mod._applied = False
 
 
@@ -100,3 +103,36 @@ def test_gloo_only_group_with_tpu_tensor_stages_via_cpu():
     assert res == "ok"
     assert fake_tpu_tensor.copied is not None
     assert torch.allclose(fake_tpu_tensor.copied, torch.tensor([6.0]))
+
+
+def test_gloo_only_group_all_gather_into_tensor_stages_via_cpu():
+    class _FakeTPUTensor:
+        device = mock.Mock(type="tpu")
+
+        def __init__(self, data: torch.Tensor):
+            self._cpu = data.clone()
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self._cpu.clone()
+
+        def copy_(self, src):
+            self._cpu.copy_(src)
+            return self
+
+    def _fake_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+        assert output_tensor.device.type == "cpu" and input_tensor.device.type == "cpu"
+        output_tensor.copy_(torch.cat([input_tensor, input_tensor * 3], dim=0))
+        return "ok"
+
+    out, inp = _FakeTPUTensor(torch.zeros(4)), _FakeTPUTensor(torch.tensor([1.0, 2.0]))
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_gather_into_tensor", side_effect=_fake_all_gather_into_tensor),
+        mock.patch.object(dist, "get_backend", return_value="gloo"),
+    ):
+        tpu_patch_mod.apply()
+        assert dist.all_gather_into_tensor(out, inp, group="dp_gloo") == "ok"
+    assert out._cpu.tolist() == [1.0, 2.0, 3.0, 6.0]

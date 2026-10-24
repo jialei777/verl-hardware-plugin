@@ -303,8 +303,8 @@ class TorchTitanTPUEngine(BaseEngine):
             activation_checkpoint = None
         else:
             activation_checkpoint = {
-                # torchtitan's TPU SelectiveAC also saves the wait of each saved collective (e.g. the Ulysses
-                # all-to-all), which torch-tpu's compiler needs in the same graph as the collective.
+                # torchtitan's TPUSelectiveAC drops collectives from the selective-AC save set so backward
+                # recomputes them with their wait_tensor, avoiding torch-tpu's wait-on-placeholder error.
                 "selective": TPUSelectiveAC.Config,
                 "full": FullAC.Config,
                 "none": lambda: None,
@@ -949,8 +949,11 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             extra_kwargs.update(cp_batch)
 
         # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
+        cp_full_segment_ids = getattr(position_ids, "_cp_full_segment_ids", None)
         extra_inputs = {"positions": position_ids, **multi_modal_inputs}
         extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
+        if cp_full_segment_ids is not None:
+            extra_inputs["positions"]._cp_full_segment_ids = cp_full_segment_ids
         extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
         output_args["labels"] = labels
         input_ids = input_ids.contiguous()

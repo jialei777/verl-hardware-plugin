@@ -11,9 +11,9 @@ from omegaconf import OmegaConf
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import TorchtitanEngineConfig
-from verl_hardware_plugin.accelerators.tpu.trainer import tpu_engine_options
-from verl_hardware_plugin.accelerators.tpu.trainer.tpu_engine_options import TPUEngineOptions, get_tpu_engine_options
-from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
+from verl_hardware_plugin.accelerators.tpu.engine import engine_options
+from verl_hardware_plugin.accelerators.tpu.engine.engine_options import TPUEngineOptions, get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
     resolve_tpu_torchtitan_options,
@@ -23,9 +23,9 @@ from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for env_name in tpu_engine_options._LEGACY_ENV_VARS.values():
+    for env_name in engine_options._LEGACY_ENV_VARS.values():
         monkeypatch.delenv(env_name, raising=False)
-    monkeypatch.setattr(tpu_engine_options, "_warned", set())
+    monkeypatch.setattr(engine_options, "_warned", set())
 
 
 def _cfg(tpu=None, **fields):
@@ -82,7 +82,7 @@ def test_resolvers_read_engine_kwargs():
 
 def test_legacy_field_and_env_still_work_with_a_warning(monkeypatch, caplog):
     legacy = _cfg(use_torch_compile=True, use_splash_attention=None, use_simple_fsdp=False, tpu_eager_mode=None)
-    with caplog.at_level(logging.WARNING, logger=tpu_engine_options.__name__):
+    with caplog.at_level(logging.WARNING, logger=engine_options.__name__):
         assert get_tpu_engine_options(legacy).use_simple_fsdp is False
     assert "torchtitan.use_simple_fsdp is deprecated" in caplog.text
 
@@ -91,7 +91,7 @@ def test_legacy_field_and_env_still_work_with_a_warning(monkeypatch, caplog):
     assert get_tpu_engine_options(both).use_simple_fsdp is True
     monkeypatch.setenv("VERL_TPU_USE_SIMPLE_FSDP", "0")
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=tpu_engine_options.__name__):
+    with caplog.at_level(logging.WARNING, logger=engine_options.__name__):
         assert get_tpu_engine_options(both).use_simple_fsdp is False
     assert "VERL_TPU_USE_SIMPLE_FSDP='0'" in caplog.text and "deprecated" in caplog.text
 

@@ -1,6 +1,8 @@
 # Google TPU Weight Sync
 
-Two checkpoint engines send the trainer's updated weights to the [vLLM rollout](./rollout.md) on TPU.
+Two checkpoint engines send the trainer's updated weights to the [vLLM rollout](./rollout.md) on TPU. They live
+in `verl_hardware_plugin/accelerators/tpu/weight_sync/`, the plugin's counterpart of verl core's
+`verl/checkpoint_engine/`, and register with verl's `CheckpointEngineRegistry`.
 Pick one with `actor_rollout_ref.rollout.checkpoint_engine.backend`:
 
 | Backend | How the weights travel |
@@ -20,7 +22,7 @@ for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
 2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`
-   (`trainer/weight_export.py` decides how each weight is exported):
+   (`engine/weight_export.py` decides how each weight is exported):
    - an FSDP shard (`Shard(0)` on a 1-D mesh, dim 0 divisible by the mesh size) is registered as this rank's
      block of the full tensor; Raiden reshards the blocks of all ranks for the rollout, so no rank gathers it;
    - a replicated weight is already full on every rank and is registered full, without further communication.

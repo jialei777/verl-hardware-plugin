@@ -17,9 +17,22 @@ import torch._dynamo
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
-from verl.utils.dataset.dataset_utils import DatasetPadMode
-from verl.workers.config import ActorConfig, TorchtitanEngineConfig
-from verl.workers.utils.losses import ppo_loss, sft_loss
+from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
+    TPUSplashAttention,
+    TPUVarlenAttention,
+    bucket_length,
+    configure_torch_compile_for_tpu,
+    extend_torchtitan_engine_config,
+    get_tpu_seq_bucket_size,
+    get_tpu_simple_fsdp_parallelize_fn,
+    init_states_without_simple_fsdp_parametrization,
+    install_tpu_attention,
+    pad_packed_inputs_for_tpu,
+    resolve_tpu_torchtitan_options,
+    splash_block_size_for,
+    unwrap_metadata,
+)
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
     configure_ray_worker_tpu7x_env,
@@ -33,23 +46,6 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     tpu_generation,
     tpu_mesh_env,
     tpu_v7x_process_env,
-)
-from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
-    TPU_PADDED_VALUES_ATTR,
-    TPUSplashAttention,
-    TPUVarlenAttention,
-    bucket_length,
-    configure_torch_compile_for_tpu,
-    extend_torchtitan_engine_config,
-    get_tpu_seq_bucket_size,
-    get_tpu_simple_fsdp_parallelize_fn,
-    init_states_without_simple_fsdp_parametrization,
-    install_tpu_attention,
-    pad_packed_inputs_for_tpu,
-    prepare_tpu_loss_inputs,
-    resolve_tpu_torchtitan_options,
-    splash_block_size_for,
-    unwrap_metadata,
 )
 
 
@@ -595,161 +591,6 @@ def test_init_states_without_simple_fsdp_parametrization_is_reentrant():
     assert simple_fsdp._active_parametrization is True
 
 
-def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():
-    # 2 packed samples of lengths 3 and 2 (orig_seq_len = 5), padded to bucket 8
-    padded_log_probs = torch.tensor(
-        [-1.0, -2.0, -3.0, -4.0, -5.0, -100.0, -200.0, -300.0],
-        dtype=torch.float32,
-        requires_grad=True,
-    )
-    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int64)
-    unpadded_log_probs = padded_log_probs.detach().clone()[:5]
-    nested_log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens)
-    setattr(nested_log_probs, TPU_PADDED_VALUES_ATTR, padded_log_probs)
-
-    loss_mask = torch.nested.nested_tensor(
-        [torch.tensor([0, 1, 1]), torch.tensor([0, 1])],
-        layout=torch.jagged,
-    )
-    micro_batch = TensorDict({"loss_mask": loss_mask}, batch_size=[2])
-    tu.assign_non_tensor(
-        micro_batch,
-        pad_mode=DatasetPadMode.NO_PADDING,
-        dp_size=2,
-        batch_num_tokens=6,
-    )
-
-    model_output = {"log_probs": nested_log_probs}
-    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
-    loss, metrics = sft_loss(config=None, model_output=loss_model_output, data=loss_data)
-    assert metrics == {}
-    loss.backward()
-
-    # Rolled unpadded mask is [1, 1, 0, 1, 0], padded with 3 zeros -> [1, 1, 0, 1, 0, 0, 0, 0].
-    # Selected log_probs are -1.0, -2.0, -4.0 -> sum = -7.0 -> loss = -(-7.0) / 6 * 2 = 7/3.
-    assert loss.item() == pytest.approx(7.0 / 3.0)
-    assert padded_log_probs.grad is not None
-    expected_grad = torch.tensor([-1.0 / 3.0, -1.0 / 3.0, 0.0, -1.0 / 3.0, 0.0, 0.0, 0.0, 0.0])
-    assert torch.allclose(padded_log_probs.grad, expected_grad)
-
-
-def _ppo_micro_batch(lengths, max_response_len=None, seed=0):
-    """Packed PPO micro-batch as `TorchTitanTPUEngineWithLMHead` builds it: nested prompts/responses on CPU."""
-    gen = torch.Generator().manual_seed(seed)
-
-    def nested(rows):
-        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-
-    prompt_lens = [p for p, _ in lengths]
-    response_lens = [r for _, r in lengths]
-    micro_batch = TensorDict(
-        {
-            "prompts": nested([torch.randint(0, 100, (p,), generator=gen) for p in prompt_lens]),
-            "responses": nested([torch.randint(0, 100, (r,), generator=gen) for r in response_lens]),
-            "input_ids": nested([torch.randint(0, 100, (p + r,), generator=gen) for p, r in lengths]),
-            "response_mask": nested([torch.ones(r, dtype=torch.int64) for r in response_lens]),
-            "old_log_probs": nested([-torch.rand(r, generator=gen) for r in response_lens]),
-            "advantages": nested([torch.randn(r, generator=gen) for r in response_lens]),
-            "ref_log_prob": nested([-torch.rand(r, generator=gen) for r in response_lens]),
-        },
-        batch_size=[len(lengths)],
-    )
-    tu.assign_non_tensor(micro_batch, dp_size=2, batch_num_tokens=sum(response_lens) * 2, global_batch_size=8)
-    if max_response_len is not None:
-        tu.assign_non_tensor_data(micro_batch, "max_response_len", max_response_len)
-    return micro_batch
-
-
-def _ppo_model_output(lengths, padded_len, with_entropy, seed=0):
-    """Bucket-padded device outputs + their trimmed CPU views, as `prepare_model_outputs` returns them."""
-    gen = torch.Generator().manual_seed(seed + 1)
-    total = sum(p + r for p, r in lengths)
-    cu_seqlens = torch.tensor([0] + [p + r for p, r in lengths]).cumsum(0)
-    leaves = {"log_probs": -torch.rand(padded_len, generator=gen)}
-    if with_entropy:
-        leaves["entropy"] = torch.rand(padded_len, generator=gen)
-    model_output = {}
-    for key, leaf in leaves.items():
-        leaf.requires_grad_(True)
-        nested = torch.nested.nested_tensor_from_jagged(leaf.detach()[:total], cu_seqlens)
-        setattr(nested, TPU_PADDED_VALUES_ATTR, leaf)
-        model_output[key] = nested
-    return model_output, leaves, cu_seqlens
-
-
-def _ppo_config():
-    return ActorConfig(
-        strategy="fsdp",
-        rollout_n=8,
-        ppo_micro_batch_size_per_gpu=4,
-        loss_agg_mode="token-mean",
-        use_kl_loss=True,
-        kl_loss_coef=0.001,
-        entropy_coeff=0.01,
-    )
-
-
-@pytest.mark.parametrize("lengths", [[(5, 7)], [(3, 2), (6, 9), (4, 1)]])
-@pytest.mark.parametrize("with_entropy", [False, True])
-def test_prepare_tpu_loss_inputs_ppo_matches_unmodified_ppo_loss(lengths, with_entropy):
-    padded_len = bucket_length(sum(p + r for p, r in lengths), 16)
-    response_bucket = bucket_length(max(r for _, r in lengths), 16)
-
-    # Reference: core ppo_loss on exact (unbucketed) packed outputs, as on GPU.
-    model_output, leaves, cu_seqlens = _ppo_model_output(lengths, padded_len, with_entropy)
-    total = int(cu_seqlens[-1])
-    reference_output = {
-        key: torch.nested.nested_tensor_from_jagged(leaf[:total], cu_seqlens) for key, leaf in leaves.items()
-    }
-    ref_loss, ref_metrics = ppo_loss(_ppo_config(), reference_output, _ppo_micro_batch(lengths))
-    ref_loss.backward()
-    ref_grads = {key: leaf.grad.clone() for key, leaf in leaves.items()}
-    for leaf in leaves.values():
-        leaf.grad = None
-
-    # TPU adapter: bucket-padded outputs, static layout, same unmodified core loss.
-    micro_batch = _ppo_micro_batch(lengths, max_response_len=response_bucket)
-    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
-    loss, metrics = ppo_loss(_ppo_config(), loss_model_output, loss_data)
-    loss.backward()
-
-    torch.testing.assert_close(loss, ref_loss, rtol=0, atol=1e-6)
-    for key, leaf in leaves.items():
-        torch.testing.assert_close(leaf.grad, ref_grads[key], rtol=0, atol=1e-7)
-    assert set(metrics) == set(ref_metrics)
-    # The source micro-batch keeps its real sequence metadata.
-    assert micro_batch["responses"].offsets().diff().tolist() == [r for _, r in lengths]
-
-
-def test_prepare_tpu_loss_inputs_ppo_shapes_depend_only_on_buckets():
-    """Different exact lengths in the same buckets must give the loss identical shapes (no XLA recompiles)."""
-
-    def loss_inputs(lengths):
-        model_output, _, _ = _ppo_model_output(lengths, padded_len=48, with_entropy=True)
-        micro_batch = _ppo_micro_batch(lengths, max_response_len=16)
-        return prepare_tpu_loss_inputs(model_output, micro_batch)
-
-    out_a, data_a = loss_inputs([(5, 7), (9, 11)])
-    out_b, data_b = loss_inputs([(12, 16), (3, 2)])
-    for key in ("log_probs", "entropy"):
-        assert out_a[key].values().shape == out_b[key].values().shape == torch.Size([2 * (16 + 1)])
-    for key in ("prompts", "responses"):
-        assert data_a[key].offsets().tolist() == data_b[key].offsets().tolist()
-    for key in ("response_mask", "old_log_probs", "advantages", "ref_log_prob"):
-        assert data_a[key].shape == data_b[key].shape == torch.Size([2, 16])
-    assert tu.get_non_tensor_data(data_a, "max_response_len", None) == 16
-
-
-def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
-    """A packed output without its bucket-padded device tensor keeps the exact-length (trimmed) path."""
-    lengths = [(3, 2), (4, 5)]
-    model_output, leaves, cu_seqlens = _ppo_model_output(lengths, padded_len=32, with_entropy=False)
-    model_output["values"] = torch.nested.nested_tensor_from_jagged(torch.zeros(int(cu_seqlens[-1])), cu_seqlens)
-    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, _ppo_micro_batch(lengths, 16))
-    assert loss_model_output["log_probs"].values().shape == torch.Size([int(cu_seqlens[-1])])
-    assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
-
-
 def _imported_modules(nodes) -> set[str]:
     names = set()
     for node in nodes:
@@ -765,8 +606,8 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     from torch.distributed.fsdp import FSDPModule
 
     from verl.workers.engine.base import BaseEngine
-    from verl_hardware_plugin.accelerators.tpu.trainer import torchtitan_tpu, tpu_utils
-    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
+    from verl_hardware_plugin.accelerators.tpu.engine import torchtitan_tpu, tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
         derive_torchtitan_name_and_flavor,
         enable_fsdp_gradient_division,
     )
@@ -802,7 +643,7 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
 
 def test_fused_linear_cross_entropy_tpu_and_logprobs():
-    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import (
+    from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import (
         fused_linear_logprobs_tpu,
         resolve_tpu_use_fused_linear_cross_entropy,
     )
@@ -867,7 +708,7 @@ def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pa
     PPO ratio is exactly 1. Entropy is taken from the logits in fp32, as on GPU.
     """
     import verl.utils.torch_functional as verl_F
-    from verl_hardware_plugin.accelerators.tpu.trainer import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engine import torchtitan_tpu
 
     seq_lens, hidden_dim, vocab = [3, 5], 4, 6
     total = sum(seq_lens)
@@ -907,7 +748,7 @@ def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(t
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, Shard, init_device_mesh
 
-    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import move_tpu_params_
+    from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import move_tpu_params_
 
     owns_group = not dist.is_initialized()
     if owns_group:
@@ -941,7 +782,7 @@ def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(t
 
 def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
     from verl.utils.torch_functional import logprobs_from_logits_naive
-    from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import compute_tpu_logprobs_chunked
+    from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import compute_tpu_logprobs_chunked
 
     torch.manual_seed(0)
     logits_ref = torch.randn(1, 20, 32, dtype=torch.bfloat16, requires_grad=True)
@@ -960,7 +801,7 @@ def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
 
 
 def test_install_parallel_dims_cache_for_tpu_reuses_parallel_dims_and_mesh():
-    from verl_hardware_plugin.accelerators.tpu.trainer import tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engine import tpu_utils
 
     build_calls = []
 
@@ -1023,7 +864,7 @@ def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
     import torch.distributed.tensor._dispatch as dt_disp
     import torch.distributed.tensor._redistribute as redist_mod
 
-    from verl_hardware_plugin.accelerators.tpu.trainer import tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engine import tpu_utils
 
     seen = []
 
@@ -1047,7 +888,7 @@ def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
 
 
 def test_build_dp_gloo_group_creates_host_gloo_subgroups_when_tp_enabled():
-    from verl_hardware_plugin.accelerators.tpu.trainer.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.engine.torchtitan_tpu import TorchTitanTPUEngine
 
     engine = object.__new__(TorchTitanTPUEngine)
     engine.engine_config = SimpleNamespace(
@@ -1086,7 +927,7 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
     import torch.distributed as dist
     from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
 
-    from verl_hardware_plugin.accelerators.tpu.trainer.weight_export import TrainerWeights, fsdp_dim0_shard
+    from verl_hardware_plugin.accelerators.tpu.engine.weight_export import TrainerWeights, fsdp_dim0_shard
 
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
     try:

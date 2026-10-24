@@ -583,7 +583,7 @@ class TestEngineRegistration:
             pytest.skip("verl.workers.engine.utils.detach_tree is required by the TPU engine (verl > 0.9.0)")
 
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.accelerators.tpu.trainer.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+        from verl_hardware_plugin.accelerators.tpu.engine.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
 
         assert (
             EngineRegistry._engines["language_model"]["torchtitan"][("tpu", "google")] is TorchTitanTPUEngineWithLMHead

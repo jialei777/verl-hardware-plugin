@@ -20,7 +20,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.accelerators.tpu.trainer.tpu_utils import tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.engine.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     RAY_PLASMA_STORE_BACKEND,
     _get_parent_module,

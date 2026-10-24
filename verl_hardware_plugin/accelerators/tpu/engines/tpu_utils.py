@@ -153,6 +153,32 @@ def tpu_model_kernel_lce_block_sizes(kernels: frozenset[str]) -> dict[str, int]:
     return dict(_LCE_BLOCK_SIZES) if "lce" in kernels else {}
 
 
+def set_packed_document_budget(modules: Any, num_documents: int) -> int:
+    """Sets ``max_num_segments`` of every Tokamax GatedDeltaNet kernel in ``modules`` to ``num_documents``.
+
+    Tokamax's KDA kernels restart the recurrence at each of the first ``max_num_segments`` documents of a packed
+    row; later documents share one recurrence. torchtitan's default derives the budget from the row length (one
+    document per 512 tokens), which is too small for RL micro-batches: two ~300-token sequences pad to a 768-token
+    row whose default budget is 1, so the second sequence would continue the first one's state. verl knows how many
+    sequences each micro-batch packs (plus one for the padding tail), so it sets the budget from that. Returns the
+    number of kernels updated.
+    """
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    updated = 0
+    for model in model_list:
+        if not isinstance(model, torch.nn.Module):
+            continue
+        for module in model.modules():
+            # By class name (anywhere in the MRO: parallelization may subclass modules), so torchtitan builds
+            # without Tokamax need not import it.
+            is_kernel = any(c.__name__ == "TokamaxGatedDeltaKernel" for c in type(module).__mro__)
+            if is_kernel and hasattr(module, "max_num_segments"):
+                if module.max_num_segments != num_documents:
+                    module.max_num_segments = int(num_documents)
+                    updated += 1
+    return updated
+
+
 def get_text_config(hf_config: Any) -> Any:
     """The language-model config of ``hf_config``: ``text_config`` for multimodal configs, else ``hf_config``."""
     text_config = getattr(hf_config, "text_config", None)

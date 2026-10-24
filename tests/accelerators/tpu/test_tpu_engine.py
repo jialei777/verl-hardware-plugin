@@ -1286,3 +1286,33 @@ def test_resolve_tpu_model_kernels(monkeypatch):
     monkeypatch.setenv("VERL_TPU_MODEL_KERNELS", "bogus")
     with pytest.raises(ValueError, match="not supported"):
         tpu_utils.resolve_tpu_model_kernels("qwen3_5")
+
+
+def test_packed_document_budget_keeps_every_rl_sequence_apart():
+    """Two sequences packed into a 768-token row restart the KDA recurrence each (plus one padding segment)."""
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import _document_ids, set_packed_document_budget
+
+    class TokamaxGatedDeltaKernel(torch.nn.Module):  # stands in for torchtitan's kernel module (same name)
+        def __init__(self):
+            super().__init__()
+            self.max_num_segments = None
+
+    class ParallelizedTokamaxGatedDeltaKernel(TokamaxGatedDeltaKernel):  # parallelization may subclass modules
+        pass
+
+    model = torch.nn.Sequential(TokamaxGatedDeltaKernel(), torch.nn.Linear(2, 2), ParallelizedTokamaxGatedDeltaKernel())
+    assert set_packed_document_budget([model], 3) == 2
+    assert all(m.max_num_segments == 3 for m in model if isinstance(m, TokamaxGatedDeltaKernel))
+    assert set_packed_document_budget([model], 3) == 0  # unchanged: no recompile
+
+    # A packed RL row: 2 sequences (300 + 308 tokens) bucket-padded to 768; every pad token has position 0.
+    positions = torch.cat([torch.arange(300), torch.arange(308), torch.zeros(160, dtype=torch.int64)]).unsqueeze(0)
+    segment_ids = _document_ids(positions, None)
+
+    def tokamax_ids(budget):  # torchtitan's tokamax_segment_ids (a9093690)
+        return (segment_ids - segment_ids[:, :1] + 1).clamp(max=budget)
+
+    # torchtitan's default budget for T=768 is max(1, 768 // 512) = 1: both sequences share one recurrence.
+    assert tokamax_ids(1)[0, 300].item() == tokamax_ids(1)[0, 299].item()
+    ids = tokamax_ids(3)[0]
+    assert ids[:300].eq(1).all() and ids[300:608].eq(2).all() and ids[608:].eq(3).all()

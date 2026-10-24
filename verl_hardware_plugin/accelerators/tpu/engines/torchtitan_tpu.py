@@ -83,6 +83,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     resolve_tpu_model_kernels,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    set_packed_document_budget,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
     tpu_model_kernel_lce_block_sizes,
@@ -618,6 +619,19 @@ class TorchTitanTPUEngine(BaseEngine):
             align_micro_batch_shapes_across_ranks(
                 micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
             )
+
+        if "kda" in getattr(self, "_tpu_kernels", ()):
+            # Every sequence of a micro-batch is one packed document, plus the bucket-padding tail.
+            budget = max(int(mb.batch_size[0]) for mb in micro_batches) + 1
+            updated = set_packed_document_budget(self.module, budget)
+            if updated:
+                logger.warning("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
+            elif not getattr(self, "_kda_budget_checked", False):
+                names = sorted(
+                    {type(m).__name__ for part in self.module for m in part.modules() if "Delta" in type(m).__name__}
+                )
+                logger.warning("Tokamax GatedDeltaNet budget %d: no kernel updated; delta modules: %s", budget, names)
+            self._kda_budget_checked = True
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()

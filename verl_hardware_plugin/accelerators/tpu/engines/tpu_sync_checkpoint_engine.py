@@ -154,6 +154,10 @@ def validate_and_sanitize_tensors(
         # Ensure contiguous memory layout (required for direct DMA pointer calculation)
         if not t.is_contiguous():
             t = t.contiguous()
+        # Raiden transfers whole device buffers, so a view into a larger buffer (e.g. a slice of a fused or
+        # all-gathered tensor) needs its own storage.
+        if t._base is not None or t.storage_offset() != 0:
+            t = t.clone()
 
         sanitized.append((name, t))
 
@@ -210,6 +214,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
       that the rollout received the trainer's weights.
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
+    * ``install_mode`` (default ``auto``, read by the driver): how the rollout writes the received tensors into
+      vLLM: ``copy`` (dense layouts: fuse q/k/v and gate/up), ``load_weights`` (vLLM's own loaders, for hybrid /
+      MoE models such as Qwen3.5) or ``auto``; see ``vLLMRaidenWorkerExtension.init_raiden_sync_on_worker``.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
       (``release_sync_buffers``) instead of keeping them resident until the next sync. The environment
       variable ``VERL_RAIDEN_RELEASE_BUFFERS`` overrides it.
@@ -591,6 +598,8 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
     raiden_kwargs = _raiden_engine_kwargs(manager.config, manager.backend)
     verify_parity = _as_bool(raiden_kwargs.get("verify_parity", False))
     parallelism = int(raiden_kwargs.get("parallelism", RAIDEN_DEFAULT_PARALLELISM))
+    # How the rollout writes the received tensors into vLLM (see vLLMRaidenWorkerExtension.init_raiden_sync_on_worker).
+    install_mode = str(raiden_kwargs.get("install_mode", "auto"))
     controller = _get_or_start_controller(manager)
 
     t_abort_start = time.perf_counter()
@@ -624,6 +633,7 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
                     # vLLM's workers run under their own Ray driver (the engine process), so they are told the
                     # rendezvous name instead of deriving it from their job id.
                     "rendezvous_name": manager._tpu_sync_rendezvous_name,
+                    "install_mode": install_mode,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)

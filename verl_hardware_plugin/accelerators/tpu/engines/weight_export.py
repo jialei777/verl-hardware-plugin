@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import Counter
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -44,10 +44,13 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once Raiden is confirmed to describe them.
     * **EP**: fused expert stacks never reach this function; ``TrainerWeights`` gathers them and splits them into
       one HF tensor per expert. TODO: export expert blocks locally.
+    * **1-D tensors** (norm weights, biases, Qwen3.5's ``A_log`` / ``dt_bias``): ``None``, gathered. They are tiny,
+      and Raiden mis-delivers some of their small blocks (e.g. a 128-element norm weight split 8 ways arrived with
+      only its first block), so they are always sent whole.
 
     Every tensor that ends up gathered is logged by ``TrainerWeights.local_shards()``.
     """
-    if not isinstance(param, DTensor):
+    if not isinstance(param, DTensor) or param.ndim < 2:
         return None
     mesh = param.device_mesh
     if mesh.ndim != 1 or len(param.placements) != 1:
@@ -91,15 +94,20 @@ class TrainerWeights:
     rank's local block and ``shard`` its ``(num_shards, shard_index)`` for parameters that ``fsdp_dim0_shard``
     recognizes, and the full tensor with ``shard=None`` for every other parameter. Both paths run the same
     collectives in the same order on every rank. A second export raises: the parameters are released as they go.
+
+    ``dense`` is a dict of HF-named parameters, or an iterable of such dicts that is consumed lazily during the export
+    (``TorchTitanTPUEngine`` converts one transformer layer at a time, so that the tensors its state-dict adapter
+    fuses, e.g. Qwen3.5's MoE ``gate_up_proj``, exist for one layer at a time). A parameter reachable under several
+    names (tied embeddings) must appear in one dict.
     """
 
     def __init__(
         self,
-        dense: dict[str, Any],
+        dense: dict[str, Any] | Iterable[dict[str, Any]],
         expert_stacks: list[tuple[Any, list[tuple[str, tuple]]]],
         device: Any,
     ) -> None:
-        self._dense = dense
+        self._dense_chunks = iter([dense]) if isinstance(dense, dict) else iter(dense)
         self._expert_stacks = expert_stacks
         self._device = device
         self._iter: Optional[Iterator[tuple[str, torch.Tensor]]] = None
@@ -117,20 +125,27 @@ class TrainerWeights:
         """Yields ``(hf_name, tensor, shard)``; see the class docstring."""
         return self._export(local=True)
 
+    def _dense_items(self) -> Iterator[tuple[str, Any, int]]:
+        """Pops ``(hf_name, param, number of names of param in its dict)`` from the dense dicts, one dict at a time."""
+        for chunk in self._dense_chunks:
+            names_per_param = Counter(id(p) for p in chunk.values())
+            for name in list(chunk.keys()):
+                param = chunk.pop(name)
+                yield name, param, names_per_param[id(param)]
+
     def _export(self, local: bool) -> Iterator[tuple[str, torch.Tensor, Optional[tuple[int, int]]]]:
         if self._exported:
             raise RuntimeError("TrainerWeights can only be exported once; call get_per_tensor_param() again")
         self._exported = True
         device = self._device
         # A parameter reachable under several names (tied input embedding and LM head) is exported once.
-        exported: dict[int, tuple[torch.Tensor, Optional[tuple[int, int]]]] = {}
-        names_per_param = Counter(id(p) for p in self._dense.values())
+        # The entries keep their parameter referenced, so its id is not reused while it is a key.
+        exported: dict[int, tuple[torch.Tensor, Optional[tuple[int, int]], Any]] = {}
         counts = {"local": 0, "replicated": 0, "gathered": 0}
-        for name in list(self._dense.keys()):
-            param = self._dense.pop(name)
+        for name, param, num_names in self._dense_items():
             pid = id(param)
             if pid in exported:
-                tensor, shard = exported[pid]
+                tensor, shard, _ = exported[pid]
             elif isinstance(param, DTensor):
                 shard = fsdp_dim0_shard(param) if local else None
                 if shard is not None:
@@ -147,8 +162,8 @@ class TrainerWeights:
                                 f"local={tuple(param.to_local().shape)})"
                             )
                     tensor = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
-                if names_per_param[pid] > 1:
-                    exported[pid] = (tensor, shard)
+                if num_names > 1:
+                    exported[pid] = (tensor, shard, param)
             else:
                 tensor, shard = param.to(torch.bfloat16, non_blocking=True), None
                 if local:

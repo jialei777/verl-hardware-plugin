@@ -75,21 +75,36 @@ _FUSED_TARGETS = (
 
 
 def _sampler_sharding(
-    name: str, global_shape: list[int], tp_size: int, tp_rank: int = 0, num_kv_heads: Optional[int] = None
+    name: str,
+    global_shape: list[int],
+    tp_size: int,
+    tp_rank: int = 0,
+    num_kv_heads: Optional[int] = None,
+    install_mode: str = "copy",
 ) -> _SamplerSlice:
     """Returns the slice of a trainer tensor that one vLLM TP rank holds.
 
-    With GQA and ``tp_size > num_kv_heads``, vLLM replicates each KV head on ``tp_size // num_kv_heads`` ranks,
-    so a dim-0 split of k_proj / v_proj over ``tp_size`` would hand every rank a fraction of a head. Those are
-    registered as one slice per KV head instead, and ``global_shard_indices`` names the head this rank holds
-    (ranks sharing a head receive the same slice). E.g. Qwen3-32B (8 KV heads) at TP=32: k_proj [1024, 5120]
-    -> mesh [8, 1], local [128, 5120], rank 13 -> slice 3.
+    ``install_mode="copy"`` receives each tensor in the TP layout of its (dense) vLLM parameter. With GQA and
+    ``tp_size > num_kv_heads``, vLLM replicates each KV head on ``tp_size // num_kv_heads`` ranks, so a dim-0 split
+    of k_proj / v_proj over ``tp_size`` would hand every rank a fraction of a head. Those are registered as one slice
+    per KV head instead, and ``global_shard_indices`` names the head this rank holds (ranks sharing a head receive
+    the same slice). E.g. Qwen3-32B (8 KV heads) at TP=32: k_proj [1024, 5120] -> mesh [8, 1], local [128, 5120],
+    rank 13 -> slice 3.
+
+    ``install_mode="load_weights"`` only splits the receive buffers: every tensor with at least two dimensions whose
+    dim 0 divides evenly is sharded on dim 0 (all-gathered again at install time), every other one is replicated.
+    1-D tensors (norm weights, biases, ``A_log``) are tiny, and tpu-sync mis-delivers some of their small shards
+    (e.g. Qwen3.5's 128-element GatedDeltaNet norm split 8 ways), so they are always received whole.
     """
     spec_axes = [""] * len(global_shape)
     local_shape = list(global_shape)
     tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
     global_shard_indices: list[int] = []  # empty: tpu-sync derives this rank's slice from the mesh geometry
-    if len(global_shape) == 2:
+    if install_mode == "load_weights":
+        if len(global_shape) >= 2 and global_shape[0] % tp_size == 0 and tp_size > 1:
+            spec_axes[0] = "tp"
+            local_shape[0] = global_shape[0] // tp_size
+    elif len(global_shape) == 2:
         if any(name.endswith(s) for s in _ROW_PARALLEL_SUFFIXES):
             # Row parallel: partition input dimension (dim 1) across TP ranks
             spec_axes = ["", "tp"]
@@ -109,6 +124,20 @@ def _sampler_sharding(
     # tp_size for unsharded tensors. The norm parity check divides by it when summing over ranks.
     replicas = tp_size // math.prod(mesh_shape)
     return _SamplerSlice(spec_axes, local_shape, mesh_shape, global_shard_indices, replicas)
+
+
+def _resolve_install_mode(install_mode: str, vllm_model: Any, global_shapes: dict[str, list[int]]) -> str:
+    """Resolves ``install_mode="auto"``: vLLM's loaders for hybrid (linear attention) or MoE models, else ``copy``."""
+    mode = (install_mode or "auto").strip().lower()
+    if mode not in ("auto", "copy", "load_weights"):
+        raise ValueError(f"unknown tpu-sync install_mode {install_mode!r} (expected auto, copy or load_weights)")
+    if mode != "auto":
+        return mode
+    is_hybrid = hasattr(type(vllm_model), "get_mamba_state_shape_from_config")
+    has_unhandled = any(len(shape) not in (1, 2) for shape in global_shapes.values()) or any(
+        ".linear_attn." in name or ".experts." in name for name in global_shapes
+    )
+    return "load_weights" if (is_hybrid or has_unhandled) else "copy"
 
 
 class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
@@ -149,12 +178,18 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
         rendezvous_name: Optional[str] = None,
+        install_mode: str = "auto",
     ) -> bool:
         """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
 
         ``job_name`` is the Raiden job this worker's replica registers under (the driver names every rollout
         replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
         the controller. ``rendezvous_name`` is the job's ``TpuSyncRendezvous`` actor, which the driver names.
+        ``install_mode`` selects how ``install_raiden_weights`` writes the received tensors into vLLM: ``copy``
+        (fuse q/k/v and gate/up and copy into dense parameters, enough for Qwen3 / Llama), ``load_weights``
+        (all-gather each tensor over the TP group and run vLLM's own checkpoint loaders through
+        ``reload_weights``, which handles every fused, sharded or kernel-native layout, e.g. Qwen3.5's
+        GatedDeltaNet projections and MoE experts), or ``auto`` (``load_weights`` for hybrid or MoE models).
         Only the first call does work: the receive buffers, the synchronizer and the
         registration are reused by every later sync.
         """
@@ -176,6 +211,8 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         # 1. Fetch RaidenController address and un-fused global shapes from the job's rendezvous
         controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val, rendezvous_name)
+        install_mode = _resolve_install_mode(install_mode, vllm_model, global_shapes_map)
+        self._raiden_install_mode = install_mode
 
         # 2. Determine tensor parallel size from vLLM V1 config
         worker: Any = getattr(self, "worker", self)
@@ -195,6 +232,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
         # weights need tpu_sync to write into a slice or layout of the target tensor.
         staging_tensors = {}
+        staging_sharded = {}
         variable_protos = []
         valid_params = []
         replicas = {}
@@ -205,12 +243,15 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
-            shard = _sampler_sharding(name, g_shape, tp_size, tp_rank=rank_val, num_kv_heads=num_kv_heads)
+            shard = _sampler_sharding(
+                name, g_shape, tp_size, tp_rank=rank_val, num_kv_heads=num_kv_heads, install_mode=install_mode
+            )
             replicas[name] = shard.replicas
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16)
             t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
             staging_tensors[name] = t
+            staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
 
             variable_protos.append(
@@ -227,6 +268,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             )
 
         self._raiden_staging = staging_tensors
+        self._raiden_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._raiden_replicas = replicas
 
@@ -296,6 +338,18 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
+        if getattr(self, "_raiden_install_mode", "copy") == "load_weights":
+            self._install_with_vllm_loaders()
+            t_sync_start = time.perf_counter()
+            raiden.tpu_synchronize()
+            t_sync = time.perf_counter() - t_sync_start
+            t_total = time.perf_counter() - t_start
+            logger.info(
+                f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: install_raiden_weights "
+                f"(load_weights) completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
+            )
+            return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+
         # Unpack, fuse, and transpose staging tensors into vLLM model parameters
         vllm_model = self._get_vllm_model()
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
@@ -362,6 +416,50 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
         return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+
+    @torch.no_grad()
+    def _install_with_vllm_loaders(self) -> None:
+        """Load the received checkpoint-format (HF-named) tensors through vLLM's own weight loaders.
+
+        Each staging tensor holds this rank's dim-0 slice (or the whole tensor); it is all-gathered over the vLLM
+        TP group one tensor at a time, in the same (sorted) order on every rank, and streamed into
+        ``model_runner.reload_weights``. vLLM's layerwise reload restores each layer's checkpoint-format
+        parameters, runs the model's ``load_weights`` (fusion, TP sharding) and re-runs
+        ``process_weights_after_loading`` (TPU kernel layouts), so no layout knowledge lives here.
+        """
+        from vllm.distributed import get_tp_group
+
+        tp_group = get_tp_group()
+        staging = self._raiden_staging
+        sharded = self._raiden_staging_sharded
+        t_gather = 0.0
+
+        def _weights():
+            nonlocal t_gather
+            for name in sorted(staging):
+                t = staging[name]
+                if sharded[name]:
+                    t0 = time.perf_counter()
+                    t = tp_group.all_gather(t, dim=0)
+                    # Run every collective on its own: deferred (fused) collective programs can be cut at different
+                    # points on different ranks and then never match up, which stalls the TP group.
+                    raiden.tpu_synchronize(t)
+                    t_gather += time.perf_counter() - t0
+                yield name, t
+
+        worker: Any = getattr(self, "worker", self)
+        model_runner = worker.model_runner
+        if hasattr(model_runner, "reload_weights"):
+            # vllm-torchtpu's dense linear method transposes weights to (k, n) in process_weights_after_loading,
+            # guarded by a per-module "already flipped" flag that layerwise reload does not reset, so the fresh
+            # weights would stay [n_out, n_in] and fail to copy into the live [n_in, n_out] tensors. Clear it first.
+            for module in self._get_vllm_model().modules():
+                if getattr(module, "_tpu_weight_flipped", False):
+                    module._tpu_weight_flipped = False
+            model_runner.reload_weights(weights_iterator=_weights(), is_checkpoint_format=True)
+        else:
+            self._get_vllm_model().load_weights(_weights())
+        logger.info(f"Sampler Rank {getattr(self, 'rank', 0)}: TP all-gathers of the received tensors: {t_gather:.2f}s")
 
     def get_model_weights_stats(self) -> dict:
         """Computes deterministic parameter count, L1 norm, and L2 norm of this worker's received weights."""

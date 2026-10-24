@@ -7,8 +7,8 @@ import warnings
 
 import pytest
 
-from verl_hardware_plugin.accelerators.tpu.engines import weight_sync_backends
-from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import (
+from verl_hardware_plugin.accelerators.tpu.weight_sync import weight_sync_backends
+from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     DEPRECATED_BACKEND_NAMES,
     RAY_PLASMA_STORE_BACKEND,
     TPU_SYNC_BACKEND,

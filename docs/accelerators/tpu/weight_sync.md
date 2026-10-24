@@ -1,6 +1,8 @@
 # Google TPU Weight Sync
 
-Two checkpoint engines send the trainer's updated weights to the [vLLM rollout](./rollout.md) on TPU.
+Two checkpoint engines send the trainer's updated weights to the [vLLM rollout](./rollout.md) on TPU. They live
+in `verl_hardware_plugin/accelerators/tpu/weight_sync/`, the plugin's counterpart of verl core's
+`verl/checkpoint_engine/`, and register with verl's `CheckpointEngineRegistry`.
 Pick one with `actor_rollout_ref.rollout.checkpoint_engine.backend`:
 
 | Backend | How the weights travel |
@@ -15,7 +17,7 @@ The former names of the two backends, `tpu` and `raiden`, are still accepted and
 
 ## How a `tpu-sync` sync works
 
-The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEngineManager.update_weights`
+The driver runs each sync (`update_tpu_sync_weights`, which replaces `CheckpointEngineManager.update_weights`
 for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
@@ -32,7 +34,7 @@ for this backend):
    On the first sync it creates that synchronizer and registers it with the Raiden controller, which the
    driver starts at the same time; later syncs rebind the new tensors to the existing synchronizer, as long as
    the tensor names, shapes, dtypes and shard layout do not change. The trainer also publishes the full shape
-   of every tensor in the job's `TpuSyncRendezvous` actor (`engines/tpu_sync_rendezvous.py`). The driver
+   of every tensor in the job's `TpuSyncRendezvous` actor (`weight_sync/tpu_sync_rendezvous.py`). The driver
    creates that actor once per job, named after the Ray job and not detached, so jobs sharing a cluster never
    see each other's.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
@@ -152,5 +154,5 @@ Errors, such as a parity mismatch, are always logged.
 
 - [User Guide](./README.md)
 - [vLLM Rollout](./rollout.md)
-- For developers: `verl_hardware_plugin/accelerators/tpu/engines/tpu_sync_checkpoint_engine.py` (trainer and driver side)
-  and `verl_hardware_plugin/accelerators/tpu/rollout/tpu_raiden.py` (rollout side).
+- For developers: `verl_hardware_plugin/accelerators/tpu/weight_sync/tpu_sync_checkpoint_engine.py` (trainer and driver side)
+  and `verl_hardware_plugin/accelerators/tpu/rollout/tpu_sync_worker_extension.py` (rollout side).

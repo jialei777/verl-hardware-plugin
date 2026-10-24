@@ -2,11 +2,10 @@
 # Licensed under the Apache License, Version 2.0.
 
 """``ray-plasma-store`` CheckpointEngine: weight sync between the TorchTitan trainer and the vLLM rollout on TPU
-through the Ray object store."""
+through the Ray object store, coordinated via ``RayWeightRegistry``."""
 
 import asyncio
 import gc
-import inspect
 import logging
 import os
 import re
@@ -21,20 +20,19 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import (
-    RAY_WEIGHT_REGISTRY_ACTOR_NAME,
-    RAY_WEIGHT_REGISTRY_NAMESPACE,
-    get_ray_weight_registry,
-)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
-from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import (
+from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     RAY_PLASMA_STORE_BACKEND,
-    TPU_SYNC_BACKEND,
-    canonical_backend,
+    _get_parent_module,
+    _resolve_model_key,
+    _to_target_layout,
+    apply_checkpoint_engine_manager_hooks,
 )
 
 logger = logging.getLogger(__name__)
 
+RAY_WEIGHT_REGISTRY_ACTOR_NAME = "RayWeightRegistry"
+RAY_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_COPY_CHUNK_SIZE_PARAMETERS = 30
 
 # vLLM stores q/k/v and gate/up as single fused parameters, while TorchTitan
@@ -43,6 +41,45 @@ _FUSED_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
+
+
+class RayWeightRegistryState:
+    """In-memory state container holding Ray ObjectRefs to synchronized model weights across steps."""
+
+    def __init__(self) -> None:
+        self.weights: dict[int, Any] = {}
+
+    def set_weights(self, step: int, ref: Any) -> None:
+        """Stores the weight reference for ``step`` and evicts any prior step entries."""
+        self.weights = {step: ref}
+
+    def get_weights(self, step: int) -> Any | None:
+        """Returns the weight reference registered for ``step``, or ``None`` if absent."""
+        return self.weights.get(step)
+
+    def clear(self) -> None:
+        """Drops all cached entries to reset state left by a previous job."""
+        self.weights.clear()
+
+
+RayWeightRegistry = ray.remote(num_cpus=0)(RayWeightRegistryState)
+
+
+def get_ray_weight_registry() -> Any:
+    """Returns the detached ``RayWeightRegistry`` actor handle, creating the actor on first use."""
+    try:
+        return ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
+    except ValueError:
+        pass
+    try:
+        return RayWeightRegistry.options(
+            name=RAY_WEIGHT_REGISTRY_ACTOR_NAME,
+            namespace=RAY_WEIGHT_REGISTRY_NAMESPACE,
+            lifetime="detached",
+        ).remote()
+    except Exception:
+        # Another process created the actor between the lookup and the creation.
+        return ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
 
 
 def get_clean_name(name: str) -> str:
@@ -59,36 +96,6 @@ def get_layer_group(key: str) -> str:
     if "tok_embeddings" in clean_k:
         return "embeddings"
     return "output"
-
-
-def _resolve_model_key(key: str, model_sd: dict[str, torch.Tensor]) -> str:
-    """Resolves a cleaned trainer key against vLLM's ``model_sd`` (handling optional ``model.`` prefixes)."""
-    if key in model_sd:
-        return key
-    if key.startswith("model.") and key[6:] in model_sd:
-        return key[6:]
-    prefixed = f"model.{key}"
-    if prefixed in model_sd:
-        return prefixed
-    return key
-
-
-def _get_parent_module(target_key: str, module_dict: dict[str, torch.nn.Module]) -> torch.nn.Module | None:
-    """Returns the owning ``torch.nn.Module`` for ``target_key``, or ``None`` if not found."""
-    parent_name = target_key.rsplit(".", 1)[0] if "." in target_key else ""
-    if parent_name in module_dict:
-        return module_dict[parent_name]
-    if parent_name.startswith("model.") and parent_name[6:] in module_dict:
-        return module_dict[parent_name[6:]]
-    prefixed = f"model.{parent_name}"
-    return module_dict.get(prefixed)
-
-
-def _to_target_layout(tensor: torch.Tensor, target_local: torch.Tensor, flipped: bool) -> torch.Tensor:
-    """Matches ``vllm-torchtpu``'s ``(n_in, n_out)`` 2D weight layout when required."""
-    if tensor.ndim == 2 and (flipped or (tensor.shape != target_local.shape and tensor.T.shape == target_local.shape)):
-        return tensor.transpose(0, 1).contiguous()
-    return tensor.contiguous()
 
 
 def _build_fused_shard(
@@ -295,7 +302,7 @@ def load_weights_on_worker(
 
 
 def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
-    """vLLM TPUWorker RPC entrypoint that pulls ``step_key`` weights from ``TPUWeightRegistry`` via host mmap."""
+    """vLLM TPUWorker RPC entrypoint that pulls ``step_key`` weights from ``RayWeightRegistry`` via host mmap."""
     rank_val = getattr(
         self, "rank", getattr(self, "adjusted_rank", getattr(self, "rpc_rank", int(os.environ.get("RANK", "0"))))
     )
@@ -378,7 +385,7 @@ def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
 
 
 @CheckpointEngineRegistry.register(RAY_PLASMA_STORE_BACKEND)
-class TPUCheckpointEngine(CheckpointEngine):
+class RayPlasmaCheckpointEngine(CheckpointEngine):
     """``ray-plasma-store`` checkpoint engine: TorchTitan trainer to vLLM rollout on TPU through the Ray object store.
 
     Trainer rank 0 all-gathers sharded ``DTensor`` parameters, packs them into Ray Plasma
@@ -391,7 +398,7 @@ class TPUCheckpointEngine(CheckpointEngine):
         | Process 1:                    |                 | Process 1 (CPU-ONLY STUB!):     |
         | ActorRolloutRefWorker         |                 | CheckpointEngineWorker          |
         |  - TorchTitanEngine           |                 |  - use_gpu=False (0 TPU chips)  |
-        |  - TPUCheckpointEngine        |                 |  - checkpoint_engine = None     |
+        |  - RayPlasmaCheckpointEngine  |                 |  - checkpoint_engine = None     |
         |    (Offloads full model to    |                 +---------------------------------+
         |     CPU & ray.put(state_dict))|
         +---------------+---------------+                 +---------------------------------+
@@ -489,7 +496,7 @@ class TPUCheckpointEngine(CheckpointEngine):
             return
 
         step_key = global_steps if global_steps is not None else 0
-        logger.info("TPUCheckpointEngine: [Step %s] Start send_weights...", step_key)
+        logger.info("RayPlasmaCheckpointEngine: [Step %s] Start send_weights...", step_key)
 
         t_offload_start = time.perf_counter()
         state_dict = self.pack_weights_to_grouped_dict(weights)
@@ -508,7 +515,8 @@ class TPUCheckpointEngine(CheckpointEngine):
         t_reg = time.perf_counter() - t_reg_start
 
         logger.debug(
-            "TPUCheckpointEngine Phase A [Step %s]: Total=%.3fs, OffloadFlatten=%.3fs, RayPut=%.3fs, Registry=%.3fs",
+            "RayPlasmaCheckpointEngine Phase A [Step %s]: "
+            "Total=%.3fs, OffloadFlatten=%.3fs, RayPut=%.3fs, Registry=%.3fs",
             step_key,
             time.perf_counter() - t_start,
             t_offload,
@@ -524,10 +532,11 @@ class TPUCheckpointEngine(CheckpointEngine):
 
 
 # Former name of the backend, still accepted (deprecated, see weight_sync_backends).
-CheckpointEngineRegistry.register("tpu")(TPUCheckpointEngine)
+CheckpointEngineRegistry.register("tpu")(RayPlasmaCheckpointEngine)
+TPUCheckpointEngine = RayPlasmaCheckpointEngine
 
 
-async def update_tpu_weights(manager: Any, global_steps: int | None = None) -> dict[str, Any]:
+async def update_ray_weights(manager: Any, global_steps: int | None = None) -> dict[str, Any]:
     """Synchronizes weights from the trainer worker group to vLLM rollout replicas on TPU (``ray-plasma-store``)."""
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
@@ -595,7 +604,7 @@ async def update_tpu_weights(manager: Any, global_steps: int | None = None) -> d
 
 
 def apply_tpu_checkpoint_engine_hooks() -> None:
-    """Registers TPU weight-sync hooks on ``CheckpointEngineWorker``, ``CheckpointEngineManager``, and ``TPUWorker``."""
+    """Registers ``ray-plasma-store`` worker RPC hook and TPU ``CheckpointEngineManager`` dispatch hooks."""
     try:
         for mod_path, cls_name in (
             ("vllm_torchtpu.worker.tpu_worker", "TPUWorker"),
@@ -620,48 +629,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
     except Exception as e:
         logger.debug("Failed to attach load_weights_from_ray_registry to TPUWorker: %s", e)
 
-    try:
-        import verl.checkpoint_engine.base as ckpt_base
-        from verl.plugin.platform import get_platform
-
-        if not getattr(ckpt_base, "_verl_tpu_ckpt_patched", False):
-            _orig_worker_init = ckpt_base.CheckpointEngineWorker.__init__
-            _orig_mgr_update = ckpt_base.CheckpointEngineManager.update_weights
-
-            def _patched_worker_init(self, rollout_config, model_config, server_adapter=None, *args, **kwargs):
-                if get_platform().device_name == "tpu":
-                    super(ckpt_base.CheckpointEngineWorker, self).__init__()
-                    self.rollout_config = rollout_config
-                    self.model_config = model_config
-                    self.checkpoint_engine = None
-                    self.server_adapter = None
-                    self.replica_rank = kwargs.get("replica_rank", 0)
-                    self.extra_rollout_args = args
-                    self.extra_rollout_kwargs = kwargs
-                    return
-                _orig_worker_init(self, rollout_config, model_config, server_adapter, *args, **kwargs)
-
-            @ckpt_base.auto_await
-            async def _patched_mgr_update(self, global_steps: int | None = None):
-                backend = canonical_backend(self.backend)
-                if backend == RAY_PLASMA_STORE_BACKEND:
-                    return await update_tpu_weights(self, global_steps=global_steps)
-                if backend == TPU_SYNC_BACKEND:
-                    from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_checkpoint_engine import (
-                        update_raiden_weights,
-                    )
-
-                    return await update_raiden_weights(self, global_steps=global_steps)
-                res = _orig_mgr_update(self, global_steps=global_steps)
-                if inspect.isawaitable(res):
-                    return await res
-                return res
-
-            ckpt_base.CheckpointEngineWorker.__init__ = _patched_worker_init
-            ckpt_base.CheckpointEngineManager.update_weights = _patched_mgr_update
-            ckpt_base._verl_tpu_ckpt_patched = True
-    except Exception as e:
-        logger.debug("Failed to patch CheckpointEngineWorker/Manager for TPU: %s", e)
+    apply_checkpoint_engine_manager_hooks()
 
 
 apply_tpu_checkpoint_engine_hooks()

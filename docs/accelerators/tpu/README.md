@@ -11,23 +11,55 @@ engines that send the trainer's weights to it (`ray-plasma-store` and `tpu-sync`
 
 ## Directory Structure
 
+Each subpackage extends one part of verl core:
+
+| Plugin subpackage | verl core counterpart | What it holds |
+|-------------------|-----------------------|---------------|
+| `engines/` | `verl/workers/engine/` (`BaseEngine`, `EngineRegistry`, `model_engine=torchtitan`) | The training engine: model build, forward/backward, optimizer step, weight export. Algorithm-agnostic; the GRPO/PPO loop is verl's `verl/trainer/`. |
+| `losses/` | `verl/workers/utils/losses.py` (`sft_loss`, `ppo_loss`) | Glue that hands the engine's TPU outputs to verl's unmodified losses; the only TPU code that knows the SFT/PPO loss inputs |
+| `rollout/` | `verl/workers/rollout/` (`RolloutReplicaRegistry`) | The sampler: the vLLM replica and server on TPU |
+| `weight_sync/` | `verl/checkpoint_engine/` (`CheckpointEngineRegistry`, `rollout.checkpoint_engine.backend`) | The checkpoint engines that send the trainer's weights to the rollout |
+| `patches/` | — | Runtime patches of torch / verl that TPU needs |
+
 ```text
 verl_hardware_plugin/accelerators/tpu/
-├── platform_tpu.py                  # TPU platform settings
-├── engines/
-│   ├── ray_weight_registry.py        # Ray actor holding the `ray-plasma-store` weight ObjectRefs
-│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
-│   ├── tpu_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
-│   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout (Raiden)
-│   ├── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
-│   ├── tpu_sync_rendezvous.py        # Per-job actor: Raiden controller address, tensor shapes, parity stats
-│   ├── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
-│   ├── weight_export.py              # Exports the trainer's weights as local FSDP shards or full tensors
-│   └── weight_sync_backends.py       # Weight sync backend names and their deprecated aliases
-└── rollout/
-    ├── tpu_raiden.py                 # vLLM worker extension that receives Raiden weight syncs
-    ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
-    └── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+├── __init__.py                       # Registers the TPU platform
+├── registration.py                   # Registers the engine, the weight sync engines and the rollout hook
+├── platform_tpu.py                   # PlatformTPU: device queries, Ray resources, PJRT mesh environment
+├── device_api.py                     # torch.accelerator / torch.tpu device functions
+├── engines/                          # verl core: verl/workers/engine/
+│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
+│   ├── engine_options.py             # The engine's TPU options (engine_kwargs.tpu), see Configuration
+│   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
+│   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
+├── losses/                           # verl core: verl/workers/utils/losses.py
+│   └── loss_inputs.py                # Static-shape inputs for verl's unmodified sft_loss / ppo_loss
+├── rollout/                          # verl core: verl/workers/rollout/
+│   ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
+│   ├── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+│   └── tpu_sync_worker_extension.py  # vLLM worker extension that receives `tpu-sync` weight syncs
+├── weight_sync/                      # verl core: verl/checkpoint_engine/
+│   ├── weight_sync_backends.py       # Weight sync backend names, shared helpers and manager dispatch hook
+│   ├── ray_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
+│   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout
+│   ├── tpu_sync_rendezvous.py        # Per-job actor: controller address, tensor shapes, parity stats
+│   └── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
+└── patches/
+    └── reduce_avg_allreduce_patch.py # all_reduce workaround for TPU tensors on Gloo-only groups
+```
+
+```text
+tests/accelerators/tpu/
+├── test_tpu_device_api.py            # device_api.py
+├── test_tpu_allreduce_patch.py       # patches/reduce_avg_allreduce_patch.py
+├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
+├── test_tpu_engine_options.py        # engines/engine_options.py (engine_kwargs.tpu)
+├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
+├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
+├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
+├── test_weight_sync_backends.py      # weight_sync/weight_sync_backends.py
+├── test_ray_checkpoint_engine.py     # weight_sync/ray_checkpoint_engine.py
+└── test_tpu_sync_checkpoint_engine.py # weight_sync/tpu_sync_*.py and rollout/tpu_sync_worker_extension.py
 ```
 
 ```text
@@ -35,7 +67,7 @@ docs/accelerators/tpu/
 ├── README.md                         # This file
 ├── install_guidance.md               # Installation and environment setup
 ├── quick_start.md                    # Selecting and verifying the platform
-├── rollout.md                        # Running the vLLM rollout on TPU
+├── rollout.md                        # Running the vLLM rollout on TPU; TorchTitan engine options (engine_kwargs.tpu)
 └── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
 ```
 
@@ -43,9 +75,26 @@ docs/accelerators/tpu/
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
-- [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU
+- [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU, and set the TorchTitan engine's TPU options (`engine_kwargs.tpu`)
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
 - [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
+
+## Configuration
+
+Every TPU option goes in the verl config, in the per-backend `engine_kwargs` dict of the component it
+configures, the same channel verl uses for its own backends. Only the engine needs a plugin-side parser, because
+verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet (the plugin adds it).
+
+| Component | Where the options go | Read by | Options |
+|-----------|----------------------|---------|---------|
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `engines/engine_options.py` (`TPUEngineOptions`; unknown keys are an error) | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`; see [vLLM Rollout](./rollout.md) |
+| Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `distributed_executor_backend=external_launcher` and `enable_sleep_mode=False`; there are no TPU-only rollout options. |
+| Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
+
+Process-wide settings stay environment variables, set in the shell that runs the recipe: libtpu / XLA flags
+(`LIBTPU_INIT_ARGS`, `XLA_FLAGS`) and the platform's `VERL_TPU_CHIPS_PER_HOST`. The platform forwards them to every
+worker. The older `torchtitan.<option>` fields and `VERL_TPU_*` engine variables, and `VERL_RAIDEN_RELEASE_BUFFERS`,
+still work and are deprecated.
 
 ## Platform Summary
 

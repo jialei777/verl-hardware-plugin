@@ -31,7 +31,9 @@ To keep the plugin's `INFO` and `WARNING` logs from the driver process, such as 
 [Weight Sync](./weight_sync.md#verify)), add `"VERL_LOGGING_LEVEL": "INFO"` and
 `"SAGEMAKER_CONTAINER_LOG_LEVEL": "INFO"` to the job's `env_vars`.
 
-libtpu and XLA flags, and the plugin's `VERL_TPU_*` / `VERL_RAIDEN_*` knobs, go in the shell that runs the
+libtpu and XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`), and the remaining `VERL_TPU_*` / `VERL_RAIDEN_*`
+environment variables (deprecated, see below, and `VERL_RAIDEN_RELEASE_BUFFERS` in
+[Weight Sync](./weight_sync.md#configuration)), go in the shell that runs the
 recipe, as the recipes do with `export LIBTPU_INIT_ARGS=...`. That shell is the driver process; Ray workers
 do not inherit its environment, so the platform names these variables in the job's `runtime_env`
 (`get_ray_init_kwargs`), which reaches every actor of the job, the rollout servers and vLLM's engine workers
@@ -39,6 +41,14 @@ included. This relies on `RAY_OVERRIDE_JOB_RUNTIME_ENV=1`, which the recipes exp
 submitted with `ray job submit`. A forwarded value replaces one set in a worker pod's environment, so put
 flags meant for every process in the recipe. To check that a flag arrived, look for it in the `argv[...]`
 lines of the libtpu start-up dump that each TPU worker prints.
+
+TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`, like verl's other
+per-backend options (`rollout.engine_kwargs.vllm`), e.g.
+`+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
+`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`,
+`optim_impl` and `seq_bucket_size` (see `TPUEngineOptions` in `engines/engine_options.py`); an unknown key is
+an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
+deprecated and log a warning.
 
 The rollout settings that matter on TPU (the recipes already set them):
 

@@ -13,7 +13,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_rendezvous import get_tpu_sync_rendezvous
+from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -206,7 +206,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
 
     total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
     mismatches = []
-    # Number of TP ranks holding each tensor's slice (vLLMRaidenWorkerExtension._raiden_replicas): 1 for a
+    # Number of TP ranks holding each tensor's slice (vLLMTPUSyncWorkerExtension._raiden_replicas): 1 for a
     # plain split, tp_size // num_kv_heads for GQA k/v with replicated KV heads, tp_size for unsharded tensors.
     replicas = sampler_workers[0].get("replicas") or {}
 

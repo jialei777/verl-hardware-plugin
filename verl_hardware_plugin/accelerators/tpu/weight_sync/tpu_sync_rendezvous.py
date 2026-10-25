@@ -3,7 +3,7 @@
 
 """Per-job rendezvous for the ``tpu-sync`` checkpoint engine.
 
-The weight-sync orchestrator (on the driver) publishes the address of its Raiden controller here, the trainer
+The weight-sync orchestrator (on the driver) publishes the address of its tpu-sync controller here, the trainer
 publishes the full shape of every tensor it sends (the rollout workers size their receive buffers from it), and
 both sides post weight statistics for the optional parity check. No weights pass through this actor.
 
@@ -33,11 +33,11 @@ class TpuSyncRendezvousState:
         self.stats: dict[int, dict[str, Any]] = {}
 
     def set_controller_address(self, address: Optional[str]) -> None:
-        """Records the ``host:port`` of the Raiden controller started by the weight-sync orchestrator."""
+        """Records the ``host:port`` of the tpu-sync controller started by the weight-sync orchestrator."""
         self.controller_address = address
 
     def get_controller_address(self) -> Optional[str]:
-        """Returns the Raiden controller address, or ``None`` before the orchestrator published it."""
+        """Returns the tpu-sync controller address, or ``None`` before the orchestrator published it."""
         return self.controller_address
 
     def set_global_shapes(self, shapes: dict[str, list[int]]) -> None:

@@ -5,7 +5,7 @@
 
 ``TorchTitanTPUEngine.get_per_tensor_param`` returns a ``TrainerWeights``. Iterating it yields full tensors (every
 sharded DTensor all-gathered), which is what verl and the ``ray-plasma-store`` engine expect. The ``tpu-sync`` engine
-calls ``TrainerWeights.local_shards()`` instead, which keeps each parameter that Raiden can place from its local
+calls ``TrainerWeights.local_shards()`` instead, which keeps each parameter that tpu-sync can place from its local
 block (``fsdp_dim0_shard``) on this rank and returns every other parameter full. See ``fsdp_dim0_shard`` for which
 layouts are exported locally and which are gathered.
 """
@@ -28,7 +28,7 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     """``(num_shards, shard_index)`` if this rank holds one of ``num_shards`` equal-size dim-0 blocks of ``param``.
 
     A receiver that knows the full shape places the local block from these two numbers alone (block
-    ``shard_index`` of ``num_shards``), which is all Raiden needs to reshard it for the rollout. Layouts:
+    ``shard_index`` of ``num_shards``), which is all tpu-sync needs to reshard it for the rollout. Layouts:
 
     * **FSDP** (``Shard(0)`` on a 1-D mesh) with dim 0 divisible by the mesh size: a block, exported locally.
     * **FSDP + CP**: torchtitan shards parameters over the flattened ``dp_shard`` x ``cp`` mesh dimension (CP splits
@@ -39,13 +39,13 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       training, but its ``state_dict()`` hook (``_split_qkv_on_save``) redistributes it to ``Replicate()`` (an FSDP
       all-gather) before splitting it into q/k/v_proj. TODO: split ``wqkv`` locally so q/k/v export as local shards.
     * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
-      the equal-block layout Raiden assumes.
+      the equal-block layout tpu-sync assumes.
     * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
-      blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once Raiden is confirmed to describe them.
+      blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe them.
     * **EP**: fused expert stacks never reach this function; ``TrainerWeights`` gathers them and splits them into
       one HF tensor per expert. TODO: export expert blocks locally.
     * **1-D tensors** (norm weights, biases, Qwen3.5's ``A_log`` / ``dt_bias``): ``None``, gathered. They are tiny,
-      and Raiden mis-delivers some of their small blocks (e.g. a 128-element norm weight split 8 ways arrived with
+      and tpu-sync mis-delivers some of their small blocks (e.g. a 128-element norm weight split 8 ways arrived with
       only its first block), so they are always sent whole.
 
     Every tensor that ends up gathered is logged by ``TrainerWeights.local_shards()``.

@@ -66,7 +66,7 @@ RANK_CLASS = {
     "compute_ref_log_prob": "ref",
     "compute_log_prob": "logp",
     "update_weights": "sync",
-    "release_raiden": "sync",
+    "release_tpu_sync": "sync",
 }
 
 Intervals = list[tuple[float, float]]

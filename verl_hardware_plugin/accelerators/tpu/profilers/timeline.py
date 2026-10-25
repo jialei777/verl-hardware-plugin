@@ -20,7 +20,7 @@ Groups, lanes and span names:
   ``timing_s/*`` step metrics, anchored at the step's ``update_weights``.
 * ``trainer_workers`` / ``rank<r>``: what trainer rank ``r`` executes: ``update_actor`` (``fwd_bwd`` and
   ``optimizer_step``), ``compute_ref_log_prob`` / ``compute_log_prob`` (forward only), and its side of the weight
-  sync, ``update_weights`` (``gather``, ``bind``) and ``release_raiden``. Only rank 0 prints by default; set
+  sync, ``update_weights`` (``gather``, ``bind``) and ``release_tpu_sync``. Only rank 0 prints by default; set
   ``VERL_TPU_TIMELINE_RANKS`` to a comma-separated list of ranks or to ``all``.
 * ``rollout_replica_<i>`` / ``requests``: one ``request`` per ``generate`` call, with the time parked at the closed
   submission gate (``admit``), the time to the first token (``first``), the prompt / generated tokens (``in`` /

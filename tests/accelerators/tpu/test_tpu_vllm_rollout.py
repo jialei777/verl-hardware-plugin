@@ -144,7 +144,7 @@ def test_server_worker_extension_defers_to_upstream(tpu_vllm):
     assert "run_server" not in tpu_vllm.TPUvLLMHttpServer.__dict__
 
 
-@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])  # "raiden": former name of tpu-sync
+@pytest.mark.parametrize("backend", ["tpu-sync"])
 def test_server_worker_extension_for_tpu_sync(tpu_vllm, backend):
     server = tpu_vllm.TPUvLLMHttpServer()
     server.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(backend=backend))

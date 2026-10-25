@@ -1,10 +1,10 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""``tpu-sync`` checkpoint engine: peer-to-peer weight sync between TPU slices with Raiden.
+"""``tpu-sync`` checkpoint engine: peer-to-peer weight sync between TPU slices with tpu-sync.
 
 The ``ray-plasma-store`` checkpoint engine stages the whole model through Ray's object store. ``tpu-sync`` instead
-moves the weights over the network from the trainer chips to the rollout chips with the Raiden transfer
+moves the weights over the network from the trainer chips to the rollout chips with the tpu-sync transfer
 library (``tpu-sync-torch``, https://github.com/google/tpu-sync). Every trainer rank registers its local FSDP
 shard of each weight (tensors that are not split evenly on dim 0 are gathered and registered full), and each
 rollout chip receives only its vLLM tensor-parallel shard; the controller reshards in between::
@@ -19,7 +19,7 @@ rollout chip receives only its vLLM tensor-parallel shard; the controller reshar
                        |                               |    fuse into vLLM's parameters       |
                        +-- host-to-host, resharded --->+--------------------------------------+
                                      ^
-                     [Driver: update_tpu_sync_weights + RaidenController]
+                     [Driver: update_tpu_sync_weights + tpu-sync controller]
 
 ``update_tpu_sync_weights`` runs on the driver in place of ``CheckpointEngineManager.update_weights``
 (see ``apply_checkpoint_engine_manager_hooks`` in ``weight_sync_backends.py``). Trainer and rollout
@@ -46,6 +46,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchron
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARALLELISM, get_tpu_sync_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import post_trainer_stats, verify_rollout_parity
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import (
     create_tpu_sync_rendezvous,
@@ -61,7 +62,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # How long the driver waits for every trainer and rollout worker to register with the controller.
 TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
-# Raiden reads and writes device buffers in place, so the tensors it is given must live on this device.
+# tpu-sync reads and writes device buffers in place, so the tensors it is given must live on this device.
 TPU_SYNC_DEVICE = "tpu"
 
 
@@ -123,7 +124,7 @@ def validate_and_sanitize_tensors(
     named_tensors: Iterable[tuple[str, Any]],
     device: Optional[torch.device] = None,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Validate and sanitize tensors for zero-copy DMA registration with Raiden.
+    """Validate and sanitize tensors for zero-copy DMA registration with tpu-sync.
 
     Performs physical memory validation:
     1. Drops None, non-tensor objects, zero-element tensors, and unallocated meta tensors.
@@ -158,7 +159,7 @@ def validate_and_sanitize_tensors(
         # Ensure contiguous memory layout (required for direct DMA pointer calculation)
         if not t.is_contiguous():
             t = t.contiguous()
-        # Raiden transfers whole device buffers, so a view into a larger buffer (e.g. a slice of a fused or
+        # tpu-sync transfers whole device buffers, so a view into a larger buffer (e.g. a slice of a fused or
         # all-gathered tensor) needs its own storage.
         if t._base is not None or t.storage_offset() != 0:
             t = t.clone()
@@ -169,40 +170,37 @@ def validate_and_sanitize_tensors(
 
 
 def setup_tpu_sync_controller() -> tuple[Any, Any, str, Any, str]:
-    """Start a Raiden controller server in this process and publish its address in the job's rendezvous actor.
+    """Start a tpu-sync controller server in this process and publish its address in the job's rendezvous actor.
 
     Returns:
         ``(controller, server, "host:port", rendezvous, rendezvous_name)``. The caller must keep ``server`` and
         ``rendezvous`` referenced while syncing (the rendezvous actor is not detached: Ray destroys it once no
         handle to it is left), and passes ``rendezvous_name`` to the rollout workers.
     """
-    from tpu_sync.rpc import raiden_controller
-
     # TODO(security): the controller (like the WeightSynchronizer endpoints) accepts unauthenticated
     # connections. Add authentication once tpu_sync supports it; until then it must only be reachable
     # from the cluster's trusted network.
-    controller = raiden_controller.RaidenController(port=0)
-    server = raiden_controller.RaidenControllerServer(controller)
+    controller, server = tpu_sync_api.new_controller_server()
     port = server.start()
     ip = ray.util.get_node_ip_address().strip("[]")
     address = f"{ip}:{port}"
-    logger.info(f"RaidenControllerServer started on the driver: {address}")
+    logger.info(f"tpu-sync controller server started on the driver: {address}")
 
     try:
         # This job's own rendezvous actor: other jobs on the cluster have theirs, and it ends with this job.
         rendezvous, rendezvous_name = create_tpu_sync_rendezvous()
         ray.get(rendezvous.set_controller_address.remote(address))
-        logger.info(f"Stored the RaidenController address ({address}) in {rendezvous_name}")
+        logger.info(f"Stored the tpu-sync controller address ({address}) in {rendezvous_name}")
     except Exception as reg_err:
         raise RuntimeError(
-            f"Failed to store RaidenController address ({address}) in the tpu-sync rendezvous: {reg_err}"
+            f"Failed to store the tpu-sync controller address ({address}) in the tpu-sync rendezvous: {reg_err}"
         ) from reg_err
     return controller, server, address, rendezvous, rendezvous_name
 
 
 @CheckpointEngineRegistry.register(TPU_SYNC_BACKEND)
 class TPUSyncCheckpointEngine(CheckpointEngine):
-    """Trainer-side ``tpu-sync`` engine: exposes this rank's weights to the controller-driven Raiden P2P transfer.
+    """Trainer-side ``tpu-sync`` engine: exposes this rank's weights to the controller-driven tpu-sync P2P transfer.
 
     Engine kwargs (``actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync``):
 
@@ -213,7 +211,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
       (``release_sync_buffers``) instead of keeping them resident until the next sync. The deprecated
-      environment variable ``VERL_RAIDEN_RELEASE_BUFFERS`` still overrides it, with a warning.
+      environment variable ``VERL_TPU_SYNC_RELEASE_BUFFERS`` still overrides it, with a warning.
 
     The options are parsed by ``options.get_tpu_sync_options`` (``TPUSyncOptions``); unknown keys are an error.
     """
@@ -238,7 +236,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
         self._registry: Any = None
         self._controller_addr: Optional[str] = None
-        self._trainer_raiden_ws: Any = None
+        self._trainer_tpu_sync_ws: Any = None
         # (name, shape, dtype, shard) of the tensors the live synchronizer was created and registered with; a later
         # send_weights with the same signature rebinds instead of re-creating it.
         self._registered_signature: Optional[list[tuple]] = None
@@ -270,7 +268,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         self._close_synchronizer()
 
     def _close_synchronizer(self) -> None:
-        ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+        ws, self._trainer_tpu_sync_ws = self._trainer_tpu_sync_ws, None
         self._registered_signature = None
         self._bound_tensors = None
         close = getattr(ws, "close", None)
@@ -286,7 +284,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         Args:
             weights: What the training engine's ``get_per_tensor_param`` returned. When it has ``local_shards()``
                 (``TrainerWeights``), every FSDP shard that method recognizes is registered as this rank's block of
-                the full tensor and Raiden reshards the blocks for the rollout, so the trainer never gathers them;
+                the full tensor and tpu-sync reshards the blocks for the rollout, so the trainer never gathers them;
                 the remaining tensors arrive full. Otherwise an iterable (or dict) of ``(hf_name, tensor)`` pairs
                 holding the full weights on every rank.
             global_steps: Trainer step of these weights.
@@ -328,9 +326,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # from (release_sync_buffers unbinds them between syncs). Re-creating it every sync re-allocates, pins
         # and first-touches a model-sized host buffer per rank and re-registers with the controller.
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
-        if self._trainer_raiden_ws is not None and signature == self._registered_signature:
+        if self._trainer_tpu_sync_ws is not None and signature == self._registered_signature:
             logger.info(f"Trainer Rank {self.rank}: rebinding {len(valid_weights)} tensors to the WeightSynchronizer")
-            self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
+            self._trainer_tpu_sync_ws.bind_weights([[t] for _, t in valid_weights])
         else:
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
@@ -380,7 +378,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
         logger.info(f"Trainer Rank {self.rank}: binding {len(valid_weights)} tensors to WeightSynchronizer")
         bind_ip = ray.util.get_node_ip_address().strip("[]")
-        self._trainer_raiden_ws = create_torch_weight_synchronizer(
+        self._trainer_tpu_sync_ws = create_torch_weight_synchronizer(
             [[t] for _, t in valid_weights],
             local_port=0,
             listener_port=0,
@@ -406,10 +404,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
         # Build variable metadata protos for each dynamic tensor. Every variable carries its full shape:
         # - a local FSDP shard is block `shard_index` of `num_shards` dim-0 blocks: mesh_shape=[num_shards, 1, ...]
-        #   and global_shard_indices=[shard_index], and Raiden reshards the blocks of all ranks for the rollout;
+        #   and global_shard_indices=[shard_index], and tpu-sync reshards the blocks of all ranks for the rollout;
         # - a full tensor (the same on every rank) is unsharded: mesh_shape=[1] * rank.
-        from tpu_sync.rpc import raiden_controller, raiden_service_pb2
-
         variable_protos = []
         max_shards = 1
         for idx, (name, p) in enumerate(valid_weights):
@@ -425,7 +421,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             else:
                 sharding = {"mesh_shape": [1] * len(shape), "sharding_spec": [""] * len(shape)}
             variable_protos.append(
-                raiden_service_pb2.VariableMetadataProto(
+                tpu_sync_api.variable_metadata(
                     name=name,
                     shape=shape,
                     layout=list(range(len(shape) - 1, -1, -1)),
@@ -454,31 +450,31 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                 await asyncio.sleep(0.1)
         if not self._controller_addr:
             raise RuntimeError(
-                f"Trainer Rank {self.rank}: No RaidenController address found in the tpu-sync rendezvous after timeout"
+                f"Trainer Rank {self.rank}: No tpu-sync controller address found in the rendezvous after timeout"
             )
 
         try:
-            ctrl_client = raiden_controller.RaidenControllerClientFacade(self._controller_addr)
-            unit_id = raiden_controller.RaidenId("trainer", str(self.rank), "weights")
+            ctrl_client = tpu_sync_api.controller_client(self._controller_addr)
+            unit_id = tpu_sync_api.unit_id("trainer", str(self.rank))
             ctrl_client.register_work_unit(
                 unit_id,
-                [f"{bind_ip}:{self._trainer_raiden_ws.local_port}"],
-                f"{bind_ip}:{self._trainer_raiden_ws.listener_port}",
+                [f"{bind_ip}:{self._trainer_tpu_sync_ws.local_port}"],
+                f"{bind_ip}:{self._trainer_tpu_sync_ws.listener_port}",
                 mesh_shape=[max_shards, 1],
                 variables=variable_protos,
                 mesh_axes=["fsdp", "tp"],
             )
         except Exception as reg_err:
             logger.error(
-                f"Trainer Rank {self.rank} failed to register with RaidenController "
+                f"Trainer Rank {self.rank} failed to register with the tpu-sync controller "
                 f"({self._controller_addr}): {reg_err}"
             )
             raise
         logger.info(
             f"Trainer Rank {self.rank} bound {len(valid_weights)} dynamic tensors and registered "
-            f"directly with RaidenController ({self._controller_addr}): "
-            f"data_port={self._trainer_raiden_ws.local_port}, "
-            f"listener_port={self._trainer_raiden_ws.listener_port}"
+            f"directly with the tpu-sync controller ({self._controller_addr}): "
+            f"data_port={self._trainer_tpu_sync_ws.local_port}, "
+            f"listener_port={self._trainer_tpu_sync_ws.listener_port}"
         )
 
     def release_sync_buffers(self) -> dict:
@@ -497,11 +493,11 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         Older ``tpu_sync`` builds without ``unbind_weights`` fall back to destroying the synchronizer; the next
         ``send_weights`` then re-creates and re-registers it.
         """
-        if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
+        if not self.release_buffers_after_sync or self._trainer_tpu_sync_ws is None:
             return {}
-        with timeline.span("release_raiden", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
-            if hasattr(self._trainer_raiden_ws, "unbind_weights"):
-                self._trainer_raiden_ws.unbind_weights()
+        with timeline.span("release_tpu_sync", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            if hasattr(self._trainer_tpu_sync_ws, "unbind_weights"):
+                self._trainer_tpu_sync_ws.unbind_weights()
                 self._bound_tensors = None
             else:
                 if not self._warned_no_unbind:
@@ -521,20 +517,15 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs: Any):
         raise NotImplementedError(
-            "Rollout workers receive Raiden weights through vLLMTPUSyncWorkerExtension via collective_rpc."
+            "Rollout workers receive tpu-sync weights through vLLMTPUSyncWorkerExtension via collective_rpc."
         )
-
-
-# Former name of the backend, still accepted (deprecated, see weight_sync_backends).
-CheckpointEngineRegistry.register("raiden")(TPUSyncCheckpointEngine)
-RaidenCheckpointEngine = TPUSyncCheckpointEngine
 
 
 def _tpu_sync_engine_kwargs(config: Any, backend: Optional[str] = None) -> dict[str, Any]:
     """Returns the engine kwargs of ``backend`` in a ``CheckpointEngineConfig`` (empty when unset).
 
     verl hands the trainer-side engine ``engine_kwargs[<configured backend name>]``, so the driver reads the
-    same entry: ``engine_kwargs.tpu-sync``, or ``engine_kwargs.raiden`` with the deprecated ``backend=raiden``.
+    same entry: ``engine_kwargs.tpu-sync``.
     """
     engine_kwargs = getattr(config, "engine_kwargs", None) or {}
     backend = backend or getattr(config, "backend", None) or TPU_SYNC_BACKEND
@@ -557,7 +548,7 @@ def _replica_rank(replica: Any, index: int) -> int:
 
 
 def _sampler_job_name(replica: Any, index: int) -> str:
-    """Raiden job name of a rollout replica: ``sampler<replica_rank>``.
+    """tpu-sync job name of a rollout replica: ``sampler<replica_rank>``.
 
     A rollout worker registers as (job name, rank within its replica). With several replicas the ranks
     ``0..TP-1`` would all collide under one name, and the controller would wait for ranks ``TP..N*TP-1``
@@ -569,15 +560,15 @@ def _sampler_job_name(replica: Any, index: int) -> str:
 
 
 def _get_or_start_controller(manager: Any) -> Any:
-    """Returns the Raiden controller of ``manager``, starting it on the first sync."""
-    controller = getattr(manager, "_raiden_controller", None)
+    """Returns the tpu-sync controller of ``manager``, starting it on the first sync."""
+    controller = getattr(manager, "_tpu_sync_controller", None)
     if controller is None:
         try:
             controller, server, address, rendezvous, rendezvous_name = setup_tpu_sync_controller()
         except Exception as e:
-            raise RuntimeError(f"Failed to start the RaidenControllerServer on the driver: {e}") from e
+            raise RuntimeError(f"Failed to start the tpu-sync controller server on the driver: {e}") from e
         # The server must stay referenced while the trainer and rollout workers use it.
-        manager._raiden_controller, manager._raiden_server, manager._raiden_address = controller, server, address
+        manager._tpu_sync_controller, manager._tpu_sync_server, manager._tpu_sync_address = controller, server, address
         # Holding the handle keeps the job's rendezvous actor alive for as long as the manager.
         manager._tpu_sync_rendezvous, manager._tpu_sync_rendezvous_name = rendezvous, rendezvous_name
     return controller
@@ -594,24 +585,24 @@ async def _wait_for_registration(controller: Any, src_units: list, dst_units: li
         missing_dst = [u for u in dst_units if u not in registered]
         if not missing_src and not missing_dst:
             logger.info(
-                f"[RAIDEN CONTROLLER] All {len(src_units)} Trainer and {len(dst_units)} Sampler units "
+                f"[TPU-SYNC CONTROLLER] All {len(src_units)} Trainer and {len(dst_units)} Sampler units "
                 "verified and registered."
             )
             return
         if time.perf_counter() > deadline:
             raise RuntimeError(
-                f"Timeout ({timeout_s}s) waiting for workers to register with RaidenController! "
+                f"Timeout ({timeout_s}s) waiting for workers to register with the tpu-sync controller! "
                 f"Missing Trainer: {missing_src}, Missing Sampler: {missing_dst}"
             )
         await asyncio.sleep(0.1)
 
 
 async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = None) -> dict[str, float]:
-    """Sync the trainer's weights to the vLLM rollout over Raiden, coordinated by a controller on the driver.
+    """Sync the trainer's weights to the vLLM rollout over tpu-sync, coordinated by a controller on the driver.
 
     Replaces ``CheckpointEngineManager.update_weights`` for ``backend=tpu-sync``. The rollout may hold several
     replicas (``tensor_model_parallel_size`` smaller than the number of rollout chips): every replica registers
-    under its own Raiden job name, all of them receive in one transfer, and the parity check runs per replica.
+    under its own tpu-sync job name, all of them receive in one transfer, and the parity check runs per replica.
 
     Args:
         manager: The ``CheckpointEngineManager`` (trainer worker group, rollout replicas and config).
@@ -669,21 +660,15 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     # TODO(tpu): Move worker registration and barrier verification to a one-time setup step during
     # initialization (e.g. in prepare/build_process_group), since shard registration is persistent on the
     # controller and does not need to be repeated on every weight sync iteration.
-    from tpu_sync.api.common import RaidenId
-    from tpu_sync.rpc.raiden_controller import RaidenMemoryType
-
     t_barrier_start = time.perf_counter()
-    src_units = [
-        RaidenId(job_name="trainer", job_replica_id=str(rank), data_name="weights")
-        for rank in range(manager.actor_wg.world_size)
-    ]
+    src_units = [tpu_sync_api.unit_id("trainer", str(rank)) for rank in range(manager.actor_wg.world_size)]
     # Every replica registers its TP workers as ranks '0'..'TP-1' under its own job name, and all of them go
-    # into ONE transfer: Raiden shards a transfer across the units that share a job name and broadcasts across
+    # into ONE transfer: tpu-sync shards a transfer across the units that share a job name and broadcasts across
     # job names, so its planner puts rank k of every replica into one broadcast tree, seeds a few of them from
     # the trainer and relays between the rollout hosts. One transfer per replica would make the trainer push
     # every byte once per replica instead.
     dst_units = [
-        RaidenId(job_name=_sampler_job_name(replica, replica_idx), job_replica_id=str(rank), data_name="weights")
+        tpu_sync_api.unit_id(_sampler_job_name(replica, replica_idx), str(rank))
         for replica_idx, replica in enumerate(manager.replicas)
         for rank in range(_rollout_world_size(replica))
     ]
@@ -696,7 +681,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     transfer_future = controller.start_transfer(
         src_units=src_units,
         dst_units=dst_units,
-        dst_mem_type=RaidenMemoryType.DRAM,
+        dst_mem_type=tpu_sync_api.dram_memory_type(),
         use_block_chunks=True,
         is_sender=True,
         expected_block_count=0,
@@ -750,12 +735,12 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     t_parity = time.perf_counter() - t_parity_start
 
     logger.info(
-        f"[RAIDEN TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
+        f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
         f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s\n"
-        f"  * Trainer Raiden Init    : {t_init_trainer:.4f}s\n"
-        f"  * Sampler Raiden Init    : {t_init_sampler:.4f}s\n"
-        f"  * Raiden Barrier Check   : {t_barrier:.4f}s\n"
-        f"  * RaidenController P2P   : {t_transfer:.4f}s\n"
+        f"  * Trainer Init           : {t_init_trainer:.4f}s\n"
+        f"  * Sampler Init           : {t_init_sampler:.4f}s\n"
+        f"  * Barrier Check          : {t_barrier:.4f}s\n"
+        f"  * Controller P2P         : {t_transfer:.4f}s\n"
         f"  * Sampler H2D DMA        : {t_install:.4f}s\n"
         f"  * Total End-to-End Sync  : {t_total:.4f}s"
     )
@@ -807,7 +792,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         "timing_s/tpu-sync/total_sync": t_total,
     }
     if t_h2d_pure is not None:
-        # Pure _raiden_ws.h2d() time on the slowest sampler worker (sampler_h2d above also includes the
+        # Pure _tpu_sync_ws.h2d() time on the slowest sampler worker (sampler_h2d above also includes the
         # fuse/transpose into vLLM params, the TPU sync barrier and the RPC round trip).
         metrics["timing_s/tpu-sync/sampler_h2d_pure"] = t_h2d_pure
     return metrics

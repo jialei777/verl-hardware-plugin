@@ -4,7 +4,7 @@ When `VERL_TPU_TIMELINE=1` is set, the TPU trainer engine, `tpu-sync` weight syn
 
 * **Timeline (`report.html#tab=timeline`)**:
   * **Trainer loop** (driver): `step`, `gen` (waiting for rollout), `old_log_prob`, `ref`, `adv`, `update_actor`, and `update_weights` (`sync.*` sub-phases).
-  * **Trainer ranks & HBM**: What trainer rank 0 executes on its TPU chips (`update_actor` -> `fwd_bwd` + `optimizer_step`, `compute_ref_log_prob`, `update_weights` -> `gather` / `bind` / `d2h`, `release_raiden`) plus a 1 Hz per-chip HBM lane (`GiB` / `GB`).
+  * **Trainer ranks & HBM**: What trainer rank 0 executes on its TPU chips (`update_actor` -> `fwd_bwd` + `optimizer_step`, `compute_ref_log_prob`, `update_weights` -> `gather` / `bind` / `d2h`, `release_tpu_sync`) plus a 1 Hz per-chip HBM lane (`GiB` / `GB`).
   * **Rollout replica N & HBM**: State (`generating`, draining behind closed submission gate, `paused` for weight transfer, `idle`), served weight version (`vK`), in-flight/queued requests, weight-sync RPCs, one bar per request, and a 1 Hz per-chip HBM lane.
 * **HBM Memory (`report.html#tab=memory`)**:
   * **Summary Cards**: Trainer peak HBM, idle floor, `compute_ref_log_prob` max, `update_actor` peak, `update_weights` max, and Rollout peak/floor (`GiB` and `GB`).

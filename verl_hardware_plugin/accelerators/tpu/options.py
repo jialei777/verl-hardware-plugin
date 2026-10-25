@@ -24,7 +24,7 @@ the same channel verl uses for its own backends:
 The config reaches every worker through verl, so nothing needs to be forwarded through the environment. Both
 parsers reject unknown keys and values of the wrong type, so a typo fails loudly. For compatibility the older
 channels are still read, each with a one-time deprecation warning: the top-level ``torchtitan.<option>`` fields,
-and the ``VERL_TPU_*`` / ``VERL_RAIDEN_RELEASE_BUFFERS`` environment variables (which still take precedence over the
+and the ``VERL_TPU_*`` / ``VERL_TPU_SYNC_RELEASE_BUFFERS`` environment variables (which still take precedence over the
 config, as before).
 
 Process-wide settings that are not part of any verl config stay environment variables, forwarded to every worker by
@@ -243,7 +243,7 @@ _SYNC_KINDS: dict[str, type] = {
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 
-_SYNC_LEGACY_ENV_VARS = {"release_buffers_after_sync": "VERL_RAIDEN_RELEASE_BUFFERS"}
+_SYNC_LEGACY_ENV_VARS = {"release_buffers_after_sync": "VERL_TPU_SYNC_RELEASE_BUFFERS"}
 
 
 def get_tpu_sync_options(engine_kwargs: Optional[Mapping[str, Any]], backend: str = "tpu-sync") -> TPUSyncOptions:
@@ -251,7 +251,7 @@ def get_tpu_sync_options(engine_kwargs: Optional[Mapping[str, Any]], backend: st
 
     ``engine_kwargs`` is the backend's own entry (what verl passes to the engine constructor, or
     ``checkpoint_engine.engine_kwargs[backend]`` on the driver). Precedence per option:
-    ``VERL_RAIDEN_RELEASE_BUFFERS`` (deprecated) > ``engine_kwargs.<backend>`` > the default.
+    ``VERL_TPU_SYNC_RELEASE_BUFFERS`` (deprecated) > ``engine_kwargs.<backend>`` > the default.
 
     Raises:
         ValueError: on an unknown key or a value of the wrong type.

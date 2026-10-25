@@ -262,7 +262,7 @@ const COLORS = {
   "submit_batch": "#ffcc80", "other": "#e3e8ed",
   // trainer ranks (what a trainer process executes on its chips)
   "compute_ref_log_prob": "#9ccc65", "compute_log_prob": "#42a5f5", "fwd_bwd": "#ef9a9a", "optimizer_step": "#b71c1c",
-  "gather": "#7e57c2", "bind": "#b39ddb", "d2h": "#5e35b1", "release_raiden": "#f06292",
+  "gather": "#7e57c2", "bind": "#b39ddb", "d2h": "#5e35b1", "release_tpu_sync": "#f06292",
   // weight sync phases
   "sync.quiesce": "#fb8c00", "sync.trainer_send": "#7e57c2", "sync.sampler_init": "#9575cd", "sync.barrier": "#b39ddb",
   "sync.p2p_transfer": "#4527a0", "sync.sampler_install": "#d81b60", "sync.finalize": "#f06292",
@@ -271,7 +271,6 @@ const COLORS = {
   // rollout server
   "paused": "#fb8c00", "abort": "#e65100", "resume_engine": "#26a69a",
   "rpc.install_tpu_sync_weights": "#d81b60", "rpc.init_tpu_sync_on_worker": "#9575cd",
-  "rpc.install_raiden_weights": "#d81b60", "rpc.init_raiden_sync_on_worker": "#9575cd",
   "rpc.load_weights_from_ray_registry": "#d81b60",
   // states
   "state.busy": "#2e9d4f", "state.drain": "#9ccc65", "state.paused": "#fb8c00", "state.idle": "#f28b82", "state.unknown": "#e0e0e0",
@@ -281,7 +280,7 @@ const COLORS = {
 };
 const WORKER_COLORS = [
   [/compute_ref_log_prob/, "#9ccc65"], [/compute_log_prob/, "#42a5f5"], [/update_actor|train_batch|train_mini_batch/, "#e53935"],
-  [/update_weights/, "#8e24aa"], [/release_raiden/, "#f06292"], [/save_model_to_cpu|restore_model_from_cpu|clear_cpu/, "#00acc1"],
+  [/update_weights/, "#8e24aa"], [/release_tpu_sync/, "#f06292"], [/save_model_to_cpu|restore_model_from_cpu|clear_cpu/, "#00acc1"],
   [/init_model|load_checkpoint|reset/, "#78909c"], [/execute_checkpoint_engine/, "#b39ddb"], [/update_critic|compute_values/, "#f48fb1"],
 ];
 function hashColor(s) {
@@ -289,7 +288,7 @@ function hashColor(s) {
   return "hsl(" + (((h % 360) + 360) % 360) + ",55%,62%)";
 }
 // Labels drawn inside the bars (the tooltip shows the full span name)
-const SHORT_LABEL = {compute_ref_log_prob: "ref forward", compute_log_prob: "log-prob forward", release_raiden: "release",
+const SHORT_LABEL = {compute_ref_log_prob: "ref forward", compute_log_prob: "log-prob forward", release_tpu_sync: "release",
                      initial_weight_sync: "initial sync"};
 // weight versions (v0 = initial weights, vk = weights after step k): one light hue per version
 const VERSION_COLORS = ["#a8c6e8", "#f9c38f", "#a6d49d", "#d4b5cc", "#f5e18f", "#b1dad7", "#ffc9cf", "#c9b29f"];
@@ -538,7 +537,7 @@ function buildTimelineModel(evs, metrics, sourceName) {
     if (!loopL.spans.some(s => s.name === "step")) model.synthesized = synthesizeLoop(loopL, metrics);
   }
 
-  // weight-sync phases: Raiden logs them as timing_s/tpu-sync/* step metrics; lay them out inside update_weights
+  // weight-sync phases: tpu-sync logs them as timing_s/tpu-sync/* step metrics; lay them out inside update_weights
   const loop0 = groups.has("trainer") ? groups.get("trainer").lanes.get("loop") : null;
   if (loop0 && !loop0.spans.some(s => s.name.startsWith("sync."))) {
     const order = [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"], ["sampler_init", "sync.sampler_init"],
@@ -738,7 +737,7 @@ const CLASS_NAMES = {compute: "compute (old/ref log-prob, adv, update)", sync: "
                      val: "validation", ckpt: "checkpoint", other: "other / untracked"};
 // What a trainer rank executes on its chips (trainer_workers lanes, depth 0).
 const RANK_CLASS = {update_actor: "actor", compute_ref_log_prob: "ref", compute_log_prob: "logp", update_weights: "sync",
-                    release_raiden: "sync"};
+                    release_tpu_sync: "sync"};
 const RANK_COLORS = {actor: "#e53935", ref: "#9ccc65", logp: "#42a5f5", sync: "#8e24aa", other: "#90a4ae", idle: "#eaeef2"};
 const RANK_NAMES = {actor: "actor update (fwd/bwd + optimizer)", ref: "reference forward", logp: "actor forward (log-prob)",
                     sync: "weight sync (gather, host staging, release)", other: "other", idle: "idle"};
@@ -1816,7 +1815,7 @@ const HBM_PHASE_COLORS = {
   compute_log_prob: "#42a5f5",
   update_actor: "#ef5350",
   update_weights: "#8e24aa",
-  release_raiden: "#ce93d8",
+  release_tpu_sync: "#ce93d8",
   paused: "#fb8c00",
 };
 const HBM_CHIP_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#6a1b9a", "#00838f", "#ad1457", "#4e342e"];

@@ -32,7 +32,7 @@ To keep the plugin's `INFO` and `WARNING` logs from the driver process, such as 
 `"SAGEMAKER_CONTAINER_LOG_LEVEL": "INFO"` to the job's `env_vars`.
 
 libtpu and XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`), `VERL_TPU_CHIPS_PER_HOST`, and the deprecated `VERL_TPU_*` /
-`VERL_RAIDEN_RELEASE_BUFFERS` variables (see [Configuration](./README.md#configuration)) go in the shell that runs the
+`VERL_TPU_SYNC_RELEASE_BUFFERS` variables (see [Configuration](./README.md#configuration)) go in the shell that runs the
 recipe, as the recipes do with `export LIBTPU_INIT_ARGS=...`. That shell is the driver process; Ray workers
 do not inherit its environment, so the platform names these variables in the job's `runtime_env`
 (`get_ray_init_kwargs`), which reaches every actor of the job, the rollout servers and vLLM's engine workers

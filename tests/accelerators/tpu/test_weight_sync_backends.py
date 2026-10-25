@@ -23,7 +23,7 @@ def _reset_warnings(monkeypatch):
 
 def test_backend_names():
     assert (RAY_PLASMA_STORE_BACKEND, TPU_SYNC_BACKEND) == ("ray-plasma-store", "tpu-sync")
-    assert DEPRECATED_BACKEND_NAMES == {"tpu": "ray-plasma-store", "raiden": "tpu-sync"}
+    assert DEPRECATED_BACKEND_NAMES == {"tpu": "ray-plasma-store"}
 
 
 @pytest.mark.parametrize("backend", ["ray-plasma-store", "tpu-sync", "naive", "nccl", None])
@@ -33,7 +33,7 @@ def test_canonical_backend_keeps_current_and_other_names(backend):
         assert canonical_backend(backend) == backend
 
 
-@pytest.mark.parametrize(("deprecated", "current"), [("tpu", "ray-plasma-store"), ("raiden", "tpu-sync")])
+@pytest.mark.parametrize(("deprecated", "current"), [("tpu", "ray-plasma-store")])
 def test_canonical_backend_maps_deprecated_names_and_warns_once(deprecated, current):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""vLLM worker extension that receives the trainer's weights over Raiden (tpu-sync) on TPU.
+"""vLLM worker extension that receives the trainer's weights over tpu-sync on TPU.
 
 ``TPUvLLMHttpServer`` passes this class to vLLM as ``worker_extension_cls`` when
 ``actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync``. The driver
@@ -9,7 +9,7 @@
 its methods on every vLLM worker through ``collective_rpc``:
 
 1. ``init_tpu_sync_on_worker``: allocate TP-sharded receive buffers for the tensors the trainer
-   published and register them with the Raiden controller (first sync only).
+   published and register them with the tpu-sync controller (first sync only).
 2. ``install_tpu_sync_weights``: after the transfer, copy the received buffers to TPU HBM and fuse or
    transpose them into vLLM's parameters (every sync).
 3. ``get_model_weights_stats``: weight norms for the optional parity check.
@@ -27,7 +27,8 @@ import ray
 import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as raiden
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
+from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import compute_tensor_stats
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
@@ -133,7 +134,7 @@ def _uses_vllm_weight_loader(vllm_model: Any, global_shapes: dict[str, list[int]
 
 
 class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
-    """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
+    """vLLM Worker Extension for Google Cloud TPU with tpu-sync P2P weight synchronization.
 
     Workloads using the 'tpu-sync' checkpoint engine for high-speed TPU weight sync
     must use this worker extension to bind TPU model tensors with WeightSynchronizer
@@ -158,36 +159,34 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 if addr and shapes:
                     return addr, shapes
             except Exception as e:
-                logger.debug(f"Raiden Sampler Rank {rank_val}: registry lookup failed: {e}")
+                logger.debug(f"tpu-sync Sampler Rank {rank_val}: registry lookup failed: {e}")
             time.sleep(_REGISTRY_POLL_INTERVAL_S)
         raise RuntimeError(
-            f"Raiden Sampler Rank {rank_val}: No RaidenController address or "
+            f"tpu-sync Sampler Rank {rank_val}: No tpu-sync controller address or "
             f"global shapes found in the tpu-sync rendezvous {rendezvous_name!r} after timeout"
         )
 
     def init_tpu_sync_on_worker(
         self,
-        parallelism: int = raiden.TPU_SYNC_DEFAULT_PARALLELISM,
+        parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
         rendezvous_name: Optional[str] = None,
     ) -> bool:
-        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
+        """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
-        ``job_name`` is the Raiden job this worker's replica registers under (the driver names every rollout
+        ``job_name`` is the tpu-sync job this worker's replica registers under (the driver names every rollout
         replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
         the controller. ``rendezvous_name`` is the job's ``TpuSyncRendezvous`` actor, which the driver names.
         Only the first call does work: the receive buffers, the synchronizer and the
         registration are reused by every later sync.
         """
-        if getattr(self, "_raiden_ws", None) is not None:
+        if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
 
         vllm_model = self._get_vllm_model()
         if vllm_model is None:
-            logger.warning("Raiden Sampler: could not locate vllm_model to bind parameters.")
+            logger.warning("tpu-sync Sampler: could not locate vllm_model to bind parameters.")
             return False
-
-        from tpu_sync.rpc import raiden_controller, raiden_service_pb2
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
@@ -195,10 +194,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
         listener_port = 0
 
-        # 1. Fetch RaidenController address and un-fused global shapes from the job's rendezvous
+        # 1. Fetch tpu-sync controller address and un-fused global shapes from the job's rendezvous
         controller_addr, global_shapes_map = self._wait_for_tpu_sync_rendezvous(rank_val, rendezvous_name)
         use_vllm_loaders = _uses_vllm_weight_loader(vllm_model, global_shapes_map)
-        self._raiden_use_vllm_loaders = use_vllm_loaders
+        self._tpu_sync_use_vllm_loaders = use_vllm_loaders
 
         # 2. Determine tensor parallel size from vLLM V1 config
         worker: Any = getattr(self, "worker", self)
@@ -206,7 +205,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         tp_size = getattr(parallel_config, "tensor_parallel_size", None)
         if not tp_size or tp_size <= 0:
             raise RuntimeError(
-                f"Raiden Sampler Rank {rank_val}: Unable to determine tensor_parallel_size (tp_size) "
+                f"tpu-sync Sampler Rank {rank_val}: Unable to determine tensor_parallel_size (tp_size) "
                 f"from worker.vllm_config.parallel_config!"
             )
 
@@ -235,13 +234,14 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             replicas[name] = shard.replicas
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16)
-            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=torch.device(raiden.TPU_SYNC_DEVICE))
+            device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
+            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
 
             variable_protos.append(
-                raiden_service_pb2.VariableMetadataProto(
+                tpu_sync_api.variable_metadata(
                     name=name,
                     shape=g_shape,
                     mesh_shape=shard.mesh_shape,
@@ -253,20 +253,20 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 )
             )
 
-        self._raiden_staging = staging_tensors
-        self._raiden_staging_sharded = staging_sharded
+        self._tpu_sync_staging = staging_tensors
+        self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
-        self._raiden_replicas = replicas
+        self._tpu_sync_replicas = replicas
 
-        raiden.tpu_synchronize()
+        tpu_sync_engine.tpu_synchronize()
 
         logger.info(
-            f"Raiden Sampler Rank {rank_val}: binding {len(valid_params)} staging tensors to WeightSynchronizer "
+            f"tpu-sync Sampler Rank {rank_val}: binding {len(valid_params)} staging tensors to WeightSynchronizer "
             f"(sample: name={valid_params[0][0]}, shape={valid_params[0][1].shape}, "
             f"total numel={sum(t.numel() for _, t in valid_params)})"
         )
 
-        self._raiden_ws = raiden.create_torch_weight_synchronizer(
+        self._tpu_sync_ws = tpu_sync_engine.create_torch_weight_synchronizer(
             [[t] for _, t in valid_params],
             local_port=0,
             parallelism=parallelism,
@@ -274,7 +274,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by tpu-sync's planner per transfer, from the
         # source and destination slices together, and delivered to this listener with the transfer. Do not set it
         # here from the local shape alone: both ends must make the same choice, and when they disagree (the
         # sender de-tiles to row-major, h2d() copies those bytes raw into tiled HBM) the weights come out permuted
@@ -283,23 +283,24 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # ranks).
 
         try:
-            ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
+            ctrl_client = tpu_sync_api.controller_client(controller_addr)
+            unit_id = tpu_sync_api.unit_id(job_name, str(rank_val))
             ctrl_client.register_work_unit(
                 unit_id,
-                [f"{bind_ip}:{self._raiden_ws.local_port}"],
-                f"{bind_ip}:{self._raiden_ws.listener_port}",
+                [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
+                f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
                 mesh_shape=[1, tp_size],
                 variables=variable_protos,
                 mesh_axes=["fsdp", "tp"],
             )
         except Exception as e:
-            logger.error(f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}")
+            logger.error(f"tpu-sync Sampler Rank {rank_val} failed to register with the tpu-sync controller: {e}")
             raise
         logger.info(
-            f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
-            f"directly with RaidenController ({controller_addr}) as {job_name}/{rank_val}: mesh_shape=[1, {tp_size}], "
-            f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
+            f"tpu-sync Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
+            f"directly with the tpu-sync controller ({controller_addr}) as {job_name}/{rank_val}: "
+            f"mesh_shape=[1, {tp_size}], "
+            f"data_port={self._tpu_sync_ws.local_port}, listener_port={self._tpu_sync_ws.listener_port}"
         )
 
         return True
@@ -310,28 +311,28 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         and fuse/transpose them directly into vLLM model parameters.
 
         Returns:
-            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
+            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_tpu_sync_ws.h2d()``)
             and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
         """
-        if getattr(self, "_raiden_ws", None) is None:
-            logger.warning("Raiden Sampler: install_tpu_sync_weights called before _raiden_ws was initialized.")
+        if getattr(self, "_tpu_sync_ws", None) is None:
+            logger.warning("tpu-sync Sampler: install_tpu_sync_weights called before _tpu_sync_ws was initialized.")
             return {}
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
         # init_tpu_sync_on_worker); nothing must override it here.
-        self._raiden_ws.h2d()
+        self._tpu_sync_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
-        if getattr(self, "_raiden_use_vllm_loaders", False):
+        if getattr(self, "_tpu_sync_use_vllm_loaders", False):
             self._install_with_vllm_loaders()
             t_sync_start = time.perf_counter()
-            raiden.tpu_synchronize()
+            tpu_sync_engine.tpu_synchronize()
             t_sync = time.perf_counter() - t_sync_start
             t_total = time.perf_counter() - t_start
             logger.info(
-                f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: "
+                f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: "
                 f"install_tpu_sync_weights (load_weights) completed in {t_total:.4f}s "
                 f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
             )
@@ -358,18 +359,18 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in _FUSED_TARGETS:
             primary_src = src_suffixes[0]
-            for name in list(self._raiden_staging.keys()):
+            for name in list(self._tpu_sync_staging.keys()):
                 if primary_src in name:
                     layer_src_keys = [name.replace(primary_src, s) for s in src_suffixes]
-                    if all(sk in self._raiden_staging for sk in layer_src_keys):
+                    if all(sk in self._tpu_sync_staging for sk in layer_src_keys):
                         resolved_key = find_model_key(name.replace(primary_src, target_suffix))
                         if resolved_key is not None:
-                            fused = torch.cat([self._raiden_staging[sk] for sk in layer_src_keys], dim=0)
+                            fused = torch.cat([self._tpu_sync_staging[sk] for sk in layer_src_keys], dim=0)
                             copy_into(resolved_key, fused)
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
-        for name, src_t in self._raiden_staging.items():
+        for name, src_t in self._tpu_sync_staging.items():
             if name in consumed_staging:
                 continue
             resolved_key = find_model_key(name)
@@ -378,7 +379,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
         #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
-        received_lm_head = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in self._raiden_staging)
+        received_lm_head = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in self._tpu_sync_staging)
         if received_lm_head:
             pass
         elif (
@@ -393,12 +394,12 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
 
         t_sync_start = time.perf_counter()
-        raiden.tpu_synchronize()
+        tpu_sync_engine.tpu_synchronize()
         t_sync = time.perf_counter() - t_sync_start
         t_total = time.perf_counter() - t_start
 
         logger.info(
-            f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: install_tpu_sync_weights "
+            f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: install_tpu_sync_weights "
             f"completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
@@ -427,8 +428,8 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         from vllm.distributed import get_tp_group
 
         tp_group = get_tp_group()
-        staging = self._raiden_staging
-        sharded = self._raiden_staging_sharded
+        staging = self._tpu_sync_staging
+        sharded = self._tpu_sync_staging_sharded
         t_gather = 0.0
 
         def _weights():
@@ -440,7 +441,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                     t = tp_group.all_gather(t, dim=0)
                     # Run every collective on its own: deferred (fused) collective programs can be cut at different
                     # points on different ranks and then never match up, which stalls the TP group.
-                    raiden.tpu_synchronize(t)
+                    tpu_sync_engine.tpu_synchronize(t)
                     t_gather += time.perf_counter() - t0
                 yield name, t
 
@@ -466,12 +467,12 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
         if not getattr(self, "_sorted_vllm_params", None):
             raise RuntimeError(
-                f"get_model_weights_stats is only supported for Raiden after initialization, "
+                f"get_model_weights_stats is only supported for tpu-sync after initialization, "
                 f"but self._sorted_vllm_params is not initialized on worker rank {getattr(self, 'rank', 'unknown')}!"
             )
 
         res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = getattr(self, "rank", 0)
         # How many TP ranks hold each tensor's slice, so the parity check counts every slice once.
-        res["replicas"] = dict(getattr(self, "_raiden_replicas", None) or {})
+        res["replicas"] = dict(getattr(self, "_tpu_sync_replicas", None) or {})
         return res

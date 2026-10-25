@@ -7,10 +7,10 @@
 * ``ray-plasma-store``: trainer rank 0 puts the full weights into the Ray object store (plasma) and every
   rollout worker pulls them from there (``RayPlasmaCheckpointEngine`` in ``ray_checkpoint_engine.py``).
 * ``tpu-sync``: the trainer chips send the weights peer to peer to the rollout chips with tpu-sync
-  (Raiden); each rollout chip receives only its tensor-parallel shard (``TPUSyncCheckpointEngine`` in
+ ; each rollout chip receives only its tensor-parallel shard (``TPUSyncCheckpointEngine`` in
   ``tpu_sync_checkpoint_engine.py``).
 
-The former names ``tpu`` and ``raiden`` are still accepted and emit a ``FutureWarning``.
+The former name ``tpu`` is still accepted and emit a ``FutureWarning``.
 """
 
 import inspect
@@ -28,7 +28,6 @@ TPU_SYNC_BACKEND = "tpu-sync"
 # Former backend names, mapped to the current ones.
 DEPRECATED_BACKEND_NAMES = {
     "tpu": RAY_PLASMA_STORE_BACKEND,
-    "raiden": TPU_SYNC_BACKEND,
 }
 
 _warned_deprecated_names: set[str] = set()

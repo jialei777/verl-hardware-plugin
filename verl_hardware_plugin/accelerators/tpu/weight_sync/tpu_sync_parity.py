@@ -121,7 +121,7 @@ def post_trainer_stats(
         else:
             return
         logger.info(
-            f"[RAIDEN PARITY] Successfully stored trainer rank {rank} stats for step {step}: "
+            f"[TPU-SYNC PARITY] Successfully stored trainer rank {rank} stats for step {step}: "
             f"L1={stats['l1_norm']:.4f}, numel={stats['total_numel']}"
         )
     except Exception as e:
@@ -167,7 +167,7 @@ async def verify_rollout_parity(manager: Any, global_steps: Optional[int], repli
         )
 
         if not trainer_entry or not sampler_entries:
-            logger.warning(f"[RAIDEN PARITY] Incomplete stats data for step {step_key}")
+            logger.warning(f"[TPU-SYNC PARITY] Incomplete stats data for step {step_key}")
             return
 
         if "ranks" in trainer_entry:
@@ -190,7 +190,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
     sampler_workers = [w for w in results if isinstance(w, dict)]
     if not sampler_workers:
         logger.warning(
-            f"[RAIDEN PARITY] No sampler worker stats for step {step_key}{label}: the rollout server's "
+            f"[TPU-SYNC PARITY] No sampler worker stats for step {step_key}{label}: the rollout server's "
             "collective_rpc must return the worker results for the parity check."
         )
         return
@@ -206,7 +206,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
 
     total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
     mismatches = []
-    # Number of TP ranks holding each tensor's slice (vLLMTPUSyncWorkerExtension._raiden_replicas): 1 for a
+    # Number of TP ranks holding each tensor's slice (vLLMTPUSyncWorkerExtension._tpu_sync_replicas): 1 for a
     # plain split, tp_size // num_kv_heads for GQA k/v with replicated KV heads, tp_size for unsharded tensors.
     replicas = sampler_workers[0].get("replicas") or {}
 
@@ -263,7 +263,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
 
     if not mismatches and total_numel_delta == 0 and total_l1_delta <= total_rel_tol:
         logger.info(
-            f"[RAIDEN PARITY VERIFIED | Step {step_key}{label}] 100% DISTRIBUTED NORM PARITY CONFIRMED!\n"
+            f"[TPU-SYNC PARITY VERIFIED | Step {step_key}{label}] 100% DISTRIBUTED NORM PARITY CONFIRMED!\n"
             f"  * Global L1 Norm: {total_sampler_l1:.6f} "
             f"(Trainer={total_trainer_l1:.6f}, delta={total_l1_delta:.6f})\n"
             f"  * Global L2 Norm: {global_sampler_l2:.6f} "
@@ -273,7 +273,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
     else:
         mismatches_summary = "\n".join(mismatches[:10])
         logger.error(
-            f"[RAIDEN PARITY MISMATCH | Step {step_key}{label}] Norms do NOT match!\n"
+            f"[TPU-SYNC PARITY MISMATCH | Step {step_key}{label}] Norms do NOT match!\n"
             f"  * Trainer: numel={total_trainer_numel}, L1={total_trainer_l1:.6f}, L2={global_trainer_l2:.6f}\n"
             f"  * Sampler: numel={total_sampler_numel}, L1={total_sampler_l1:.6f}, L2={global_sampler_l2:.6f}\n"
             f"  * Mismatched Tensors ({len(mismatches)} / {len(all_param_names)}):\n"

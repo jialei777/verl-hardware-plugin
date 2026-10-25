@@ -551,7 +551,7 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
     for name in list(os.environ):
-        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith(("VERL_TPU_", "VERL_RAIDEN_")):
+        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith("VERL_TPU_"):
             monkeypatch.delenv(name)
 
 
@@ -567,14 +567,14 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
     monkeypatch.setenv("LIBTPU_INIT_ARGS", flags)
     monkeypatch.setenv("XLA_FLAGS", "")  # empty: not forwarded, it would replace the workers' own value
     monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
-    monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", "0")
+    monkeypatch.setenv("VERL_TPU_SYNC_RELEASE_BUFFERS", "0")
     monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
     env_vars = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]
     assert env_vars == {
         "VERL_PLATFORM": "tpu",
         "LIBTPU_INIT_ARGS": flags,
         "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
-        "VERL_RAIDEN_RELEASE_BUFFERS": "0",
+        "VERL_TPU_SYNC_RELEASE_BUFFERS": "0",
     }
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/xla")
     assert PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"

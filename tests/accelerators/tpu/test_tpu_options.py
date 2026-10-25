@@ -142,8 +142,8 @@ def test_tpu_sync_options_reject_unknown_keys_and_bad_values(kwargs):
 
 
 def test_tpu_sync_options_name_the_configured_backend():
-    with pytest.raises(ValueError, match="engine_kwargs.raiden"):
-        get_tpu_sync_options({"bogus": 1}, backend="raiden")
+    with pytest.raises(ValueError, match="engine_kwargs.my-tpu-sync"):
+        get_tpu_sync_options({"bogus": 1}, backend="my-tpu-sync")
 
 
 @pytest.mark.parametrize(
@@ -155,11 +155,11 @@ def test_tpu_sync_options_name_the_configured_backend():
     ],
 )
 def test_release_buffers_env_var_is_deprecated(monkeypatch, caplog, kwargs, env, expected):
-    monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", env)
+    monkeypatch.setenv("VERL_TPU_SYNC_RELEASE_BUFFERS", env)
     with caplog.at_level(logging.WARNING, logger=tpu_options.__name__):
         assert get_tpu_sync_options(kwargs).release_buffers_after_sync is expected
         get_tpu_sync_options(kwargs)
-    warnings = [r.getMessage() for r in caplog.records if "VERL_RAIDEN_RELEASE_BUFFERS" in r.getMessage()]
+    warnings = [r.getMessage() for r in caplog.records if "VERL_TPU_SYNC_RELEASE_BUFFERS" in r.getMessage()]
     if env:
         # One warning per process, pointing at the config key that replaces it.
         assert len(warnings) == 1

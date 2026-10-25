@@ -12,7 +12,7 @@ and changes only what TPU needs:
 * ``distributed_executor_backend=external_launcher`` and ``enable_sleep_mode=False``: the
   multi-host executor is selected by ``patch_vllm_for_tpu``, and vllm-torchtpu has no sleep
   mode.
-* With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the Raiden worker extension
+* With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the tpu-sync worker extension
   (``tpu_sync_worker_extension.py``), which receives the trainer's weights over the network.
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
@@ -127,7 +127,7 @@ class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
 
     def _get_worker_extension_cls(self) -> str:
         # The tpu-sync checkpoint engine transfers weights straight into vLLM's workers, which need the
-        # methods of the Raiden worker extension. Other backends keep upstream's extension.
+        # methods of the tpu-sync worker extension. Other backends keep upstream's extension.
         checkpoint_engine = getattr(getattr(self, "config", None), "checkpoint_engine", None)
         if canonical_backend(getattr(checkpoint_engine, "backend", None)) == TPU_SYNC_BACKEND:
             return TPU_SYNC_WORKER_EXTENSION_CLS

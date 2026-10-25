@@ -112,7 +112,7 @@ overrides the config, as before):
 
 | Deprecated | Replacement |
 |------------|-------------|
-| `torchtitan.<option>` (`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `context_parallel_strategy`) | `torchtitan.engine_kwargs.tpu.<option>` |
+| `torchtitan.<option>` (`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`) | `torchtitan.engine_kwargs.tpu.<option>` |
 | `VERL_TPU_USE_SPLASH_ATTENTION`, `VERL_TPU_USE_SIMPLE_FSDP`, `VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY`, `VERL_TPU_EAGER_MODE`, `VERL_TPU_OPTIM_IMPL`, `VERL_TPU_SEQ_BUCKET_SIZE` | `torchtitan.engine_kwargs.tpu.<option>` |
 | `VERL_RAIDEN_RELEASE_BUFFERS` | `checkpoint_engine.engine_kwargs.tpu-sync.release_buffers_after_sync` |
 | `checkpoint_engine.backend=tpu` / `raiden` | `ray-plasma-store` / `tpu-sync` |

@@ -175,7 +175,6 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_fused_linear_cross_entropy",
     "fuse_qkv",
     "tpu_eager_mode",
-    "context_parallel_strategy",
 )
 
 

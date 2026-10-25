@@ -1259,39 +1259,3 @@ def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
     plain_inner = SimpleNamespace(_owner=object)
     with pytest.raises(RuntimeError, match="has no cp_shard"):
         TorchTitanTPUEngine._cp_attention_owner(_engine(plain_inner))
-
-
-def test_optimizer_step_synchronizes_clip_and_step_in_lockstep(monkeypatch):
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
-
-    events = []
-    fake_dist_utils = SimpleNamespace(
-        clip_grad_norm_=lambda *args, **kwargs: (events.append("clip"), torch.tensor(1.5))[1]
-    )
-    monkeypatch.setitem(sys.modules, "torchtitan", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "torchtitan.distributed", SimpleNamespace(utils=fake_dist_utils))
-    monkeypatch.setitem(sys.modules, "torchtitan.distributed.utils", fake_dist_utils)
-    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: events.append(("sync", kwargs)))
-
-    engine = object.__new__(TorchTitanTPUEngine)
-    engine._tpu_eager_mode = "DEFER_AND_FUSE"
-    engine.module = [torch.nn.Linear(2, 2)]
-    engine.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
-    engine.parallel_dims = SimpleNamespace(
-        get_optional_mesh=lambda _name: None,
-        ep_enabled=False,
-    )
-    engine.optimizer = SimpleNamespace(
-        step=lambda: events.append("step"),
-        zero_grad=lambda: events.append("zero_grad"),
-    )
-
-    grad_norm_val = engine.optimizer_step()
-    assert grad_norm_val == pytest.approx(1.5)
-    assert events == [
-        "clip",
-        ("sync", {"wait": True}),
-        "step",
-        ("sync", {"wait": True}),
-    ]

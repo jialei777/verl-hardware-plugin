@@ -291,11 +291,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 f"cache length ({training.max_context_length}); raise engine.max_seq_len or lower the bucket"
             )
 
-        # Activation checkpointing mode. Note: under spmd_backend="spmd_types" with
-        # eager execution (use_torch_compile=False), selective/full AC recompute runs
-        # on the autograd backward thread where the thread-local SPMD mesh is inactive,
-        # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
-        # (or enable torch.compile, which recomputes in-graph) in that configuration.
+        # Activation checkpointing mode. Under spmd_backend="spmd_types" with eager execution
+        # (use_torch_compile=False), selective/full AC recompute runs on the autograd backward thread
+        # where the thread-local SPMD mesh is inactive, so spmd.assert_type() raises "no current mesh".
         ac_mode = self.engine_config.activation_checkpoint
         if parallelism.spmd_backend == "spmd_types" and not self.engine_config.use_torch_compile and ac_mode != "none":
             logger.warning(
@@ -676,7 +674,6 @@ class TorchTitanTPUEngine(BaseEngine):
                             tpu_synchronize(wait=True)
                     else:
                         del loss
-                        tpu_synchronize(wait=True)
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -980,12 +977,11 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             extra_kwargs.update(cp_batch)
 
         # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
-        cp_full_segment_ids = getattr(position_ids, "_cp_full_segment_ids", None)
         extra_inputs = {"positions": position_ids, **multi_modal_inputs}
-        extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
-        if cp_full_segment_ids is not None:
-            extra_inputs["positions"]._cp_full_segment_ids = cp_full_segment_ids
-        extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
+        extra_inputs = {
+            k: v if not isinstance(v, torch.Tensor) or v.is_contiguous() else v.contiguous()
+            for k, v in extra_inputs.items()
+        }
         output_args["labels"] = labels
         input_ids = input_ids.contiguous()
 

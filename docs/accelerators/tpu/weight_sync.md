@@ -77,7 +77,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
-| `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
+| `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_RAIDEN_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 
 ## Several rollout replicas
 

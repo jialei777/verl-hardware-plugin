@@ -30,7 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
-from verl_hardware_plugin.accelerators.tpu.engines.engine_options import get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -190,7 +190,7 @@ def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
 def extend_torchtitan_engine_config() -> None:
     """Register TPU fields on ``TorchtitanEngineConfig`` for Hydra/OmegaConf.
 
-    ``engine_kwargs`` holds the TPU options under ``engine_kwargs.tpu`` (see ``engine_options``). The other
+    ``engine_kwargs`` holds the TPU options under ``engine_kwargs.tpu`` (see ``accelerators.tpu.options``). The other
     TPU fields are deprecated aliases, kept so existing recipes keep working.
     TODO(tpu): drop this patch once verl's ``TorchtitanEngineConfig`` has an ``engine_kwargs`` field.
     """

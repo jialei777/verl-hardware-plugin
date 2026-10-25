@@ -27,9 +27,9 @@ verl_hardware_plugin/accelerators/tpu/
 ├── registration.py                   # Registers the engine, the weight sync engines and the rollout hook
 ├── platform_tpu.py                   # PlatformTPU: device queries, Ray resources, PJRT mesh environment
 ├── device_api.py                     # torch.accelerator / torch.tpu device functions
+├── options.py                        # Every TPU-only option: engine, tpu-sync, platform; see Configuration
 ├── engines/                          # verl core: verl/workers/engine/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
-│   ├── engine_options.py             # The engine's TPU options (engine_kwargs.tpu), see Configuration
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
 ├── losses/                           # verl core: verl/workers/utils/losses.py
@@ -53,7 +53,7 @@ tests/accelerators/tpu/
 ├── test_tpu_device_api.py            # device_api.py
 ├── test_tpu_allreduce_patch.py       # patches/reduce_avg_allreduce_patch.py
 ├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
-├── test_tpu_engine_options.py        # engines/engine_options.py (engine_kwargs.tpu)
+├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
 ├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
@@ -82,19 +82,31 @@ docs/accelerators/tpu/
 ## Configuration
 
 Every TPU option goes in the verl config, in the per-backend `engine_kwargs` dict of the component it
-configures, the same channel verl uses for its own backends. Only the engine needs a plugin-side parser, because
-verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet (the plugin adds it).
+configures, the same channel verl uses for its own backends. All TPU-only options (the ones verl's GPU config has no
+field for) are defined and parsed in one module, `verl_hardware_plugin/accelerators/tpu/options.py`: unknown keys and
+values of the wrong type are an error, and each deprecated channel logs a one-time warning that names its
+replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; the plugin adds it.
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `engines/engine_options.py` (`TPUEngineOptions`; unknown keys are an error) | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`; see [vLLM Rollout](./rollout.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`; see [vLLM Rollout](./rollout.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `distributed_executor_backend=external_launcher` and `enable_sleep_mode=False`; there are no TPU-only rollout options. |
-| Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
+| Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
-Process-wide settings stay environment variables, set in the shell that runs the recipe: libtpu / XLA flags
-(`LIBTPU_INIT_ARGS`, `XLA_FLAGS`) and the platform's `VERL_TPU_CHIPS_PER_HOST`. The platform forwards them to every
-worker. The older `torchtitan.<option>` fields and `VERL_TPU_*` engine variables, and `VERL_RAIDEN_RELEASE_BUFFERS`,
-still work and are deprecated.
+Process-wide settings that are not part of any verl config stay environment variables, set in the shell that
+runs the recipe; the platform forwards them to every worker: libtpu / XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`)
+and `VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the topology before any
+verl config exists).
+
+Deprecated channels, still read for compatibility (each logs a one-time warning; an environment variable still
+overrides the config, as before):
+
+| Deprecated | Replacement |
+|------------|-------------|
+| `torchtitan.<option>` (`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`) | `torchtitan.engine_kwargs.tpu.<option>` |
+| `VERL_TPU_USE_SPLASH_ATTENTION`, `VERL_TPU_USE_SIMPLE_FSDP`, `VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY`, `VERL_TPU_EAGER_MODE`, `VERL_TPU_OPTIM_IMPL`, `VERL_TPU_SEQ_BUCKET_SIZE` | `torchtitan.engine_kwargs.tpu.<option>` |
+| `VERL_RAIDEN_RELEASE_BUFFERS` | `checkpoint_engine.engine_kwargs.tpu-sync.release_buffers_after_sync` |
+| `checkpoint_engine.backend=tpu` / `raiden` | `ray-plasma-store` / `tpu-sync` |
 
 ## Platform Summary
 

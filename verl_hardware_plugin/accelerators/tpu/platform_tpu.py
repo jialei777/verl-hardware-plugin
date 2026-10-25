@@ -26,6 +26,7 @@ from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
+from verl_hardware_plugin.accelerators.tpu.options import tpu_chips_per_host_override
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
 extend_torchtitan_engine_config()
@@ -298,7 +299,7 @@ def resolve_tpu_topology_bounds(
             a wrong mesh does not error, it silently trains on part of the slice.
     """
     inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
-    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+    chips_per_host = str(tpu_chips_per_host_override() or inferred_chips_per_host)
 
     if is_tpu_v7x(pod_type):
         v7x_topology = resolve_tpu_v7x_topology(total_chips, num_nodes)

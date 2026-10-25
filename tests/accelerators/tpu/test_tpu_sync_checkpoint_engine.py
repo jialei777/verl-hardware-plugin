@@ -659,15 +659,6 @@ def test_filter_tied_embeddings():
     ]
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [("1", True), ("true", True), (" Yes ", True), ("on", True), ("0", False), ("false", False), ("", False)]
-    + [("off", False), (True, True), (False, False), (1, True), (0, False)],
-)
-def test_as_bool(value, expected):
-    assert tpu_sync_engine._as_bool(value) is expected
-
-
 def test_validate_and_sanitize_tensors():
     weight = torch.arange(6.0).reshape(2, 3)
     named = [
@@ -840,7 +831,7 @@ def test_release_sync_buffers_falls_back_to_destroying_synchronizer_without_unbi
         ({}, None, True),
         ({"release_buffers_after_sync": False}, None, False),
         ({"release_buffers_after_sync": "0"}, None, False),
-        ({"release_buffers_after_sync": False}, "1", True),  # the environment variable wins
+        ({"release_buffers_after_sync": False}, "1", True),  # the deprecated environment variable still wins
         ({}, "false", False),
         ({}, "", True),  # unset / empty is ignored
     ],
@@ -1352,3 +1343,9 @@ def test_sampler_methods_before_init(worker_ext):
     assert sampler.install_tpu_sync_weights() == {}
     with pytest.raises(RuntimeError, match="only supported for Raiden after initialization"):
         sampler.get_model_weights_stats()
+
+
+def test_unknown_engine_kwarg_is_an_error():
+    # verl passes checkpoint_engine.engine_kwargs.tpu-sync to the constructor; a typo must not be ignored.
+    with pytest.raises(ValueError, match="paralelism"):
+        tpu_sync_engine.TPUSyncCheckpointEngine(paralelism=4)

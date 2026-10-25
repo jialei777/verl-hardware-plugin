@@ -43,6 +43,7 @@ import torch
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARALLELISM, get_tpu_sync_options
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import post_trainer_stats, verify_rollout_parity
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import (
     create_tpu_sync_rendezvous,
@@ -56,8 +57,6 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends impo
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Parallel transfer streams per worker, unless engine_kwargs.tpu-sync.parallelism overrides it.
-TPU_SYNC_DEFAULT_PARALLELISM = 8
 # How long the driver waits for every trainer and rollout worker to register with the controller.
 TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
 # Raiden reads and writes device buffers in place, so the tensors it is given must live on this device.
@@ -195,13 +194,6 @@ def setup_tpu_sync_controller() -> tuple[Any, Any, str, Any, str]:
     return controller, server, address, rendezvous, rendezvous_name
 
 
-def _as_bool(value: Any) -> bool:
-    """Parse a bool flag that may arrive as a string (env var, CLI override) as well as a bool."""
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
 @CheckpointEngineRegistry.register(TPU_SYNC_BACKEND)
 class TPUSyncCheckpointEngine(CheckpointEngine):
     """Trainer-side ``tpu-sync`` engine: exposes this rank's weights to the controller-driven Raiden P2P transfer.
@@ -214,27 +206,25 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
-      (``release_sync_buffers``) instead of keeping them resident until the next sync. The environment
-      variable ``VERL_RAIDEN_RELEASE_BUFFERS`` overrides it.
+      (``release_sync_buffers``) instead of keeping them resident until the next sync. The deprecated
+      environment variable ``VERL_RAIDEN_RELEASE_BUFFERS`` still overrides it, with a warning.
+
+    The options are parsed by ``options.get_tpu_sync_options`` (``TPUSyncOptions``); unknown keys are an error.
     """
 
     def __init__(self, bucket_size: int = 0, is_master: bool = False, **kwargs: Any) -> None:
         # CheckpointEngine defines no __init__ (object.__init__ takes no arguments).
         self.bucket_size = bucket_size
         self.is_master = is_master
-        self.parallelism = int(kwargs.get("parallelism", TPU_SYNC_DEFAULT_PARALLELISM))
-        self.verify_parity = _as_bool(kwargs.get("verify_parity", False))
-        tie_word_embeddings = kwargs.get("tie_word_embeddings")
-        self.tie_word_embeddings = None if tie_word_embeddings is None else _as_bool(tie_word_embeddings)
+        # verl passes checkpoint_engine.engine_kwargs.<backend> here; parsed (and validated) in one place.
+        options = get_tpu_sync_options(kwargs)
+        self.parallelism = options.parallelism
+        self.verify_parity = options.verify_parity
+        self.tie_word_embeddings = options.tie_word_embeddings
         # The synchronizer pins the device buffers of every bound tensor (a bf16 copy of this rank's weights), so
-        # dropping the Python references alone frees nothing. On by default so the
-        # trainer keeps that HBM headroom between syncs; opt out with the engine kwarg or
-        # VERL_RAIDEN_RELEASE_BUFFERS=0 to keep the send tensors resident.
-        release = _as_bool(kwargs.get("release_buffers_after_sync", True))
-        env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
-        if env_release:
-            release = _as_bool(env_release)
-        self.release_buffers_after_sync = release
+        # dropping the Python references alone frees nothing. On by default so the trainer keeps that HBM headroom
+        # between syncs; opt out with engine_kwargs.tpu-sync.release_buffers_after_sync=False.
+        self.release_buffers_after_sync = options.release_buffers_after_sync
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -591,9 +581,10 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     Returns:
         Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics.
     """
-    raiden_kwargs = _tpu_sync_engine_kwargs(manager.config, manager.backend)
-    verify_parity = _as_bool(raiden_kwargs.get("verify_parity", False))
-    parallelism = int(raiden_kwargs.get("parallelism", TPU_SYNC_DEFAULT_PARALLELISM))
+    backend = manager.backend or TPU_SYNC_BACKEND
+    options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
+    verify_parity = options.verify_parity
+    parallelism = options.parallelism
     controller = _get_or_start_controller(manager)
 
     t_abort_start = time.perf_counter()

@@ -120,7 +120,6 @@ verl (main framework)
             ├── EngineRegistry.register(device="tpu", vendor="google")
             ├── EngineRegistry.register(device="supa", vendor="biren")
             │
-            ├── CheckpointEngineRegistry.register("cncl" / "cnixl")              → Cambricon MLU
             ├── CheckpointEngineRegistry.register("ray-plasma-store" / "tpu-sync") → Google TPU
             │
             └── RolloutReplicaRegistry.register("vllm")  → TPUvLLMReplica on TPU

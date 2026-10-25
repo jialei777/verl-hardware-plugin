@@ -86,6 +86,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
+from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -371,6 +372,9 @@ class TorchTitanTPUEngine(BaseEngine):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+        if timeline.trainer_lane() is not None:
+            timeline.start_hbm_sampler(group=timeline.TRAINER_WORKERS, lane=timeline.HBM_LANE)
+
         logger.info(
             "TorchTitanTPUEngine initialized (compile=%s, splash=%s, simple_fsdp=%s, eager_mode=%s)",
             engine_config.use_torch_compile,
@@ -532,6 +536,15 @@ class TorchTitanTPUEngine(BaseEngine):
         """Data-parallel mesh (dp_replicate x dp_shard). Excludes cp: CP ranks share the same samples."""
         return self.parallel_dims.get_optional_mesh("batch")
 
+    def train_batch(self, data: TensorDict, loss_function: Callable) -> dict[str, Any]:
+        with timeline.span("update_actor", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            return super().train_batch(data, loss_function)
+
+    def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> dict[str, Any]:
+        span_name = "compute_ref_log_prob" if self.engine_config.forward_only else "compute_log_prob"
+        with timeline.span(span_name, group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            return super().infer_batch(data, loss_function)
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
@@ -553,8 +566,19 @@ class TorchTitanTPUEngine(BaseEngine):
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
+        timeline_ctx = (
+            timeline.span(
+                "fwd_bwd",
+                group=timeline.TRAINER_WORKERS,
+                lane=timeline.trainer_lane(),
+                micro_batches=len(micro_batches),
+                tokens=batch_num_tokens,
+            )
+            if not forward_only
+            else nullcontext()
+        )
 
-        with tpu_eager_mode_context(self._tpu_eager_mode):
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -610,7 +634,10 @@ class TorchTitanTPUEngine(BaseEngine):
         """Clip gradients using the per-tensor norm path (``foreach=False``) and step the optimizer."""
         from torchtitan.distributed import utils as dist_utils
 
-        with tpu_eager_mode_context(self._tpu_eager_mode):
+        with (
+            timeline.span("optimizer_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()),
+            tpu_eager_mode_context(self._tpu_eager_mode),
+        ):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.module for p in m.parameters()],
                 self.config.training.max_norm,

@@ -19,6 +19,7 @@ Each subpackage extends one part of verl core:
 | `losses/` | `verl/workers/utils/losses.py` (`sft_loss`, `ppo_loss`) | Glue that hands the engine's TPU outputs to verl's unmodified losses; the only TPU code that knows the SFT/PPO loss inputs |
 | `rollout/` | `verl/workers/rollout/` (`RolloutReplicaRegistry`) | The sampler: the vLLM replica and server on TPU |
 | `weight_sync/` | `verl/checkpoint_engine/` (`CheckpointEngineRegistry`, `rollout.checkpoint_engine.backend`) | The checkpoint engines that send the trainer's weights to the rollout |
+| `profilers/` | `verl/utils/profiler/` | Opt-in `VERL_TPU_TIMELINE` spans and 1 Hz TPU HBM memory sampling for the RL timeline report |
 | `patches/` | — | Runtime patches of torch / verl that TPU needs |
 
 ```text
@@ -44,6 +45,11 @@ verl_hardware_plugin/accelerators/tpu/
 │   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout
 │   ├── tpu_sync_rendezvous.py        # Per-job actor: controller address, tensor shapes, parity stats
 │   └── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
+├── profilers/                        # verl core: verl/utils/profiler/
+│   ├── timeline.py                   # Opt-in `VERL_TPU_TIMELINE` span prints, 1 Hz HBM sampling, and CSV sidecar CLI
+│   ├── tpu_vllm_timeline.py          # vLLM rollout server timeline mixin (requests, drain, pause, RPCs)
+│   ├── make_report.py                # Builds a self-contained HTML report (Timeline + HBM Memory tabs) from a job log
+│   └── index.html                    # Self-contained report viewer (Timeline + HBM Memory tabs; also opens raw logs)
 └── patches/
     └── reduce_avg_allreduce_patch.py # all_reduce workaround for TPU tensors on Gloo-only groups
 ```
@@ -57,6 +63,7 @@ tests/accelerators/tpu/
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
 ├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
+├── test_tpu_timeline.py              # profilers/ (timeline, tpu_vllm_timeline, make_report, index.html)
 ├── test_weight_sync_backends.py      # weight_sync/weight_sync_backends.py
 ├── test_ray_checkpoint_engine.py     # weight_sync/ray_checkpoint_engine.py
 └── test_tpu_sync_checkpoint_engine.py # weight_sync/tpu_sync_*.py and rollout/tpu_sync_worker_extension.py
@@ -68,7 +75,8 @@ docs/accelerators/tpu/
 ├── install_guidance.md               # Installation and environment setup
 ├── quick_start.md                    # Selecting and verifying the platform
 ├── rollout.md                        # Running the vLLM rollout on TPU; TorchTitan engine options (engine_kwargs.tpu)
-└── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
+├── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
+└── timeline.md                       # Recording (`VERL_TPU_TIMELINE=1`) and viewing the unified Timeline + HBM report
 ```
 
 ## Getting Started
@@ -77,6 +85,7 @@ docs/accelerators/tpu/
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
 - [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU, and set the TorchTitan engine's TPU options (`engine_kwargs.tpu`)
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
+- [RL Timeline & HBM Profiler](./timeline.md) — see what the trainer and rollout chips do and their 1 Hz HBM usage in every step (`VERL_TPU_TIMELINE=1`)
 - [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
 
 ## Configuration
@@ -94,9 +103,9 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
 Process-wide settings that are not part of any verl config stay environment variables, set in the shell that
-runs the recipe; the platform forwards them to every worker: libtpu / XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`)
-and `VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the topology before any
-verl config exists).
+runs the recipe; the platform forwards them to every worker: libtpu / XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`),
+`VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the topology before any
+verl config exists), and `VERL_TPU_TIMELINE` ([RL Timeline & HBM Profiler](./timeline.md)).
 
 Deprecated channels, still read for compatibility (each logs a one-time warning; an environment variable still
 overrides the config, as before):

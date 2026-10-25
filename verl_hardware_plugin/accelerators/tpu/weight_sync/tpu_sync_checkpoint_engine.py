@@ -45,6 +45,7 @@ from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegist
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARALLELISM, get_tpu_sync_options
+from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import post_trainer_stats, verify_rollout_parity
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import (
     create_tpu_sync_rendezvous,
@@ -292,6 +293,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         shapes, dtypes and shard layout do not change.
         """
         step_key = global_steps if global_steps is not None else 0
+        timeline_lane = timeline.trainer_lane()
+        t_start = time.time()
         logger.info(f"TPUSyncCheckpointEngine: [Step {step_key}] Start send_weights...")
         tpu_synchronize(strict=True)
 
@@ -314,6 +317,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         self._shard_info = {name: shard_info[name] for name, _ in valid_weights if name in shard_info}
 
         tpu_synchronize(strict=True)
+        t_gathered = time.time()
 
         # Reuse the synchronizer when the tensor signature is unchanged: rebinding keeps the pinned host staging
         # buffers, listener threads and controller registration, and only swaps the device buffers the D2H reads
@@ -327,6 +331,34 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
         self._bound_tensors = [t for _, t in valid_weights]
+        t_bound = time.time()
+
+        if timeline_lane is not None:
+            timeline.emit(
+                "update_weights",
+                t_start,
+                t_bound - t_start,
+                group=timeline.TRAINER_WORKERS,
+                lane=timeline_lane,
+                step=step_key,
+                tensors=len(valid_weights),
+            )
+            timeline.emit(
+                "gather",
+                t_start,
+                t_gathered - t_start,
+                group=timeline.TRAINER_WORKERS,
+                lane=timeline_lane,
+                step=step_key,
+            )
+            timeline.emit(
+                "bind",
+                t_gathered,
+                t_bound - t_gathered,
+                group=timeline.TRAINER_WORKERS,
+                lane=timeline_lane,
+                step=step_key,
+            )
 
         # No explicit d2h() here: the controller-driven push (PushWeightsResharded, started by start_transfer)
         # performs a pipelined D2H overlapped with the host-to-host transfer, using the per-transfer skip_tiling
@@ -463,23 +495,24 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         """
         if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
-        if hasattr(self._trainer_raiden_ws, "unbind_weights"):
-            self._trainer_raiden_ws.unbind_weights()
-            self._bound_tensors = None
-        else:
-            if not self._warned_no_unbind:
-                logger.warning(
-                    f"Trainer Rank {self.rank}: tpu_sync WeightSynchronizer has no unbind_weights(); destroying "
-                    "it to free the send buffers each sync (upgrade tpu-sync-torch to keep it across syncs)."
-                )
-                self._warned_no_unbind = True
-            # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
-            # device tensors and the host staging memory) is destroyed when the last Python reference goes.
-            self._close_synchronizer()
-            gc.collect()
-        # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
-        # TPU runtime reuses freed HBM without it.
-        tpu_synchronize()
+        with timeline.span("release_raiden", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            if hasattr(self._trainer_raiden_ws, "unbind_weights"):
+                self._trainer_raiden_ws.unbind_weights()
+                self._bound_tensors = None
+            else:
+                if not self._warned_no_unbind:
+                    logger.warning(
+                        f"Trainer Rank {self.rank}: tpu_sync WeightSynchronizer has no unbind_weights(); destroying "
+                        "it to free the send buffers each sync (upgrade tpu-sync-torch to keep it across syncs)."
+                    )
+                    self._warned_no_unbind = True
+                # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
+                # device tensors and the host staging memory) is destroyed when the last Python reference goes.
+                self._close_synchronizer()
+                gc.collect()
+            # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
+            # TPU runtime reuses freed HBM without it.
+            tpu_synchronize()
         return {}
 
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs: Any):
@@ -589,6 +622,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     parallelism = options.parallelism
     controller = _get_or_start_controller(manager)
 
+    t_sync_wall = time.time()
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -691,21 +725,25 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     # Tag new generations with this weight version (the trajectory staleness metrics read it), as the other
     # checkpoint backends do once the new weights are loaded. abort_replicas() already reset the prefix
     # cache, and no request has run since.
+    t_finalize_start = time.perf_counter()
     if global_steps is not None:
         await asyncio.gather(
             *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
         )
     if release_refs is not None:
         await asyncio.to_thread(ray.get, release_refs)
+    t_finalize = time.perf_counter() - t_finalize_start
 
     t_total = time.perf_counter() - t_total_start
 
     # 6. Parity verification (optional, default off).
+    t_parity_start = time.perf_counter()
     if verify_parity:
         try:
             await _verify_parity(manager, global_steps)
         except Exception as e:
             logger.warning(f"Failed to execute parity verification: {e}")
+    t_parity = time.perf_counter() - t_parity_start
 
     logger.info(
         f"[RAIDEN TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
@@ -719,7 +757,38 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     )
 
     # 7. Resume generation immediately
+    t_resume_start = time.perf_counter()
     await manager.resume_generation_replicas()
+    t_resume = time.perf_counter() - t_resume_start
+
+    if timeline.enabled():
+        step = global_steps or 0
+        sync_phases = [
+            ("sync.quiesce", t_abort),
+            ("sync.trainer_send", t_init_trainer),
+            ("sync.sampler_init", t_init_sampler),
+            ("sync.barrier", t_barrier),
+            ("sync.p2p_transfer", t_transfer),
+            ("sync.sampler_install", t_install),
+            ("sync.finalize", t_finalize),
+            ("sync.parity_check", t_parity if verify_parity else 0.0),
+            ("sync.resume", t_resume),
+        ]
+        timeline.emit(
+            "update_weights" if step > 0 else "initial_weight_sync",
+            t_sync_wall,
+            sum(d for _, d in sync_phases),
+            step=step,
+            quiesce=round(t_abort, 3),
+            trainer_send=round(t_init_trainer, 3),
+            p2p=round(t_transfer, 3),
+            install=round(t_install, 3),
+        )
+        t_cursor = t_sync_wall
+        for phase_name, phase_dur in sync_phases:
+            if phase_dur >= 1e-4:
+                timeline.emit(phase_name, t_cursor, phase_dur, step=step)
+            t_cursor += phase_dur
 
     # Surface the phase timers as step metrics. Trainers that record sync metrics (e.g. the separate-async
     # trainer's _pending_sync_metrics) log them next to timing_s/update_weights with every configured

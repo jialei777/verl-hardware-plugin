@@ -13,6 +13,7 @@ around the real ``TpuSyncRendezvousState``.
 import asyncio
 import importlib
 import itertools
+import json
 import logging
 import sys
 import threading
@@ -1350,3 +1351,28 @@ def test_unknown_engine_kwarg_is_an_error():
     # verl passes checkpoint_engine.engine_kwargs.tpu-sync to the constructor; a typo must not be ignored.
     with pytest.raises(ValueError, match="paralelism"):
         tpu_sync_engine.TPUSyncCheckpointEngine(paralelism=4)
+
+
+def test_update_tpu_sync_weights_prints_timeline(fake_tpu_sync, worker_ext, monkeypatch, capsys):
+    from verl_hardware_plugin.accelerators.tpu.profilers import timeline
+
+    monkeypatch.setenv(timeline.ENV_VAR, "1")
+    monkeypatch.delenv(timeline.RANKS_ENV_VAR, raising=False)
+    monkeypatch.delenv("RANK", raising=False)
+    weights = _trainer_weights(seed=0)
+    engines = [_trainer_engine(0, verify_parity=False)]
+    samplers = [_make_sampler(worker_ext, 0, 1, _FakeVllmModel(1))]
+    manager, _ = _make_manager(engines, lambda _: iter(weights.items()), samplers, [], verify_parity=False)
+
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+    events = [
+        json.loads(line[len(timeline.MARKER) :])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(timeline.MARKER)
+    ]
+    loop = [(e["name"], e["step"]) for e in events if e["group"] == "trainer" and not e["name"].startswith("sync.")]
+    assert loop == [("initial_weight_sync", 0), ("update_weights", 1)]
+    worker = {e["name"] for e in events if e["group"] == "trainer_workers" and e["lane"] == "rank0"}
+    assert {"update_weights", "gather", "bind", "release_raiden"} <= worker

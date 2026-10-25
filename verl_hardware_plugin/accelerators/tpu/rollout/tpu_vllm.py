@@ -25,6 +25,7 @@ from verl.plugin.platform import get_platform
 from verl.utils.device import get_device_name
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
+from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
 
@@ -108,7 +109,7 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     )
 
 
-class TPUvLLMHttpServer(vLLMHttpServer):
+class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
     """``vLLMHttpServer`` with the TPU engine arguments."""
 
     def __init__(self, *args, **kwargs):

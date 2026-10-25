@@ -556,6 +556,7 @@ def test_tpu_sync_engine_registered():
     assert ckpt_base.CheckpointEngineRegistry.get("tpu-sync") is tpu_sync_engine.TPUSyncCheckpointEngine
     # Former name of the backend, still accepted.
     assert ckpt_base.CheckpointEngineRegistry.get("raiden") is tpu_sync_engine.TPUSyncCheckpointEngine
+    assert tpu_sync_engine.RaidenCheckpointEngine is tpu_sync_engine.TPUSyncCheckpointEngine
 
 
 @pytest.mark.parametrize(

@@ -31,9 +31,9 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoin
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import compute_tensor_stats
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
-    _get_parent_module,
-    _resolve_model_key,
-    _to_target_layout,
+    get_parent_module,
+    resolve_model_key,
+    to_target_layout,
 )
 
 logger = logging.getLogger(__name__)
@@ -301,16 +301,16 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
         module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
 
-        def resolve_model_key(k: str) -> Optional[str]:
-            resolved = _resolve_model_key(k, model_sd)
+        def find_model_key(k: str) -> Optional[str]:
+            resolved = resolve_model_key(k, model_sd)
             return resolved if resolved in model_sd else None
 
         def copy_into(resolved_key: str, src: torch.Tensor) -> None:
             target_param = model_sd[resolved_key]
             target_local = target_param.to_local() if hasattr(target_param, "to_local") else target_param
-            parent_mod = _get_parent_module(resolved_key, module_dict)
+            parent_mod = get_parent_module(resolved_key, module_dict)
             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
-            target_local.copy_(_to_target_layout(src, target_local, is_flipped))
+            target_local.copy_(to_target_layout(src, target_local, is_flipped))
 
         consumed_staging = set()
 
@@ -321,7 +321,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 if primary_src in name:
                     layer_src_keys = [name.replace(primary_src, s) for s in src_suffixes]
                     if all(sk in self._raiden_staging for sk in layer_src_keys):
-                        resolved_key = resolve_model_key(name.replace(primary_src, target_suffix))
+                        resolved_key = find_model_key(name.replace(primary_src, target_suffix))
                         if resolved_key is not None:
                             fused = torch.cat([self._raiden_staging[sk] for sk in layer_src_keys], dim=0)
                             copy_into(resolved_key, fused)
@@ -331,7 +331,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         for name, src_t in self._raiden_staging.items():
             if name in consumed_staging:
                 continue
-            resolved_key = resolve_model_key(name)
+            resolved_key = find_model_key(name)
             if resolved_key is not None:
                 copy_into(resolved_key, src_t)
 

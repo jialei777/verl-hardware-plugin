@@ -58,7 +58,7 @@ def canonical_backend(backend: Optional[str]) -> Optional[str]:
     return current
 
 
-def _resolve_model_key(key: str, model_sd: dict[str, torch.Tensor]) -> str:
+def resolve_model_key(key: str, model_sd: dict[str, torch.Tensor]) -> str:
     """Resolves a cleaned trainer key against vLLM's ``model_sd`` (handling optional ``model.`` prefixes)."""
     if key in model_sd:
         return key
@@ -70,7 +70,7 @@ def _resolve_model_key(key: str, model_sd: dict[str, torch.Tensor]) -> str:
     return key
 
 
-def _get_parent_module(target_key: str, module_dict: dict[str, torch.nn.Module]) -> Optional[torch.nn.Module]:
+def get_parent_module(target_key: str, module_dict: dict[str, torch.nn.Module]) -> Optional[torch.nn.Module]:
     """Returns the owning ``torch.nn.Module`` for ``target_key``, or ``None`` if not found."""
     parent_name = target_key.rsplit(".", 1)[0] if "." in target_key else ""
     if parent_name in module_dict:
@@ -81,11 +81,16 @@ def _get_parent_module(target_key: str, module_dict: dict[str, torch.nn.Module])
     return module_dict.get(prefixed)
 
 
-def _to_target_layout(tensor: torch.Tensor, target_local: torch.Tensor, flipped: bool) -> torch.Tensor:
+def to_target_layout(tensor: torch.Tensor, target_local: torch.Tensor, flipped: bool) -> torch.Tensor:
     """Matches ``vllm-torchtpu``'s ``(n_in, n_out)`` 2D weight layout when required."""
     if tensor.ndim == 2 and (flipped or (tensor.shape != target_local.shape and tensor.T.shape == target_local.shape)):
         return tensor.transpose(0, 1).contiguous()
     return tensor.contiguous()
+
+
+_resolve_model_key = resolve_model_key
+_get_parent_module = get_parent_module
+_to_target_layout = to_target_layout
 
 
 def apply_checkpoint_engine_manager_hooks() -> None:

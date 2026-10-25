@@ -10,20 +10,21 @@ shard of each weight (tensors that are not split evenly on dim 0 are gathered an
 rollout chip receives only its vLLM tensor-parallel shard; the controller reshards in between::
 
      [Trainer slice: FSDP ranks]                       [Rollout slice: vLLM TP workers]
-    +-------------------------------------+           +--------------------------------------+
-    | TPUSyncCheckpointEngine.send_weights |           | vLLMTPUSyncWorkerExtension            |
-    |  - bind local FSDP shards to a      |           |  - init_tpu_sync_on_worker:       |
-    |    WeightSynchronizer               |           |    allocate TP-sharded receive       |
-    |  - register "trainer/<rank>"        |           |    buffers, register "sampler/<rank>"|
-    +------------------+------------------+           |  - install_tpu_sync_weights: H2D and   |
-                       |                              |    fuse into vLLM's parameters       |
-                       +-- host-to-host, resharded -->+--------------------------------------+
+    +--------------------------------------+           +--------------------------------------+
+    | TPUSyncCheckpointEngine.send_weights |           | vLLMTPUSyncWorkerExtension           |
+    |  - bind local FSDP shards to a       |           |  - init_tpu_sync_on_worker:          |
+    |    WeightSynchronizer                |           |    allocate TP-sharded receive       |
+    |  - register "trainer/<rank>"         |           |    buffers, register "sampler/<rank>"|
+    +------------------+-------------------+           |  - install_tpu_sync_weights: H2D and |
+                       |                               |    fuse into vLLM's parameters       |
+                       +-- host-to-host, resharded --->+--------------------------------------+
                                      ^
                      [Driver: update_tpu_sync_weights + RaidenController]
 
 ``update_tpu_sync_weights`` runs on the driver in place of ``CheckpointEngineManager.update_weights``
-(see ``apply_tpu_checkpoint_engine_hooks``). Trainer and rollout processes find the controller, and
-the tensor shapes, through the job's ``TpuSyncRendezvous`` actor (``tpu_sync_rendezvous.py``).
+(see ``apply_checkpoint_engine_manager_hooks`` in ``weight_sync_backends.py``). Trainer and rollout
+processes find the controller, and the tensor shapes, through the job's ``TpuSyncRendezvous`` actor
+(``tpu_sync_rendezvous.py``).
 
 Security: the controller and the WeightSynchronizer endpoints accept unauthenticated connections and
 carry model weights in the clear. Run them only on a trusted cluster network.
@@ -489,6 +490,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
 # Former name of the backend, still accepted (deprecated, see weight_sync_backends).
 CheckpointEngineRegistry.register("raiden")(TPUSyncCheckpointEngine)
+RaidenCheckpointEngine = TPUSyncCheckpointEngine
 
 
 def _tpu_sync_engine_kwargs(config: Any, backend: Optional[str] = None) -> dict[str, Any]:

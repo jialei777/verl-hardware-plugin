@@ -23,10 +23,10 @@ from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegist
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     RAY_PLASMA_STORE_BACKEND,
-    _get_parent_module,
-    _resolve_model_key,
-    _to_target_layout,
     apply_checkpoint_engine_manager_hooks,
+    get_parent_module,
+    resolve_model_key,
+    to_target_layout,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ def _build_fused_shard(
     """Shards each source projection for ``rank`` and concatenates them into a fused vLLM parameter."""
     target_v = model_sd[fused_key]
     target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
-    module = _get_parent_module(fused_key, module_dict)
+    module = get_parent_module(fused_key, module_dict)
     flipped = bool(getattr(module, "_tpu_weight_flipped", False))
 
     out_dim = target_local.shape[1] if (flipped and target_local.ndim == 2) else target_local.shape[0]
@@ -122,7 +122,7 @@ def _build_fused_shard(
         size = part.shape[0] // n_shards
         shards.append(part[shard_rank * size : (shard_rank + 1) * size])
 
-    fused = _to_target_layout(torch.cat(shards, dim=0), target_local, flipped)
+    fused = to_target_layout(torch.cat(shards, dim=0), target_local, flipped)
     return (fused_key, target_local.shape, target_local.numel(), fused.reshape(-1))
 
 
@@ -134,7 +134,7 @@ def _slice_parameter_for_rank(
     module_dict: dict[str, torch.nn.Module],
 ) -> tuple[str, torch.Size, int, torch.Tensor] | None:
     """Slices or fuses a trainer parameter into the local shard expected by vLLM rank ``rank``."""
-    target_key = _resolve_model_key(key, model_sd)
+    target_key = resolve_model_key(key, model_sd)
 
     if target_key not in model_sd:
         for suffix in (".weight", ".bias"):
@@ -145,7 +145,7 @@ def _slice_parameter_for_rank(
                 if not base.endswith(sources[0]):
                     continue
                 prefix = base[: -len(sources[0])]
-                fused_key = _resolve_model_key(f"{prefix}{fused_name}{suffix}", model_sd)
+                fused_key = resolve_model_key(f"{prefix}{fused_name}{suffix}", model_sd)
                 parts = [raw_tensors.get(f"{prefix}{s}{suffix}") for s in sources]
                 if fused_key not in model_sd or any(p is None for p in parts):
                     return None
@@ -154,7 +154,7 @@ def _slice_parameter_for_rank(
 
     target_v = model_sd[target_key]
     target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
-    parent_mod = _get_parent_module(target_key, module_dict)
+    parent_mod = get_parent_module(target_key, module_dict)
     is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
 
     param_cpu_global = raw_tensors[key]

@@ -97,7 +97,9 @@ def _parse_section(
     return {name: _parse(name, kinds[name], value, source, label) for name, value in raw.items()}
 
 
-def _apply_legacy_env(values: dict[str, Any], kinds: Mapping[str, type], env_vars: Mapping[str, str], target: str):
+def _apply_legacy_env(
+    values: dict[str, Any], kinds: Mapping[str, type], env_vars: Mapping[str, str], target: str
+) -> None:
     """Applies the deprecated environment variables over ``values``, warning once per variable."""
     for name, env_name in env_vars.items():
         raw_env = os.environ.get(env_name)

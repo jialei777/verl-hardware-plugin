@@ -1247,6 +1247,33 @@ def test_sampler_sharding_gqa_kv_heads(worker_ext):
     assert shard(k, [1024, 5120], 32, 13, None) == (["tp", ""], [32, 5120], [32, 1], [], 1)
 
 
+def test_sampler_sharding_load_weights_mode(worker_ext):
+    """use_vllm_loaders=True shards >=2D tensors on dim 0 and keeps 1-D tensors replicated."""
+
+    def shard(name, shape, tp):
+        s = worker_ext._sampler_sharding(name, shape, tp, use_vllm_loaders=True)
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.replicas
+
+    assert shard(LAYER + "linear_attn.norm.weight", [128], 8) == ([""], [128], [1], 8)
+    assert shard(LAYER + "mlp.experts.down_proj", [256, 2048, 512], 8) == (
+        ["tp", "", ""],
+        [32, 2048, 512],
+        [8, 1, 1],
+        1,
+    )
+    # Row-parallel names are still split on dim 0: the install all-gathers them before vLLM's loaders run.
+    assert shard(LAYER + "self_attn.o_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8], [2, 1], 1)
+
+
+def test_uses_vllm_weight_loader(worker_ext):
+    """Auto-selects vLLM's loaders for hybrid (linear attention) or MoE models, direct copy for dense ones."""
+    dense = {LAYER + "self_attn.q_proj.weight": [16, 8], "model.norm.weight": [8]}
+    moe = {**dense, LAYER + "mlp.experts.down_proj": [4, 8, 2]}
+    model = object()
+    assert not worker_ext._uses_vllm_weight_loader(model, dense)
+    assert worker_ext._uses_vllm_weight_loader(model, moe)
+
+
 @pytest.mark.parametrize("verify_parity", [False, True])
 def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, worker_ext, caplog, verify_parity):
     """TP=4 with 2 KV heads: each rank receives one whole KV head, and the parity check counts each head once."""

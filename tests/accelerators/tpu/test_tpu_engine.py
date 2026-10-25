@@ -992,11 +992,18 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
             "c.cols": torch.randn(4, 6, generator=generator),
             "d.replicated": torch.randn(4, generator=generator),
             "e.plain": torch.randn(3, generator=generator),
+            "f.norm": torch.randn(8, generator=generator),  # 1-D: always exported whole
             "model.embed_tokens.weight": torch.randn(6, 4, generator=generator),
         }
         full["lm_head.weight"] = full["model.embed_tokens.weight"]
         stack = torch.randn(2, 3, 4, generator=generator)
-        placements = {"a.even": Shard(0), "b.uneven": Shard(0), "c.cols": Shard(1), "d.replicated": Replicate()}
+        placements = {
+            "a.even": Shard(0),
+            "b.uneven": Shard(0),
+            "c.cols": Shard(1),
+            "d.replicated": Replicate(),
+            "f.norm": Shard(0),
+        }
         placements["model.embed_tokens.weight"] = Shard(0)
         params = {name: distribute_tensor(full[name], mesh, [p]) for name, p in placements.items()}
         params["e.plain"] = full["e.plain"]
@@ -1004,7 +1011,7 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
         stack_dt = distribute_tensor(stack, mesh, [Shard(0)])
 
         assert fsdp_dim0_shard(params["a.even"]) == (world, rank)
-        for name in ("b.uneven", "c.cols", "d.replicated", "e.plain"):
+        for name in ("b.uneven", "c.cols", "d.replicated", "e.plain", "f.norm"):
             assert fsdp_dim0_shard(params[name]) is None, name
 
         def weights() -> TrainerWeights:
@@ -1033,6 +1040,14 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
             raise AssertionError("a second export must raise")
         except RuntimeError as e:
             assert "only be exported once" in str(e)
+
+        # The dense parameters may come as several dicts (one per layer), consumed lazily; same export.
+        names = list(params)
+        chunks = iter([{n: params[n] for n in names[:2]}, {n: params[n] for n in names[2:]}])
+        chunked = list(TrainerWeights(chunks, [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu").local_shards())
+        assert [(n, s) for n, _, s in chunked] == [(n, s) for n, _, s in exported]
+        for (name, tensor, _), (_, ref, _) in zip(chunked, exported, strict=True):
+            assert torch.equal(tensor, ref), name
 
         gathered = list(weights())  # plain iteration: every tensor full, as verl expects
         assert [name for name, _ in gathered] == [*params, "x.0", "x.1"]
@@ -1259,3 +1274,149 @@ def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
     plain_inner = SimpleNamespace(_owner=object)
     with pytest.raises(RuntimeError, match="has no cp_shard"):
         TorchTitanTPUEngine._cp_attention_owner(_engine(plain_inner))
+
+
+def test_chunked_optimizer_step_matches_unchunked_adamw():
+    """Chunked ``optimizer_step`` produces the exact same grad_norm and parameter updates as un-chunked AdamW."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import (
+        TorchTitanTPUEngine,
+        _partition_params_into_chunks,
+    )
+
+    torch.manual_seed(0)
+    names = ["tok_embeddings.weight"] + [f"layers.{i}.wq.weight" for i in range(8)] + ["norm.weight"]
+    params_a = [torch.nn.Parameter(torch.randn(4, 4)) for _ in names]
+    params_b = [torch.nn.Parameter(p.detach().clone()) for p in params_a]
+    for pa, pb in zip(params_a, params_b, strict=True):
+        g = torch.randn_like(pa) * 2.0
+        pa.grad = g.clone()
+        pb.grad = g.clone()
+
+    chunks = _partition_params_into_chunks(params_a, names, layers_per_chunk=4)
+    # 2 four-layer chunks (layers 0..3, layers 4..7) + 1 non-layer chunk (tok_embeddings, norm)
+    assert [len(c) for c in chunks] == [4, 4, 2]
+
+    opt_a = torch.optim.AdamW([{"params": params_a, "param_names": names, "lr": 1e-2, "foreach": True}])
+    opt_b = torch.optim.AdamW([{"params": params_b, "param_names": names, "lr": 1e-2, "foreach": True}])
+
+    ref_norm = torch.nn.utils.clip_grad_norm_(params_b, max_norm=1.0, foreach=False).item()
+    opt_b.step()
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params_a, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt_a], zero_grad=opt_a.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+    )
+    for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+        setattr(fake_engine, helper, getattr(TorchTitanTPUEngine, helper).__get__(fake_engine))
+    chunked_norm = TorchTitanTPUEngine.optimizer_step(fake_engine)
+    assert chunked_norm == pytest.approx(ref_norm, rel=1e-6, abs=1e-6)
+    for pa, pb in zip(params_a, params_b, strict=True):
+        torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-6)
+        assert pa.grad is None
+    assert opt_a.param_groups[0]["params"] == params_a
+
+
+def test_to_hf_named_param_chunks_converts_one_layer_at_a_time():
+    """``get_per_tensor_param`` converts the state dict to HF names one transformer layer at a time, lazily."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    calls = []
+
+    class _Adapter:
+        def to_hf(self, sd):
+            calls.append(sorted(sd))
+            return {f"hf.{k}": v for k, v in sd.items()}
+
+    engine = SimpleNamespace(checkpointer=SimpleNamespace(sd_adapter=_Adapter()))
+    engine._to_hf_named_params = lambda params: TorchTitanTPUEngine._to_hf_named_params(engine, params)
+    names = [
+        "tok_embeddings.weight",
+        "layers.0.attn.wq.weight",
+        "layers.0.moe.w1",
+        "layers.1.attn.wq.weight",
+        "layers.10.attn.wq.weight",
+        "vision_encoder.layers.0.attn.wq.weight",
+        "norm.weight",
+    ]
+    params = {n: torch.zeros(1) for n in names}
+    chunks = TorchTitanTPUEngine._to_hf_named_param_chunks(engine, params)
+    assert params == {} and calls == []  # nothing is converted before the export asks for it
+    first = next(chunks)
+    assert calls == [["norm.weight", "tok_embeddings.weight"]] and set(first) == {
+        "hf.norm.weight",
+        "hf.tok_embeddings.weight",
+    }
+    rest = list(chunks)
+    assert calls[1:] == [
+        ["layers.0.attn.wq.weight", "layers.0.moe.w1"],
+        ["layers.1.attn.wq.weight"],
+        ["layers.10.attn.wq.weight"],
+        ["vision_encoder.layers.0.attn.wq.weight"],
+    ]
+    assert sum(len(c) for c in rest) == 5
+
+
+def test_resolve_tpu_model_kernels(monkeypatch):
+    """``engine_kwargs.tpu.model_kernels`` selects (or auto-detects from torchtitan) the optional TPU kernels."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    resolve = kernels_mod.resolve_tpu_model_kernels
+    # torchtitan main: no optional kernels, so "auto" (the default) enables none and explicit requests fail.
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset())
+    assert resolve("qwen3_5") == frozenset()
+    assert resolve("qwen3_5", "auto") == frozenset()
+    assert resolve("qwen3_5", "none") == frozenset()
+    with pytest.raises(ValueError, match="not provided by the installed torchtitan"):
+        resolve("qwen3_5", "all")
+
+    # An optimized torchtitan build (google-pytorch/torchtitan#73-#80) with Tokamax.
+    available = frozenset({"moe", "kda", "lce"})
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: available if name == "qwen3_5" else frozenset())
+    assert resolve("qwen3_5") == available
+    assert resolve("qwen3_5", "all") == available
+    assert resolve("qwen3_5", "none") == frozenset()
+    assert resolve("qwen3") == frozenset()
+    kernels = resolve("qwen3_5", "moe, lce")
+    assert kernels == {"moe", "lce"}
+    assert kernels_mod.override_imports(kernels) == []
+    lce = {"b_block_size": 1024, "h_block_size": 2048, "v_block_size": 640}
+    assert kernels_mod.lce_block_sizes(kernels, hidden_size=2048, vocab_size=248320) == lce
+    assert kernels_mod.lce_block_sizes(kernels, hidden_size=2560, vocab_size=248320) == {}
+    assert kernels_mod.lce_block_sizes(frozenset(), hidden_size=2048, vocab_size=248320) == {}
+    with pytest.raises(ValueError, match="not supported"):
+        resolve("qwen3_5", "bogus")
+
+
+def test_packed_document_budget_keeps_every_rl_sequence_apart():
+    """Two sequences packed into a 768-token row restart the KDA recurrence each (plus one padding segment)."""
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import set_packed_document_budget
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import _document_ids
+
+    class TokamaxGatedDeltaKernel(torch.nn.Module):  # stands in for torchtitan's kernel module (same name)
+        def __init__(self):
+            super().__init__()
+            self.max_num_segments = None
+
+    class ParallelizedTokamaxGatedDeltaKernel(TokamaxGatedDeltaKernel):  # parallelization may subclass modules
+        pass
+
+    model = torch.nn.Sequential(TokamaxGatedDeltaKernel(), torch.nn.Linear(2, 2), ParallelizedTokamaxGatedDeltaKernel())
+    assert set_packed_document_budget([model], 3) == 2
+    assert all(m.max_num_segments == 3 for m in model if isinstance(m, TokamaxGatedDeltaKernel))
+    assert set_packed_document_budget([model], 3) == 0  # unchanged: no recompile
+
+    # A packed RL row: 2 sequences (300 + 308 tokens) bucket-padded to 768; every pad token has position 0.
+    positions = torch.cat([torch.arange(300), torch.arange(308), torch.zeros(160, dtype=torch.int64)]).unsqueeze(0)
+    with mock.patch.dict(sys.modules, _fake_torchtitan_modules()):
+        segment_ids = _document_ids(positions, None)
+
+    def tokamax_ids(budget):  # torchtitan's tokamax_segment_ids (a9093690)
+        return (segment_ids - segment_ids[:, :1] + 1).clamp(max=budget)
+
+    # torchtitan's default budget for T=768 is max(1, 768 // 512) = 1: both sequences share one recurrence.
+    assert tokamax_ids(1)[0, 300].item() == tokamax_ids(1)[0, 299].item()
+    ids = tokamax_ids(3)[0]
+    assert ids[:300].eq(1).all() and ids[300:608].eq(2).all() and ids[608:].eq(3).all()

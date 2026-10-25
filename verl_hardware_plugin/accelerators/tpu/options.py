@@ -136,6 +136,8 @@ class TPUEngineOptions:
         optim_impl: torchtitan optimizer implementation (default: ``fused``, ``for-loop`` with TP).
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
+        model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
+            (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -146,6 +148,7 @@ class TPUEngineOptions:
     context_parallel_strategy: Optional[str] = None
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
+    model_kernels: Optional[str] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -157,6 +160,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "context_parallel_strategy": str,
     "optim_impl": str,
     "seq_bucket_size": int,
+    "model_kernels": str,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

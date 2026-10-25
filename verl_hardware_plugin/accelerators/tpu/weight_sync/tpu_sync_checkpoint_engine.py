@@ -158,6 +158,10 @@ def validate_and_sanitize_tensors(
         # Ensure contiguous memory layout (required for direct DMA pointer calculation)
         if not t.is_contiguous():
             t = t.contiguous()
+        # Raiden transfers whole device buffers, so a view into a larger buffer (e.g. a slice of a fused or
+        # all-gathered tensor) needs its own storage.
+        if t._base is not None or t.storage_offset() != 0:
+            t = t.clone()
 
         sanitized.append((name, t))
 

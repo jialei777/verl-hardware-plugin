@@ -122,14 +122,17 @@ class TPUEngineOptions:
     """TPU options of the TorchTitan engine. ``None`` means "use the default derived from the rest of the config".
 
     Attributes:
-        use_splash_attention: Use the Pallas splash attention kernel (default: ``use_torch_compile``).
-        use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP, CP and EP are 1).
+        use_splash_attention: Use the Pallas splash attention kernel (default: ``use_torch_compile`` or
+            ``context_parallel_size > 1``).
+        use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP and EP are 1).
         use_fused_linear_cross_entropy: Use the Pallas fused linear + cross-entropy kernel for log-probs
             (default: ``use_torch_compile`` when TP is 1).
         fuse_qkv: Fuse attention Q/K/V projections in the model (default: ``True``; ``False`` avoids
             the FSDP all-gather inside ``FusedQKVLinear._split_qkv_on_save`` during ``state_dict()``).
         tpu_eager_mode: ``torch_tpu`` eager mode, ``DEFER_AND_FUSE`` or ``DEFER_NEVER``
             (default: ``DEFER_AND_FUSE`` with ``use_torch_compile``).
+        context_parallel_strategy: Context-parallel attention strategy when ``context_parallel_size > 1``:
+            ``all_gather`` (load-balanced KV all-gather with Splash Attention, default) or ``ulysses`` (all-to-all).
         optim_impl: torchtitan optimizer implementation (default: ``fused``, ``for-loop`` with TP).
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
@@ -140,6 +143,7 @@ class TPUEngineOptions:
     use_fused_linear_cross_entropy: Optional[bool] = None
     fuse_qkv: Optional[bool] = None
     tpu_eager_mode: Optional[str] = None
+    context_parallel_strategy: Optional[str] = None
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
 
@@ -150,6 +154,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "use_fused_linear_cross_entropy": bool,
     "fuse_qkv": bool,
     "tpu_eager_mode": str,
+    "context_parallel_strategy": str,
     "optim_impl": str,
     "seq_bucket_size": int,
 }
@@ -170,6 +175,7 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_fused_linear_cross_entropy",
     "fuse_qkv",
     "tpu_eager_mode",
+    "context_parallel_strategy",
 )
 
 

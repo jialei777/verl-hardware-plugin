@@ -45,7 +45,7 @@ TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`
 per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`,
-`optim_impl` and `seq_bucket_size` (see `TPUEngineOptions` in `options.py`); an unknown key is
+`optim_impl`, `seq_bucket_size` and `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is
 an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 

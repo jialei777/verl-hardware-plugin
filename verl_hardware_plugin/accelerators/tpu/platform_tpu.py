@@ -183,7 +183,7 @@ def resolve_tpu_v7x_topology(num_devices: int, num_nodes: int, environ: Optional
     """
     environ = os.environ if environ is None else environ
     override = environ.get("TORCH_TPU_TOPOLOGY")
-    if override:
+    if override and math.prod(_bounds(override)) == num_devices:
         return override
     slice_topology, slice_hosts = gke_tpu_slice_topology(environ)
     if slice_topology:
@@ -287,8 +287,10 @@ def resolve_tpu_topology_bounds(
 ) -> tuple[str, str, str, str]:
     """Resolve ``(topology, host_bounds, chips_per_host_bounds, chips_per_host)`` for a TPU slice.
 
-    Resolution order for the topology is: the ``TORCH_TPU_TOPOLOGY`` escape hatch, then the pod
-    type reported by Ray, then the chip count.
+    Resolution order for the topology is: the ``TORCH_TPU_TOPOLOGY`` escape hatch (when its chip
+    count matches ``total_chips``, ignoring a GKE TPU webhook variable inherited from a different
+    slice where the caller/driver process happens to run), then the pod type reported by Ray, then
+    the chip count.
 
     On TPU 7x (``pod_type`` or ``TPU_ACCELERATOR_TYPE`` names it) ``total_chips`` counts TensorCore
     devices, the topology is the 4-D mesh of ``resolve_tpu_v7x_topology`` and every process is its own
@@ -305,10 +307,11 @@ def resolve_tpu_topology_bounds(
         v7x_topology = resolve_tpu_v7x_topology(total_chips, num_nodes)
         return v7x_topology, v7x_topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
 
+    env_topology = os.environ.get("TORCH_TPU_TOPOLOGY", "")
+    if env_topology and math.prod(_bounds(env_topology)) != total_chips:
+        env_topology = ""
     topology = (
-        os.environ.get("TORCH_TPU_TOPOLOGY")
-        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
-        or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
+        env_topology or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower()) or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
     )
     if not topology:
         raise ValueError(

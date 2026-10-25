@@ -49,6 +49,7 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "tpu_eager_mode": "DEFER_NEVER",
                 "optim_impl": "for-loop",
                 "seq_bucket_size": "512",
+                "context_parallel_strategy": "ulysses",
             }
         )
     )
@@ -59,6 +60,7 @@ def test_engine_kwargs_are_parsed_and_typed():
         tpu_eager_mode="DEFER_NEVER",
         optim_impl="for-loop",
         seq_bucket_size=512,
+        context_parallel_strategy="ulysses",
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()

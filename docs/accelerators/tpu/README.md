@@ -98,7 +98,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`; see [vLLM Rollout](./rollout.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `context_parallel_strategy`; see [vLLM Rollout](./rollout.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `distributed_executor_backend=external_launcher` and `enable_sleep_mode=False`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
@@ -112,7 +112,7 @@ overrides the config, as before):
 
 | Deprecated | Replacement |
 |------------|-------------|
-| `torchtitan.<option>` (`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`) | `torchtitan.engine_kwargs.tpu.<option>` |
+| `torchtitan.<option>` (`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `context_parallel_strategy`) | `torchtitan.engine_kwargs.tpu.<option>` |
 | `VERL_TPU_USE_SPLASH_ATTENTION`, `VERL_TPU_USE_SIMPLE_FSDP`, `VERL_TPU_USE_FUSED_LINEAR_CROSS_ENTROPY`, `VERL_TPU_EAGER_MODE`, `VERL_TPU_OPTIM_IMPL`, `VERL_TPU_SEQ_BUCKET_SIZE` | `torchtitan.engine_kwargs.tpu.<option>` |
 | `VERL_RAIDEN_RELEASE_BUFFERS` | `checkpoint_engine.engine_kwargs.tpu-sync.release_buffers_after_sync` |
 | `checkpoint_engine.backend=tpu` / `raiden` | `ray-plasma-store` / `tpu-sync` |

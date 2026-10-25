@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import Counter
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -99,6 +99,11 @@ class TrainerWeights:
     (``TorchTitanTPUEngine`` converts one transformer layer at a time, so that the tensors its state-dict adapter
     fuses, e.g. Qwen3.5's MoE ``gate_up_proj``, exist for one layer at a time). A parameter reachable under several
     names (tied embeddings) must appear in one dict.
+
+    ``local_transform``, if given, rewrites each dense dict before ``local_shards()`` exports it: the layout that the
+    ``tpu-sync`` receiver installs from (e.g. Qwen3.5's fused ``in_proj_qkv`` / ``conv1d`` / expert ``gate_up_proj``
+    split into the pieces that vLLM TP-shards separately, see ``rollout.qwen3_5_layout``). Plain iteration keeps
+    verl's HF layout.
     """
 
     def __init__(
@@ -106,8 +111,10 @@ class TrainerWeights:
         dense: dict[str, Any] | Iterable[dict[str, Any]],
         expert_stacks: list[tuple[Any, list[tuple[str, tuple]]]],
         device: Any,
+        local_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     ) -> None:
         self._dense_chunks = iter([dense]) if isinstance(dense, dict) else iter(dense)
+        self._local_transform = local_transform
         self._expert_stacks = expert_stacks
         self._device = device
         self._iter: Optional[Iterator[tuple[str, torch.Tensor]]] = None
@@ -125,9 +132,11 @@ class TrainerWeights:
         """Yields ``(hf_name, tensor, shard)``; see the class docstring."""
         return self._export(local=True)
 
-    def _dense_items(self) -> Iterator[tuple[str, Any, int]]:
+    def _dense_items(self, local: bool = False) -> Iterator[tuple[str, Any, int]]:
         """Pops ``(hf_name, param, number of names of param in its dict)`` from the dense dicts, one dict at a time."""
         for chunk in self._dense_chunks:
+            if local and self._local_transform is not None:
+                chunk = self._local_transform(chunk)
             names_per_param = Counter(id(p) for p in chunk.values())
             for name in list(chunk.keys()):
                 param = chunk.pop(name)
@@ -142,7 +151,7 @@ class TrainerWeights:
         # The entries keep their parameter referenced, so its id is not reused while it is a key.
         exported: dict[int, tuple[torch.Tensor, Optional[tuple[int, int]], Any]] = {}
         counts = {"local": 0, "replicated": 0, "gathered": 0}
-        for name, param, num_names in self._dense_items():
+        for name, param, num_names in self._dense_items(local):
             pid = id(param)
             if pid in exported:
                 tensor, shard, _ = exported[pid]

@@ -245,6 +245,7 @@ class TorchTitanTPUEngine(BaseEngine):
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
+        self._torchtitan_name = torchtitan_name
 
         tpu_options = get_tpu_engine_options(self.engine_config)
 
@@ -1067,7 +1068,16 @@ class TorchTitanTPUEngine(BaseEngine):
         # wqkv FSDP sharded, and its state_dict() hook (_split_qkv_on_save) all-gathers it to Replicate() before
         # splitting it into q/k/v; see weight_export.fsdp_dim0_shard.
         # TODO(tpu): split wqkv locally on save (or train with fuse_qkv=False) so q/k/v export as local shards.
-        return TrainerWeights(dense, expert_stacks, get_device_id()), None
+        # tpu-sync installs Qwen3.5 straight into vLLM's TP-sharded parameters and receives the tensors that vLLM
+        # shards in several pieces (in_proj_qkv, conv1d, the stacked experts' gate_up_proj) as those pieces
+        # (rollout/qwen3_5_layout.py); plain iteration keeps the HF layout.
+        local_transform = None
+        if getattr(self, "_torchtitan_name", None) == "qwen3_5":
+            from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
+
+            hf_config = self.model_config.hf_config
+            local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
+        return TrainerWeights(dense, expert_stacks, get_device_id(), local_transform=local_transform), None
 
 
 @EngineRegistry.register(

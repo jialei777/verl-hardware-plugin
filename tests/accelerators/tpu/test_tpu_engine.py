@@ -138,7 +138,8 @@ def test_pad_packed_inputs_for_tpu_pads_to_bucket_and_aligned_length():
             device=torch.device("cpu"),
         )
     assert orig_seq_len == 5
-    assert ids.tolist() == [10, 11, 12, 20, 21, 0, 0, 0]
+    # Pad tokens cycle real input_ids so MoE routers spread pad traffic across experts.
+    assert ids.tolist() == [10, 11, 12, 20, 21, 10, 11, 12]
     # Pad tokens get position 0: each one is its own document for the attention.
     assert pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0]
     assert labels.tolist() == [11, 12, 20, 21, 10, 0, 0, 0]
@@ -1337,6 +1338,53 @@ def test_chunked_optimizer_step_matches_unchunked_adamw():
     assert opt_a.param_groups[0]["params"] == params_a
 
 
+@pytest.mark.parametrize("host_offload", [False, True])
+def test_chunked_optimizer_step_fp32_master(host_offload):
+    """``fp32_master``: bf16 params follow an FP32 AdamW run (cast to bf16) and keep tiny updates bf16 alone loses."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    torch.manual_seed(0)
+    names = [f"layers.{i}.wq.weight" for i in range(6)] + ["norm.weight"]
+    ref = [torch.nn.Parameter(torch.randn(8, 8)) for _ in names]
+    params = [torch.nn.Parameter(p.detach().to(torch.bfloat16)) for p in ref]
+    for p in ref:  # the reference starts from the same (bf16-representable) weights
+        p.data.copy_(p.data.to(torch.bfloat16).float())
+    lr = 1e-6  # ~3 orders of magnitude below a bf16 ulp of these weights
+    opt_ref = torch.optim.AdamW([{"params": ref, "lr": lr, "foreach": True}])
+    opt = torch.optim.AdamW([{"params": params, "param_names": names, "lr": lr, "foreach": True}])
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        _tpu_options=TPUEngineOptions(param_dtype="bfloat16", fp32_master=True, optimizer_host_offload=host_offload),
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt], zero_grad=opt.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1e9)),
+    )
+    for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+        setattr(fake_engine, helper, getattr(TorchTitanTPUEngine, helper).__get__(fake_engine))
+
+    initial = [p.detach().clone() for p in params]
+    for _ in range(300):
+        for p, r in zip(params, ref, strict=True):
+            g = torch.randn_like(r)
+            r.grad = g.clone()
+            p.grad = g.to(torch.bfloat16)
+        opt_ref.step()
+        TorchTitanTPUEngine.optimizer_step(fake_engine)
+    store = fake_engine._fp32_master_store
+    for p, r in zip(params, ref, strict=True):
+        assert p.dtype == torch.bfloat16 and p.grad is None
+        master, state = store._entries[id(p)]
+        assert master.dtype == torch.float32 and state["exp_avg"].dtype == torch.float32
+        torch.testing.assert_close(master, r.detach(), rtol=1e-3, atol=1e-6)  # bf16 grads, fp32 everything else
+        torch.testing.assert_close(p.detach(), master.to(torch.bfloat16), rtol=0, atol=0)
+    # 300 steps x 1e-6 move the masters by ~3e-4, enough to flip some bf16 weights.
+    assert any(not torch.equal(p.detach(), i) for p, i in zip(params, initial, strict=True))
+    assert opt.state == {} and opt.param_groups[0]["params"] == params
+
+
 def test_to_hf_named_param_chunks_converts_one_layer_at_a_time():
     """``get_per_tensor_param`` converts the state dict to HF names one transformer layer at a time, lazily."""
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
@@ -1438,3 +1486,44 @@ def test_packed_document_budget_keeps_every_rl_sequence_apart():
     assert tokamax_ids(1)[0, 300].item() == tokamax_ids(1)[0, 299].item()
     ids = tokamax_ids(3)[0]
     assert ids[:300].eq(1).all() and ids[300:608].eq(2).all() and ids[608:].eq(3).all()
+
+
+def test_ep_capacity_factor_and_strided_pad_tokens():
+    """Non-Module ``RoutedExperts.token_dispatcher`` gets ``capacity_factor``, and padding strides across vocab."""
+    from tensordict import TensorDict
+
+    from verl.utils import tensordict_utils as tu
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import set_ep_capacity_factor
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pad_packed_inputs_for_tpu
+
+    class TpuQwen35TokenDispatcher:  # plain Configurable object in torchtitan (NOT an nn.Module)
+        def __init__(self):
+            self.capacity_factor = 1.25
+
+    class RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.token_dispatcher = TpuQwen35TokenDispatcher()
+
+    model = torch.nn.Sequential(RoutedExperts(), torch.nn.Linear(2, 2), RoutedExperts())
+    assert set_ep_capacity_factor([model], 4.0) == 2
+    assert all(m.token_dispatcher.capacity_factor == 4.0 for m in model if isinstance(m, RoutedExperts))
+    assert set_ep_capacity_factor([model], 4.0) == 0
+
+    ids = torch.nested.nested_tensor_from_jagged(torch.tensor([11, 22, 33, 44, 55]), torch.tensor([0, 3, 5]))
+    pos = torch.nested.nested_tensor_from_jagged(torch.tensor([0, 1, 2, 0, 1]), torch.tensor([0, 3, 5]))
+    mb = TensorDict({}, batch_size=[2])
+    tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", 12)
+    padded_ids, padded_pos, padded_labels, orig_len = pad_packed_inputs_for_tpu(
+        ids, pos, mb, device="cpu", bucket_size=8, vocab_size=1000
+    )
+    assert orig_len == 5 and padded_ids.shape == (12,)
+    assert padded_ids[:5].tolist() == [11, 22, 33, 44, 55]
+    assert padded_ids[5:].tolist() == [(i * 9973) % 1000 for i in range(7)]
+    assert len(set(padded_ids[5:].tolist())) == 7
+    assert padded_pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    assert padded_labels.tolist() == [22, 33, 44, 55, 11, 0, 0, 0, 0, 0, 0, 0]
+
+    # Fallback when vocab_size is omitted: cycle real token IDs so tiny synthetic vocabs never go out of bounds.
+    fallback_ids, _, _, _ = pad_packed_inputs_for_tpu(ids, pos, mb, device="cpu", bucket_size=8)
+    assert fallback_ids.tolist() == [11, 22, 33, 44, 55, 11, 22, 33, 44, 55, 11, 22]

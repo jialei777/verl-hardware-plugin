@@ -74,6 +74,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     fused_linear_logprobs_tpu,
+    get_text_config,
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
@@ -116,6 +117,119 @@ _LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _LAYER_PREFIX_RE = re.compile(r"^(.*?(?:^|\.)layers\.\d+)\.")
 _OPTIMIZER_STEP_LAYERS_PER_CHUNK = 4
 _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK = 64
+
+
+# Safetensors files that the initial HF load reads in parallel (one thread per file; see engines/hf_range_reader.py).
+_HF_LOAD_THREADS_ENV = "VERL_TPU_HF_LOAD_THREADS"
+
+
+def _use_threaded_hf_reader(checkpointer: Any) -> None:
+    """Makes the initial HF load pread byte ranges from ``VERL_TPU_HF_LOAD_THREADS`` (default 16) files at a time.
+
+    torch's reader reads through mmap slices, ~6 MB/s per reader on a gcsfuse mount (hours for a 740 GB checkpoint).
+    """
+    sd_adapter = getattr(checkpointer, "sd_adapter", None)
+    threads = int(os.environ.get(_HF_LOAD_THREADS_ENV, "16"))
+    if sd_adapter is None or threads < 1 or not hasattr(sd_adapter, "get_hf_storage_reader"):
+        return
+    original = sd_adapter.get_hf_storage_reader
+
+    def get_hf_storage_reader(path: str, from_quantized: bool = False):
+        reader = original(path, from_quantized)
+        if from_quantized or type(reader).__name__ != "HuggingFaceStorageReader":
+            return reader
+        from verl_hardware_plugin.accelerators.tpu.engines.hf_range_reader import make_range_read_hf_storage_reader
+
+        return make_range_read_hf_storage_reader(type(reader), path, threads)
+
+    sd_adapter.get_hf_storage_reader = get_hf_storage_reader
+
+
+@torch.no_grad()
+def _move_optimizer_state(optimizer: Any, params: list[torch.nn.Parameter], device: Any) -> None:
+    """Moves the optimizer states of ``params`` (created on the device by the first step) to ``device``."""
+    for p in params:
+        state = optimizer.state.get(p)
+        if not state:
+            continue
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor) and value.device != torch.device(device):
+                state[key] = value.to(device)
+
+
+def _state_to(state: dict, device: Any) -> dict:
+    """``state`` (one parameter's optimizer state) with its tensors moved to ``device``."""
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) and v.device != torch.device(device) else v
+        for k, v in state.items()
+    }
+
+
+class _Fp32Masters:
+    """FP32 master weights of bf16 parameters and their optimizer states (``engine_kwargs.tpu.fp32_master``).
+
+    The model keeps bf16 parameters for forward, backward and the weight sync. The optimizer steps an FP32 master
+    copy of each parameter instead (FP32 AdamW moments too) and the result is cast back into the bf16 parameter, so
+    small updates (lr 1e-6 is ~3-4 orders of magnitude below a bf16 ulp of a weight) accumulate instead of rounding
+    to zero. With ``host`` (``optimizer_host_offload``) the masters and states live in host memory between steps and
+    only the current chunk's are on the device.
+
+    The inner optimizer never sees the bf16 parameters: each chunk step narrows its param group to fresh FP32
+    parameters of the chunk's masters (bf16 gradients upcast), with their saved states put back into
+    ``optimizer.state``. The masters are not part of the optimizer's ``state_dict()``.
+    """
+
+    def __init__(self, host: bool):
+        self.home: Any = "cpu" if host else None
+        self._entries: dict[int, tuple[torch.Tensor, dict]] = {}
+
+    @torch.no_grad()
+    def begin(self, opt: Any, chunk: list[torch.nn.Parameter]) -> list[tuple[torch.nn.Parameter, torch.nn.Parameter]]:
+        """FP32 parameters (with FP32 gradients and their saved optimizer states) for ``chunk``'s stepped params."""
+        pairs = []
+        for p in chunk:
+            if p.grad is None:
+                continue
+            entry = self._entries.get(id(p))
+            if entry is None:
+                master, state = p.detach().float(), {}
+            else:
+                master, state = entry[0].to(p.device), _state_to(entry[1], p.device)
+            master_param = torch.nn.Parameter(master, requires_grad=True)
+            master_param.grad = p.grad.float()
+            if state:
+                opt.state[master_param] = state
+            pairs.append((p, master_param))
+        return pairs
+
+    @torch.no_grad()
+    def write_back(self, pairs: list[tuple[torch.nn.Parameter, torch.nn.Parameter]]) -> None:
+        """Casts the stepped FP32 masters into their bf16 parameters (on the device, before the chunk's sync)."""
+        for p, master_param in pairs:
+            p.copy_(master_param.detach())
+            p.grad = None
+            master_param.grad = None
+
+    def end(self, opt: Any, pairs: list[tuple[torch.nn.Parameter, torch.nn.Parameter]]) -> None:
+        """Saves the masters and their optimizer states (to host memory with ``host``) after the chunk's sync."""
+        for p, master_param in pairs:
+            state = opt.state.pop(master_param, {})
+            master = master_param.detach()
+            if self.home is not None:
+                master, state = master.to(self.home), _state_to(state, self.home)
+            self._entries[id(p)] = (master, state)
+
+
+def _fp32_masters_of(engine: Any) -> Optional[_Fp32Masters]:
+    """``engine``'s FP32 master weights of ``engine_kwargs.tpu.fp32_master`` (None when it is off), created lazily."""
+    tpu_options = getattr(engine, "_tpu_options", None)
+    if not (tpu_options and tpu_options.fp32_master):
+        return None
+    masters = getattr(engine, "_fp32_master_store", None)
+    if masters is None:
+        masters = _Fp32Masters(host=bool(tpu_options.optimizer_host_offload))
+        engine._fp32_master_store = masters
+    return masters
 
 
 def _partition_params_into_chunks(
@@ -248,6 +362,7 @@ class TorchTitanTPUEngine(BaseEngine):
         self._torchtitan_name = torchtitan_name
 
         tpu_options = get_tpu_engine_options(self.engine_config)
+        self._tpu_options = tpu_options
 
         # Get ModelSpec from model registry
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
@@ -333,6 +448,10 @@ class TorchTitanTPUEngine(BaseEngine):
             engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
             if engine_dtype in ("bfloat16", "float32"):
                 training_kwargs["dtype"] = engine_dtype
+        elif tpu_options.param_dtype == "bfloat16":
+            # Pure bf16 training (engine_kwargs.tpu.param_dtype): bf16 parameters, gradients and optimizer states.
+            training_kwargs["dtype"] = "bfloat16"
+            training_kwargs["mixed_precision_reduce"] = "bfloat16"
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
         training = TrainingConfig(**training_kwargs)
@@ -409,6 +528,15 @@ class TorchTitanTPUEngine(BaseEngine):
                 enable_fsdp_gradient_division(model_part, dp_size)
 
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
+        if self.parallel_dims.ep_enabled:
+            ep_cap = (
+                tpu_options.ep_capacity_factor
+                if tpu_options.ep_capacity_factor is not None
+                else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
+            )
+            n_ep = tpu_model_kernels.set_ep_capacity_factor(model_parts, ep_cap)
+            if n_ep:
+                logger.warning("Set TpuQwen35TokenDispatcher.capacity_factor=%.2f on %d dispatchers", ep_cap, n_ep)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -601,6 +729,7 @@ class TorchTitanTPUEngine(BaseEngine):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        _use_threaded_hf_reader(self.checkpointer)
         # load initial HF weights
         self.checkpointer.load()
         tpu_synchronize(wait=True)
@@ -880,6 +1009,9 @@ class TorchTitanTPUEngine(BaseEngine):
         for hook in getattr(self.optimizer, "_optimizer_step_pre_hooks", {}).values():
             hook(self.optimizer, (), {})
         max_norm = self.config.training.max_norm
+        tpu_options = getattr(self, "_tpu_options", None)
+        host_offload = bool(tpu_options and tpu_options.optimizer_host_offload)
+        masters = _fp32_masters_of(self)
         for opt, group_entries in param_chunks:
             for group, _, _ in group_entries:
                 group["params"] = []
@@ -889,10 +1021,26 @@ class TorchTitanTPUEngine(BaseEngine):
                         if not any(p.grad is not None for p in chunk):
                             continue
                         torch.nn.utils.clip_grads_with_norm_(chunk, max_norm, grad_norm, foreach=False)
+                        if masters is not None:
+                            pairs = masters.begin(opt, chunk)
+                            group["params"] = [master_param for _, master_param in pairs]
+                            opt.step()
+                            masters.write_back(pairs)
+                            if grad_norm.device.type == "tpu":
+                                tpu_synchronize(wait=True)
+                            masters.end(opt, pairs)
+                            group["params"] = []
+                            continue
                         group["params"] = chunk
+                        if host_offload:
+                            _move_optimizer_state(opt, chunk, chunk[0].device)
                         opt.step()
                         if grad_norm.device.type == "tpu":
                             tpu_synchronize(wait=True)  # end this chunk's program before tracing the next one
+                        if host_offload:
+                            # The chunk's optimizer states live in host memory between steps (engine_kwargs.tpu.
+                            # optimizer_host_offload), so only one chunk's states are ever on the device.
+                            _move_optimizer_state(opt, chunk, "cpu")
                         for p in chunk:
                             p.grad = None
                         group["params"] = []
@@ -1076,7 +1224,10 @@ class TorchTitanTPUEngine(BaseEngine):
             from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
 
             hf_config = self.model_config.hf_config
-            local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
+            local_transform = make_tpu_sync_local_layout(
+                getattr(hf_config, "text_config", None) or hf_config,
+                expert_parallel=bool(self._tpu_options.rollout_expert_parallel),
+            )
         return TrainerWeights(dense, expert_stacks, get_device_id(), local_transform=local_transform), None
 
 
@@ -1106,12 +1257,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
+            vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 micro_batch=micro_batch,
                 device=get_device_id(),
                 bucket_size=bucket_size,
+                vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
         else:

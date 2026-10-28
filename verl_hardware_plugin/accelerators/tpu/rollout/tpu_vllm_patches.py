@@ -4,14 +4,16 @@
 """vLLM / vllm-torchtpu runtime patches for multi-host TPU rollout.
 
 ``patch_vllm_for_tpu`` lets the vLLM engine of a ``TPUvLLMHttpServer`` run on all hosts of a TPU
-slice through Ray. Each patch fills a gap in vLLM (v0.29.0 / v0.31.0) and vllm-torchtpu
-(9faafb17 / 33ee547b) and can be dropped once upstream closes it:
+slice through Ray. Each patch fills a gap in vLLM (v0.29.0 - v0.32.0) and vllm-torchtpu
+(9faafb17 - 732c4346) and can be dropped once upstream closes it:
 
 * ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
   ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,
   on the placement groups verl reserved for the replica (one per host), with one worker per chip
-  that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can use only a
-  single placement group. Upstream fix: let it use several.
+  that gets the TPU multi-host environment, and run ``current_platform.update_block_size_for_backend``
+  after ``load_model`` so hybrid GatedDeltaNet + full-attention models align their unified KV pool
+  block size. vllm-torchtpu's own Ray executor can use only a single placement group (and omits
+  ``update_block_size_for_backend``). Upstream fix: let it use several and update block size.
 * ``RayDistributedExecutor._execute_dag``: run each step with plain Ray calls instead of a
   compiled Ray graph. The graph runs the model on a background thread, where vllm-torchtpu's
   raised torch.compile recompile limit does not apply, so the first request fails. Upstream fix:
@@ -324,6 +326,24 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
     self.collective_rpc("init_worker", args=(all_kwargs,))
     self.collective_rpc("init_device")
     self.collective_rpc("load_model")
+    self.collective_rpc(_update_worker_block_size)
+
+
+def _update_worker_block_size(worker) -> None:
+    """Finalize ``worker.vllm_config`` KV-cache block sizing after ``load_model``.
+
+    vLLM >= 0.31 moved ``current_platform.update_block_size_for_backend`` out of
+    ``EngineArgs.create_engine_config`` and into the executor right after ``load_model`` (because
+    ``_find_non_ssm_backends`` inspects the loaded model's ``static_forward_context``). Skipping it
+    leaves hybrid GatedDeltaNet + full-attention models (Qwen3.5) with ``block_size=16`` instead of
+    the aligned ``mamba_fit_block_size`` (e.g. ``272``), crashing the unified block pool with
+    ``AssertionError: pool page mismatch``.
+    """
+    from vllm.platforms import current_platform
+
+    update_fn = getattr(current_platform, "update_block_size_for_backend", None)
+    if callable(update_fn):
+        update_fn(worker.vllm_config)
 
 
 def _local_ranks(worker_ips: list[str]) -> list[int]:

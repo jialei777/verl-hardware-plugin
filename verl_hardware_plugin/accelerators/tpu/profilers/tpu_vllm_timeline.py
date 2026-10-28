@@ -77,6 +77,7 @@ class vLLMServerTimelineMixin:
             self._tl_pause_called = time.time()
             return await engine_pause(*args, **kwargs)
 
+        pause_generation.__wrapped__ = engine_pause  # type: ignore[attr-defined]
         # Instance attributes shadow the AsyncLLM methods; the upstream server looks them up on every call.
         engine.generate = generate
         engine.pause_generation = pause_generation

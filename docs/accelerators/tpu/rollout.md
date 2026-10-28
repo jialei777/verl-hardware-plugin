@@ -10,8 +10,8 @@ updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (
 
 ## Requirements
 
-- The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.31.0` and
-  [vllm-torchtpu](https://github.com/vllm-project/vllm-torchtpu) `33ee547b`, the versions the rollout is tested with (see the `Dockerfile` in verl's
+- The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.32.0` and
+  [vllm-torchtpu](https://github.com/vllm-project/vllm-torchtpu) `732c4346`, the versions the rollout is tested with (see the `Dockerfile` in verl's
   [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)).
 - A verl checkout with the TPU GRPO examples in `examples/tpu/grpo`.
 - At least two TPU slices, one for training and one for rollout. A TPU chip belongs to a single

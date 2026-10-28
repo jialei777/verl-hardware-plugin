@@ -266,6 +266,58 @@ def test_server_timeline_marks_aborted_requests(timeline_on, capsys):
     assert (request["args"]["stop"], request["args"]["out"]) == ("abort", 2)
 
 
+def test_server_timeline_tracks_add_request_collector_outputs(timeline_on, capsys):
+    """Upstream verl (#8397) calls ``engine.add_request`` and drains its collector instead of ``engine.generate``."""
+
+    class _AddRequestBase(_FakeHttpServer):
+        async def generate(self, prompt_ids, sampling_params, request_id, priority=0):
+            rejected = await self._park_until_admitted(request_id)
+            if rejected is not None:
+                return rejected
+            queue = await self.engine.add_request(request_id, prompt_ids, sampling_params)
+            final = None
+            finished = False
+            while not finished:
+                output = queue.get_nowait() or await queue.get()
+                finished = output.finished
+                final = output
+            return SimpleNamespace(token_ids=final.outputs[0].token_ids, stop_reason="completed")
+
+    class _AddRequestServer(vLLMServerTimelineMixin, _AddRequestBase):
+        pass
+
+    async def add_request(request_id, *args, **kwargs):
+        pending = [
+            SimpleNamespace(finished=False, outputs=[SimpleNamespace(finish_reason=None, token_ids=[1])]),
+            SimpleNamespace(finished=True, outputs=[SimpleNamespace(finish_reason="length", token_ids=[1, 2, 3])]),
+        ]
+
+        class _Collector:
+            def get_nowait(self_inner):
+                return None
+
+            async def get(self_inner):
+                await asyncio.sleep(0)
+                return pending.pop(0)
+
+        return _Collector()
+
+    server = _AddRequestServer()
+
+    async def scenario():
+        await server.launch_server()
+        server.engine = SimpleNamespace(add_request=add_request, pause_generation=_FakeEngine().pause_generation)
+        server._tl_install_engine_hooks()
+        return await server.generate([5, 6], {}, "req-add-0")
+
+    output = asyncio.run(scenario())
+    assert output.token_ids == [1, 2, 3]
+    (request,) = [e for e in _events(capsys.readouterr().out) if e["name"] == "request"]
+    assert {k: request["args"][k] for k in ("in", "out", "stop")} == {"in": 2, "out": 3, "stop": "length"}
+    assert 0 <= request["args"]["admit"] <= request["args"]["first"] <= request["dur"] + 1e-3
+    assert not server._tl_admit and not server._tl_first and not server._tl_finish
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Report builder
 # ----------------------------------------------------------------------------------------------------------------------

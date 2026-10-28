@@ -8,9 +8,10 @@ wraps the server's own hooks, so verl needs no change. Every hook is a plain pas
 ``VERL_TPU_TIMELINE`` is set (see ``verl_hardware_plugin.accelerators.tpu.profilers.timeline`` for the line format and
 the report that reads it).
 
-When enabled, ``launch_server`` additionally wraps two methods of this server's ``AsyncLLM`` instance:
+When enabled, ``launch_server`` additionally wraps the methods of this server's ``AsyncLLM`` instance:
 
-* ``generate``: records when a request yields its first output (queueing and prefill done) and its finish reason.
+* ``add_request`` / ``generate``: records when a request yields its first output (queueing and prefill done) and its
+  finish reason.
 * ``pause_generation``: records when ``abort_all_requests`` stops waiting for admitted requests (end of ``drain``).
 """
 
@@ -57,8 +58,16 @@ class vLLMServerTimelineMixin:
         self._tl_pause_called: Optional[float] = None
         self._tl_paused_at: Optional[float] = None
         first_output, finish_reason = self._tl_first, self._tl_finish
-        engine_generate: Callable = engine.generate
+        engine_generate = getattr(engine, "generate", None)
+        engine_add_request = getattr(engine, "add_request", None)
         engine_pause: Callable = engine.pause_generation
+
+        def _record_output(request_id: str, output: Any) -> Any:
+            outputs = getattr(output, "outputs", None)
+            if outputs is not None:
+                first_output.setdefault(request_id, time.time())
+                finish_reason[request_id] = outputs[0].finish_reason if outputs else None
+            return output
 
         async def generate(*args, **kwargs):
             request_id = kwargs.get("request_id")
@@ -73,13 +82,28 @@ class vLLMServerTimelineMixin:
                 outputs = getattr(last, "outputs", None)
                 finish_reason[request_id] = outputs[0].finish_reason if outputs else None
 
+        async def add_request(request_id, *args, **kwargs):
+            queue = await engine_add_request(request_id, *args, **kwargs)
+            orig_get_nowait = getattr(queue, "get_nowait", None)
+            orig_get = getattr(queue, "get", None)
+            if callable(orig_get_nowait) and callable(orig_get):
+                queue.get_nowait = lambda: _record_output(request_id, orig_get_nowait())
+
+                async def get():
+                    return _record_output(request_id, await orig_get())
+
+                queue.get = get
+            return queue
+
         async def pause_generation(*args, **kwargs):
             self._tl_pause_called = time.time()
             return await engine_pause(*args, **kwargs)
 
-        pause_generation.__wrapped__ = engine_pause  # type: ignore[attr-defined]
         # Instance attributes shadow the AsyncLLM methods; the upstream server looks them up on every call.
-        engine.generate = generate
+        if callable(engine_generate):
+            engine.generate = generate
+        if callable(engine_add_request):
+            engine.add_request = add_request
         engine.pause_generation = pause_generation
         self._tl_hooked = True
 

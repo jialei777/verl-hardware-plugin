@@ -516,8 +516,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                 # device tensors and the host staging memory) is destroyed when the last Python reference goes.
                 self._close_synchronizer()
                 gc.collect()
-            # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
-            # TPU runtime reuses freed HBM without it.
+            # No empty_cache(): the TPU runtime reuses freed HBM by itself (the platform's empty_cache() does
+            # nothing, and torch.tpu._clear_cache() would evict the compiled executables, forcing recompiles).
             tpu_synchronize()
         return {}
 

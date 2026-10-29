@@ -62,22 +62,6 @@ TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
-# HBM capacity in bytes of one addressable device (a chip, or a TensorCore on TPU 7x)
-HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
-HBM_BYTES_TPU_V6E = 32 * 1024 * 1024 * 1024  # 32 GB
-# A TPU 7x chip has 192 GB and two TensorCores; a process drives one core, so this is what a process sees.
-HBM_BYTES_TPU_V7X = 96 * 1024 * 1024 * 1024  # 96 GB per TensorCore device
-
-# Keyed by the generation ``tpu_generation`` extracts from a pod type, accelerator type or Ray label.
-TPU_HBM_BYTES_MAP = {
-    "v5p": HBM_BYTES_TPU_V5P,
-    "v6e": HBM_BYTES_TPU_V6E,
-    "v7x": HBM_BYTES_TPU_V7X,
-}
-
-# Fallback HBM capacity when the chip generation cannot be determined.
-HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
-
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
 # rollout agree on the physical layout of a given slice size.
@@ -330,16 +314,6 @@ def resolve_tpu_topology_bounds(
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
-def get_tpu_chip_hbm_bytes() -> int:
-    """Detect the TPU chip generation from Ray node labels or env vars and return its HBM capacity."""
-    tpu_type = ray_tpu_accelerator_name() or os.environ.get("TPU_ACCELERATOR_TYPE", "")
-    hbm_bytes = TPU_HBM_BYTES_MAP.get(tpu_generation(tpu_type))
-    if hbm_bytes is None:
-        logger.warning(f"Unable to determine TPU chip HBM bytes for tpu_type='{tpu_type}'. Returning -1.")
-        return -1
-    return hbm_bytes
-
-
 class DummyTpuDeviceModule:
     """Fallback device module for CPU-only nodes and driver processes.
 
@@ -370,55 +344,31 @@ class DummyTpuDeviceModule:
 
 
 class TPUDeviceModuleProxy:
-    """Proxy wrapper for torch.tpu to emulate the PyTorch NVIDIA memory management APIs.
+    """The device module verl uses on TPU (``get_torch_device()``): ``torch.tpu`` plus what verl needs from it.
 
-    Provides default fallback implementations for memory tracking methods
-    (e.g. memory_reserved, memory_allocated, get_device_properties) that are called throughout verl's
-    codebase but not natively provided by torch_tpu.
+    verl calls every accelerator through a CUDA-style device module. ``torch.tpu`` (torch_tpu >= 0.2.0) provides
+    part of that surface itself, e.g. ``get_device_properties``, ``get_device_name``, ``manual_seed_all`` and
+    ``set_rng_state``, and those are forwarded unchanged. This class serves the rest:
+
+    * Device queries that torch_tpu made internal (they raise when called from outside torch / torch_tpu) go
+      through ``torch.accelerator`` (see ``device_api``).
+    * The memory statistics (``memory_allocated``, ``max_memory_allocated``, ``memory_reserved``,
+      ``max_memory_reserved``, ``memory_stats``, ``reset_peak_memory_stats``, ``mem_get_info``) come from the
+      PJRT allocator, which torch_tpu exposes through ``torch.accelerator`` only (see ``device_api``).
+    * ``empty_cache`` does nothing. PJRT manages TPU HBM itself and torch_tpu has nothing to release
+      (``torch.accelerator.empty_cache`` is a no-op on TPU, as vllm-torchtpu's ``torch.cuda.empty_cache`` shim
+      is); ``torch.tpu._clear_cache()`` evicts every compiled executable, so calling it would make each
+      ``empty_cache()`` force recompilations.
+
+    The proxy never modifies ``torch.tpu``: torchtitan's TPU support patches the same module with its own memory
+    shims (``torchtitan.tools.utils``), and two patches of one module depend on import order.
     """
 
     def __init__(self, original_module):
         self.__dict__["_original_module"] = original_module
 
     def __getattr__(self, name):
-        if name == "set_device":
-            return self.set_device
-
-        if hasattr(self._original_module, name):
-            return getattr(self._original_module, name)
-
-        if name == "memory_reserved":
-            return lambda *args, **kwargs: 0
-        elif name == "memory_allocated":
-            return lambda *args, **kwargs: 0
-        elif name == "max_memory_reserved":
-            return lambda *args, **kwargs: 0
-        elif name == "max_memory_allocated":
-            return lambda *args, **kwargs: 0
-        elif name == "reset_peak_memory_stats":
-            return lambda *args, **kwargs: None
-        elif name == "memory_stats":
-            return lambda *args, **kwargs: {}
-        elif name == "get_device_name":
-            return lambda *args, **kwargs: "Google TPU"
-        elif name == "get_device_properties":
-
-            class DummyDeviceProperties:
-                def __init__(self, total_memory=HBM_BYTES_TPU_DEFAULT):
-                    self.total_memory = total_memory
-                    self.name = "Google TPU"
-                    self.major = 1
-                    self.minor = 0
-
-            hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else HBM_BYTES_TPU_DEFAULT
-            return lambda *args, **kwargs: DummyDeviceProperties(total_memory=total_mem)
-        elif name == "mem_get_info":
-            hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else HBM_BYTES_TPU_DEFAULT
-            return lambda *args, **kwargs: (total_mem, total_mem)
-
-        raise AttributeError(f"'TPUDeviceModuleProxy' object has no attribute '{name}'")
+        return getattr(self._original_module, name)
 
     def __setattr__(self, name, value):
         if name.startswith("_"):
@@ -470,21 +420,30 @@ class TPUDeviceModuleProxy:
     def initial_seed(self) -> int:
         return tpu_device_api.initial_seed()
 
-    def manual_seed_all(self, seed: int) -> None:
-        # torch_tpu does not always expose manual_seed_all; the global torch seed is the
-        # right fallback because a TPU process owns exactly one chip.
-        fn = getattr(self._original_module, "manual_seed_all", None)
-        if fn is not None:
-            fn(seed)
-        else:
-            torch.manual_seed(seed)
+    # Memory statistics: torch.tpu has none, torch.accelerator reports the PJRT allocator's (see device_api).
+    def memory_allocated(self, device: Any = None) -> int:
+        return tpu_device_api.memory_allocated(device)
+
+    def max_memory_allocated(self, device: Any = None) -> int:
+        return tpu_device_api.max_memory_allocated(device)
+
+    def memory_reserved(self, device: Any = None) -> int:
+        return tpu_device_api.memory_reserved(device)
+
+    def max_memory_reserved(self, device: Any = None) -> int:
+        return tpu_device_api.max_memory_reserved(device)
+
+    def memory_stats(self, device: Any = None) -> dict[str, Any]:
+        return tpu_device_api.memory_stats(device)
+
+    def reset_peak_memory_stats(self, device: Any = None) -> None:
+        tpu_device_api.reset_peak_memory_stats(device)
+
+    def mem_get_info(self, device: Any = None) -> tuple[int, int]:
+        return tpu_device_api.mem_get_info(device)
 
     def empty_cache(self) -> None:
-        if hasattr(self._original_module, "_clear_cache"):
-            try:
-                self._original_module._clear_cache()
-            except Exception as e:
-                logger.warning(f"Failed to clear TPU cache: {e}")
+        """Nothing to release; see the class docstring (never ``torch.tpu._clear_cache()``)."""
 
 
 def driver_tpu_env_for_workers() -> dict[str, str]:
@@ -610,17 +569,8 @@ class PlatformTPU(PlatformBase):
         configure_torchrun_tpu_env()
         configure_ray_worker_tpu7x_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
+        # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
-        if hasattr(torch, "tpu"):
-            for attr in (
-                "reset_peak_memory_stats",
-                "empty_cache",
-                "memory_stats",
-                "get_device_name",
-                "get_device_properties",
-            ):
-                if not hasattr(torch.tpu, attr):
-                    setattr(torch.tpu, attr, getattr(self._device_module, attr))
         self._claimed_slices: set[str] = set()
 
     @property
@@ -654,11 +604,9 @@ class PlatformTPU(PlatformBase):
         self.device_module.manual_seed_all(seed)
 
     def empty_cache(self) -> None:
-        # Delegate when torch.tpu provides it. A TPU runtime that manages HBM itself has no
-        # CUDA-style caching allocator to drain, in which case there is nothing to do.
-        empty = getattr(self.device_module, "empty_cache", None)
-        if empty is not None:
-            empty()
+        # PJRT manages TPU HBM itself: there is no CUDA-style caching allocator to drain, so this does nothing
+        # (TPUDeviceModuleProxy.empty_cache explains why it must not call torch.tpu._clear_cache()).
+        self.device_module.empty_cache()
 
     def set_allocator_settings(self, settings: str) -> None:
         # TPU exposes no configurable caching allocator equivalent to CUDA's.

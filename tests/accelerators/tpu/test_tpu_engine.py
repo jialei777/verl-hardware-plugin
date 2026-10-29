@@ -36,7 +36,6 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
     configure_ray_worker_tpu7x_env,
     configure_torchrun_tpu_env,
-    get_tpu_chip_hbm_bytes,
     gke_tpu_slice_topology,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
@@ -475,18 +474,6 @@ def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes(caplog):
     assert "None of the pool's hosts ['10.0.0.9']" in caplog.text
     with mock.patch("ray.is_initialized", return_value=False):
         assert ray_tpu_accelerator_name() == ""
-
-
-def test_tpu7x_hbm_is_per_tensorcore_device(monkeypatch):
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "tpu7x")
-    assert get_tpu_chip_hbm_bytes() == 96 * 1024**3
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
-    assert get_tpu_chip_hbm_bytes() == 32 * 1024**3
-    nodes = [{"Alive": True, "Resources": {"TPU": 8.0}, "Labels": {"ray.io/tpu-pod-type": "v7x-16"}}]
-    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
-        assert get_tpu_chip_hbm_bytes() == 96 * 1024**3  # Ray's spelling of the pod type
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v9z-8")
-    assert get_tpu_chip_hbm_bytes() == -1
 
 
 def test_ray_worker_relays_the_webhook_slice_shape_on_tpu7x():

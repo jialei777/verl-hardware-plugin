@@ -152,7 +152,23 @@ part of a slice takes the whole-host shape for its device count from `TPU_V7X_TO
 `platform_tpu.py`. The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count. When the generation cannot be determined, the platform falls back to the v6e HBM figure.
+own worker count.
+
+### Device memory
+
+`get_torch_device()` (`TPUDeviceModuleProxy`) forwards to `torch.tpu`, except for the calls `torch.tpu`
+does not provide:
+
+- The memory statistics (`memory_allocated`, `max_memory_allocated`, `memory_reserved`,
+  `max_memory_reserved`, `memory_stats`, `reset_peak_memory_stats`, `mem_get_info`) come from
+  `torch.accelerator`. That is where `torch_tpu` reports its PJRT allocator. They read zero until the
+  process has started its TPU runtime, and in processes without a TPU. On TPU, `memory_reserved` is
+  PJRT's reserved bytes, so unlike on CUDA it is not a superset of `memory_allocated`.
+- `empty_cache()` does nothing, because PJRT manages HBM itself. It must not call
+  `torch.tpu._clear_cache()`, which evicts every compiled executable.
+- HBM capacity: `torch.tpu.get_device_properties().total_memory`.
+
+The plugin never modifies the `torch.tpu` module.
 
 ## Related Documentation
 

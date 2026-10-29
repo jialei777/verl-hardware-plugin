@@ -7,7 +7,7 @@ import ast
 import os
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -30,6 +30,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     install_tpu_attention,
     pad_packed_inputs_for_tpu,
     resolve_tpu_torchtitan_options,
+    tpu_eager_mode_context,
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
@@ -214,6 +215,28 @@ def test_configure_torch_compile_for_tpu():
     assert torch._dynamo.config.assume_static_by_default is True
     assert torch._dynamo.config.capture_scalar_outputs is True
     assert torch._dynamo.config.recompile_limit >= 64
+
+
+def test_tpu_eager_mode_context_uses_the_public_torch_tpu_api():
+    """torch.tpu.set_eager_mode / torch.tpu.EagerMode (torch_tpu >= 0.2.0), not torch_tpu._internal."""
+    entered = []
+
+    @contextmanager
+    def set_eager_mode(mode):
+        entered.append(mode)
+        yield
+
+    tpu = SimpleNamespace(
+        set_eager_mode=set_eager_mode, EagerMode=SimpleNamespace(DEFER_AND_FUSE="fuse", DEFER_NEVER="never")
+    )
+    with mock.patch.object(torch, "tpu", tpu, create=True):
+        with tpu_eager_mode_context("DEFER_AND_FUSE"):
+            assert entered == ["fuse"]
+        assert isinstance(tpu_eager_mode_context(None), nullcontext)
+    # Without torch_tpu (e.g. these CPU tests) the context does nothing.
+    with mock.patch.object(torch, "tpu", SimpleNamespace(), create=True):
+        assert isinstance(tpu_eager_mode_context("DEFER_AND_FUSE"), nullcontext)
+    assert entered == ["fuse"]
 
 
 def test_resolve_tpu_torchtitan_options_and_config_extension():

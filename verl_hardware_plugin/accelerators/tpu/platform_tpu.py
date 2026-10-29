@@ -244,11 +244,15 @@ def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
 
 
 def tpu_mesh_env(total_chips: int, num_nodes: int, rank: int, local_rank: int, pod_type: str = "") -> dict[str, str]:
-    """The complete mesh environment of one process of a slice.
+    """The complete mesh environment of one process of a slice, for the rollout's vLLM workers.
 
     The topology and bounds of ``resolve_tpu_topology_bounds`` and, on TPU 7x, the per-process variables of
     ``tpu_v7x_process_env``. Callers apply it after their generic defaults, so that on TPU 7x the task id is
     the process's global rank rather than its host's index.
+
+    The trainer does not use it: its processes start torch_tpu in multi-process mode, which derives these
+    variables itself (see ``PlatformTPU.get_tpu_env_vars``). A TP=1 rollout worker starts torch_tpu in
+    single-device mode (vllm-torchtpu unsets ``WORLD_SIZE``), which derives only the visible device.
     """
     topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
         total_chips=total_chips, num_nodes=num_nodes, pod_type=pod_type
@@ -456,15 +460,16 @@ def driver_tpu_env_for_workers() -> dict[str, str]:
 
 
 def configure_torchrun_tpu_env() -> None:
-    """Populate PJRT multi-process environment variables when launched via ``torchrun``.
+    """Populate the torch_tpu multi-process environment when launched via ``torchrun``.
 
     In Ray single-controller runs (``sft_trainer_ray`` / ``main_ppo``), ``get_worker_env_vars``
-    populates ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and the topology bounds on each worker actor.
+    populates ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and ``TORCH_TPU_TOPOLOGY`` on each worker actor.
     In ``torchrun`` multi-controller runs (``verl.trainer.sft_trainer``), ``PlatformTPU()`` is
     instantiated inside ``auto_set_device`` / ``initialize_global_process_group`` before
-    ``torch.distributed.init_process_group(backend="cpu:gloo,tpu:tpu_dist")`` runs. Setting
-    missing PJRT variables from ``LOCAL_RANK`` / ``RANK`` / ``WORLD_SIZE`` lets ``torchrun``
-    work out of the box without a wrapper script.
+    ``torch.distributed.init_process_group(backend="cpu:gloo,tpu:tpu_dist")`` runs. Setting the
+    two from ``LOCAL_WORLD_SIZE`` / ``WORLD_SIZE`` lets ``torchrun`` work out of the box without a
+    wrapper script; torch_tpu derives libtpu's per-process variables from them and from torchrun's
+    ``RANK`` / ``LOCAL_RANK`` (see ``PlatformTPU.get_tpu_env_vars``).
     """
     if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return
@@ -477,9 +482,7 @@ def configure_torchrun_tpu_env() -> None:
         pass
 
     try:
-        local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        rank = int(os.environ.get("RANK", local_rank))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     except ValueError:
         return
@@ -506,52 +509,23 @@ def configure_torchrun_tpu_env() -> None:
 
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.environ.setdefault("TORCH_TPU_SLICEBUILDER_ADDRESSES", ",".join(sb_addresses))
-    os.environ.setdefault("TPU_PROCESS_ADDRESSES", ",".join(sb_addresses))
-    os.environ.setdefault("TPU_PROCESS_PORT", str(TPU_PROCESS_BASE_PORT + local_rank))
-    os.environ.setdefault("CLOUD_TPU_TASK_ID", str(rank // local_world_size))
     os.environ.setdefault("TPU_WORKER_HOSTNAMES", ",".join(hostnames))
-    os.environ.setdefault("TPU_VISIBLE_CHIPS", str(local_rank))
 
     pod_type = os.environ.get("TPU_ACCELERATOR_TYPE", "")
     try:
-        mesh_env = tpu_mesh_env(
-            total_chips=world_size, num_nodes=num_nodes, rank=rank, local_rank=local_rank, pod_type=pod_type
+        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size, num_nodes=num_nodes, pod_type=pod_type
         )
     except ValueError:
         return
+    mesh_env = {"TORCH_TPU_TOPOLOGY": topology, "CHIPS_PER_HOST": chips_per_host}
     if is_tpu_v7x(pod_type):
-        # The GKE TPU webhook pre-sets 3-D host bounds and a per-host task id on TPU 7x pods; the mesh is
-        # laid out by process here, so those are replaced rather than kept.
+        # The 4-D mesh of TensorCore processes replaces any other preset value (resolve_tpu_v7x_topology already
+        # returned a TORCH_TPU_TOPOLOGY that fits the world size).
         os.environ.update(mesh_env)
     else:
         for name, value in mesh_env.items():
             os.environ.setdefault(name, value)
-
-
-def configure_ray_worker_tpu7x_env() -> None:
-    """On a TPU 7x Ray worker, lay the mesh out from the slice shape the GKE webhook put in the pod.
-
-    ``get_tpu_env_vars`` runs in the process that creates the workers, usually the Ray head, which has no
-    TPU webhook variables and so takes the pool's mesh from ``TPU_V7X_TOPOLOGY_MAP``. The worker itself has
-    them, so it recomputes the mesh the way torchtitan's launcher does (``resolve_tpu_v7x_topology``) and
-    replaces the head's shape when the two differ. Only the shape changes; the process addresses, ports,
-    ranks and visible device the head assigned stay.
-    """
-    addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
-    hostnames = os.environ.get("TPU_WORKER_HOSTNAMES")
-    if not addresses or not hostnames or "TPU_PROCESS_BOUNDS" not in os.environ or not is_tpu_v7x():
-        return
-    num_devices, num_nodes = len(addresses.split(",")), len(hostnames.split(","))
-    try:
-        topology = resolve_tpu_v7x_topology(num_devices, num_nodes)
-    except ValueError as e:
-        logger.warning("Keeping the mesh the head assigned: %s", e)
-        return
-    if topology != os.environ["TPU_PROCESS_BOUNDS"]:
-        logger.info(
-            "TPU 7x mesh %s from this pod's slice (head assigned %s)", topology, os.environ["TPU_PROCESS_BOUNDS"]
-        )
-        os.environ.update({"TORCH_TPU_TOPOLOGY": topology, "TPU_HOST_BOUNDS": topology, "TPU_PROCESS_BOUNDS": topology})
 
 
 @PlatformRegistry.register(platform="tpu")
@@ -567,7 +541,6 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         reduce_avg_allreduce_patch.apply()
         configure_torchrun_tpu_env()
-        configure_ray_worker_tpu7x_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
@@ -769,6 +742,13 @@ class PlatformTPU(PlatformBase):
         bundle order, are exactly the processes of the PJRT mesh. This runs in the process that
         creates the workers (the trainer's TaskRunner), so nothing here may depend on the IP of
         the calling process -- it can be the head node or any TPU host.
+
+        Only the slice's process addresses and topology are set. verl sets ``WORLD_SIZE`` on every worker, so
+        torch_tpu (>= 0.2.0) starts its runtime in multi-process mode: from ``RANK``, ``LOCAL_RANK``,
+        ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and ``TORCH_TPU_TOPOLOGY`` it derives libtpu's per-process variables
+        (``CLOUD_TPU_TASK_ID``, ``TPU_VISIBLE_DEVICES`` / ``TPU_VISIBLE_CHIPS``, ``TPU_PROCESS_ADDRESSES``,
+        ``TPU_PROCESS_PORT``, and the host, process and chip bounds) and overwrites any value set before, on TPU 7x
+        as on v6e.
         """
         node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
         bundle_ips = []
@@ -789,29 +769,20 @@ class PlatformTPU(PlatformBase):
         # Extract unique worker hostnames preserving rank order
         unique_hostnames = list(dict.fromkeys(bundle_ips))
 
-        env_vars = {
+        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
+        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+        )
+
+        return {
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
-            "TPU_PROCESS_ADDRESSES": ",".join(sb_addresses),
-            "TPU_PROCESS_PORT": str(base_port + local_rank),
-            "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
+            "TORCH_TPU_TOPOLOGY": topology,
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
             "LOCAL_RANK": str(local_rank),
             "LOCAL_WORLD_SIZE": str(local_world_size),
+            "CHIPS_PER_HOST": chips_per_host,
         }
-
-        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
-        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
-        env_vars.update(
-            tpu_mesh_env(
-                total_chips=world_size,
-                num_nodes=len(unique_hostnames),
-                rank=rank,
-                local_rank=local_rank,
-                pod_type=tpu_type,
-            )
-        )
-
-        return env_vars
 
     def get_worker_env_vars(
         self,

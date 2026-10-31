@@ -3,12 +3,14 @@
 
 """TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0) or the legacy torch.tpu API."""
 
+import math
 import types
 from unittest import mock
 
 import pytest
 import torch
 
+from verl.utils.flops_counter import get_device_flops
 from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModuleProxy
 
@@ -195,3 +197,26 @@ def test_platform_leaves_torch_tpu_untouched():
         platform.empty_cache()
     for name in ("empty_cache", "memory_stats", "reset_peak_memory_stats", "get_device_name", "get_device_properties"):
         assert not hasattr(tpu, name)
+
+
+@pytest.mark.parametrize(
+    "device_name,expected_tflops",
+    [
+        ("TPU v7", 1153.5),
+        ("TPU v7x", 1153.5),
+        ("TPU7x", 1153.5),
+        ("tpu7x", 1153.5),
+        ("v7x", 1153.5),
+        ("TPU v6 lite", 918.0),
+        ("TPU v6e", 918.0),
+        ("v6e", 918.0),
+        ("TPU v5p", 459.0),
+        ("v5p", 459.0),
+        ("TPU v5 lite", 197.0),
+        ("TPU v5e", 197.0),
+        ("v5e", 197.0),
+    ],
+)
+def test_tpu_device_flops_registered(device_name: str, expected_tflops: float):
+    """TPU libtpu device_kind strings and GKE accelerator names resolve in verl's _DEVICE_FLOPS."""
+    assert math.isclose(get_device_flops(unit="T", device_name=device_name), expected_tflops)

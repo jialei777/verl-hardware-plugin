@@ -1,14 +1,16 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0) or the legacy torch.tpu API."""
+"""TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0)."""
 
+import math
 import types
 from unittest import mock
 
 import pytest
 import torch
 
+from verl.utils.flops_counter import get_device_flops
 from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModuleProxy
 
@@ -72,35 +74,23 @@ def test_uses_torch_accelerator_when_tpu_device_apis_are_internal():
         assert proxy.initial_seed() == 123
 
 
-def test_falls_back_to_legacy_torch_tpu_api():
-    """Older torch_tpu: torch.accelerator is not TPU-backed, torch.tpu functions are public."""
+def test_cpu_only_process_without_tpu_devices_never_calls_internal_torch_tpu_apis():
+    """torch_tpu >= 0.2.0 on a CPU-only process: current_accelerator() is None and torch.tpu device APIs raise."""
     legacy_tpu = types.SimpleNamespace(
-        is_available=lambda: True,
-        device_count=lambda: 4,
-        current_device=lambda: 2,
-        synchronize=mock.MagicMock(),
-        get_rng_state=mock.MagicMock(return_value=torch.tensor([1])),
-        initial_seed=lambda: 5,
+        **{n: _internal(n) for n in ("is_available", "device_count", "current_device", "synchronize")}
     )
     acc = _fake_accelerator(current_accelerator=lambda: None)
     with mock.patch.object(torch, "accelerator", acc), mock.patch.object(torch, "tpu", legacy_tpu, create=True):
         proxy = TPUDeviceModuleProxy(legacy_tpu)
-        assert proxy.is_available() is True
-        assert proxy.device_count() == 4
-        assert proxy.current_device() == 2
-        proxy.synchronize()
-        legacy_tpu.synchronize.assert_called_once_with()
-        acc.synchronize.assert_not_called()
-        assert torch.equal(proxy.get_rng_state(), torch.tensor([1]))
-        assert proxy.initial_seed() == 5
-
-
-def test_is_available_is_false_without_tpu_devices():
-    """torch_tpu >= 0.2.0 on a CPU-only process: no TPU accelerator and torch.tpu.is_available raises."""
-    legacy_tpu = types.SimpleNamespace(is_available=_internal("is_available"))
-    acc = _fake_accelerator(current_accelerator=lambda: None)
-    with mock.patch.object(torch, "accelerator", acc), mock.patch.object(torch, "tpu", legacy_tpu, create=True):
         assert device_api.is_available() is False
+        assert proxy.is_available() is False
+        assert device_api.device_count() == 0
+        assert proxy.device_count() == 0
+        assert device_api.current_device() == 0
+        assert proxy.current_device() == 0
+        assert device_api.synchronize() is None
+        assert proxy.synchronize() is None
+        acc.synchronize.assert_not_called()
 
 
 def _memory_accelerator():
@@ -195,3 +185,46 @@ def test_platform_leaves_torch_tpu_untouched():
         platform.empty_cache()
     for name in ("empty_cache", "memory_stats", "reset_peak_memory_stats", "get_device_name", "get_device_properties"):
         assert not hasattr(tpu, name)
+
+
+def test_placement_group_claims_tpu_slices_in_numeric_order():
+    """Clusters with >=10 TPU slices claim tpu-group-0, tpu-group-1, ..., tpu-group-10 in numeric order."""
+    import ray
+
+    from verl_hardware_plugin.accelerators.tpu import platform_tpu as platform_tpu_mod
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
+
+    nodes = [{"Alive": True, "Resources": {f"tpu-group-{i}": 8.0}} for i in (10, 2, 0, 1, 9)]
+    tpu = types.ModuleType("torch.tpu")
+    with (
+        mock.patch.object(torch, "tpu", tpu, create=True),
+        mock.patch.object(ray, "is_initialized", return_value=True),
+        mock.patch.object(ray, "nodes", return_value=nodes),
+    ):
+        platform = PlatformTPU()
+        claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
+    assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
+    assert platform_tpu_mod is not None
+
+
+@pytest.mark.parametrize(
+    "device_name,expected_tflops",
+    [
+        ("TPU v7", 1153.5),
+        ("TPU v7x", 1153.5),
+        ("TPU7x", 1153.5),
+        ("tpu7x", 1153.5),
+        ("v7x", 1153.5),
+        ("TPU v6 lite", 918.0),
+        ("TPU v6e", 918.0),
+        ("v6e", 918.0),
+        ("TPU v5p", 459.0),
+        ("v5p", 459.0),
+        ("TPU v5 lite", 197.0),
+        ("TPU v5e", 197.0),
+        ("v5e", 197.0),
+    ],
+)
+def test_tpu_device_flops_registered(device_name: str, expected_tflops: float):
+    """TPU libtpu device_kind strings and GKE accelerator names resolve in verl's _DEVICE_FLOPS."""
+    assert math.isclose(get_device_flops(unit="T", device_name=device_name), expected_tflops)

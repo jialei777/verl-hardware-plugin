@@ -1530,6 +1530,55 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
     ]
 
 
+@pytest.mark.parametrize(
+    ("flag", "strategy", "installs"),
+    [(None, "ulysses", False), ("1", "all_gather", False), ("1", "ulysses", True), ("0", "ulysses", False)],
+)
+def test_fast_cp_gdn_patches_only_with_flag_and_ulysses(monkeypatch, flag, strategy, installs):
+    """VERL_TPU_FAST_CP_GDN=1 installs the Qwen3.5 Ulysses CP patches; the default path is untouched."""
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    if flag is None:
+        monkeypatch.delenv("VERL_TPU_FAST_CP_GDN", raising=False)
+    else:
+        monkeypatch.setenv("VERL_TPU_FAST_CP_GDN", flag)
+    fake_transform = SimpleNamespace(
+        ContextParallelTransform=lambda inner_attention: inner_attention,
+        transform_model_config_=lambda model, transforms: model,
+    )
+    fake_cp_attention = SimpleNamespace(
+        install_tpu_cp_patches=lambda: None,
+        tpu_cp_inner_attention=lambda base, strat: base,
+        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
+        validate_tpu_context_parallel=lambda model, parallelism: None,
+    )
+    engine = SimpleNamespace(
+        engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": strategy}}),
+        _use_splash_attention=True,
+    )
+    parallelism = SimpleNamespace(
+        context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
+    )
+    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object))
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "torchtitan": SimpleNamespace(),
+                "torchtitan.config": SimpleNamespace(transform=fake_transform),
+                "torchtitan.config.transform": fake_transform,
+                "torchtitan.experiments": SimpleNamespace(),
+                "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+                "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+            },
+        ),
+        mock.patch.object(torchtitan_tpu, "_install_fast_cp_gdn_patches") as install,
+    ):
+        TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+    assert install.called == installs
+
+
 def test_enable_context_parallel_all_gather_requires_splash():
     """KV all-gather CP fails before the model is built when splash is off; torchtitan would refuse it on TPU."""
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine

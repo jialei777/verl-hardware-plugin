@@ -658,7 +658,7 @@ def test_reused_tensordict_stale_mb_slot_len_gated_and_entropy_excluded_before_u
         tu.assign_non_tensor_data(mb_reused, gdn_slot_schedule.MB_SLOT_LEN_KEY, 8)
         eng = _build_fwb_stub(auto_slot_len=auto_slot_len)
 
-        def _fake_forward_step(mb: TensorDict, loss_function: object, forward_only: bool, _eng=eng):
+        def _fake_forward_step(mb: TensorDict, loss_function: object, forward_only: bool, _eng=eng, **_kw: object):
             with mock.patch.object(torchtitan_tpu, "get_device_id", return_value=torch.device("cpu")):
                 _, _, extra_kw, out_args = _eng.prepare_model_inputs(mb)
             seen_forward_kwargs.append(dict(extra_kw))

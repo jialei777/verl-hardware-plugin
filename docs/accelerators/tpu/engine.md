@@ -8,8 +8,11 @@ TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`
 per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
-`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
-`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `model_kernels`,
+`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`,
+`static_log_prob_micro_batch_len`, `static_max_response_len`, `splash_max_block_size`,
+`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`,
+`cp_full_positions`, `gdn_auto_row_slot_len`, `fuse_gdn_projections`, `sort_micro_batches_by_slot`,
+`gdn_row_slot_len`, `trainer_mode`, `graph_trainer`, `model_kernels`,
 `ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm` and
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
@@ -45,16 +48,16 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | Option | Effect |
 |---|---|
 | `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
-| `static_log_prob_micro_batch_len: <tokens>` | Static packed micro-batch length for forward-only (old/reference log-prob) passes, overriding `static_micro_batch_len` when `forward_only=True` |
-| `cp_full_positions: true` | Pass pre-`cp_shard` unsharded 1-D `positions` to `model.forward(cp_full_positions=...)` (`google-pytorch/torchtitan#216`), removing per-layer `all_gather(positions)` under Ulysses and KV all-gather CP |
-| `gdn_auto_row_slot_len: <tokens>` | Dynamic per-micro-batch row-slot planner (e.g. `32768`, `google-pytorch/torchtitan#216`): permutes eligible single-doc sequences into slots with `set_unflatten_seq_len(slot_len)` and `gated_delta_document_resets=False`, runs 1-doc micro-batches unsegmented at `padded_len`, and keeps multi-doc micro-batches segmented (cross-rank `BAND` agreement; works with Ulysses CP and non-CP) |
-| `fuse_gdn_projections: true` | Set `fuse_input_projections=True` on GatedDeltaNet configs (`google-pytorch/torchtitan#216`), fusing the six bias-free input projections into one matmul |
-| `sort_micro_batches_by_slot: true` | Order micro-batches by `(slot_category, -total_tokens, idx)` so identical slot/segmentation shapes execute consecutively |
-| `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
+| `static_log_prob_micro_batch_len: <tokens>` | Static packed micro-batch length for forward-only (old/reference log-prob) passes, overriding `static_micro_batch_len` when `forward_only=True` (must be `>= gdn_auto_row_slot_len` and divisible by `gdn_auto_row_slot_len` when `gdn_auto_row_slot_len` is set) |
+| `cp_full_positions: true` | Pass pre-`cp_shard` unsharded 1-D text `positions` to `model.forward(cp_full_positions=...)` (`google-pytorch/torchtitan#216`), removing per-layer `all_gather(positions)` under Ulysses and KV all-gather CP (fails loudly on multimodal / 3-D MRoPE batches) |
+| `gdn_auto_row_slot_len: <tokens>` | Qwen3.5 (`use_dynamic_bsz=True` compatible, `google-pytorch/torchtitan#216`): dynamic per-micro-batch row-slot planner (e.g. `32768`) that permutes eligible single-doc sequences starting at position `0` into slots with `set_unflatten_seq_len(slot_len)` and `gated_delta_document_resets=False`, runs 1-doc micro-batches unsegmented at `padded_len`, and keeps multi-doc / continuation micro-batches segmented (cross-rank `BAND` agreement; works with Ulysses CP and non-CP; requires `use_fused_linear_cross_entropy=True`, `tensor_parallel_size=1`, and any set `static_micro_batch_len` / `static_log_prob_micro_batch_len` to be `>=` and divisible by `gdn_auto_row_slot_len`) |
+| `fuse_gdn_projections: true` | Qwen3.5 (`google-pytorch/torchtitan#216`): set `fuse_input_projections=True` on GatedDeltaNet configs, fusing the six bias-free input projections into one matmul (requires `tensor_parallel_size=1`) |
+| `sort_micro_batches_by_slot: true` | Qwen3.5 (`use_dynamic_bsz=True`): order micro-batches by `(slot_category, -total_tokens, idx)` so identical slot/segmentation shapes execute consecutively |
+| `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length; must be `>= gdn_auto_row_slot_len` and divisible by `gdn_auto_row_slot_len` when `gdn_auto_row_slot_len` is set) |
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
-| `gdn_row_slot_len: <max_model_len>` | Qwen3.5: every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob |
+| `gdn_row_slot_len: <max_model_len>` | Qwen3.5: every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, `context_parallel_size=1` (use `gdn_auto_row_slot_len` with `context_parallel_strategy='ulysses'` under CP), and the fused log-prob |
 | `trainer_mode: graph_trainer` | Actor only (bypass mode, KL loss off, `use_simple_fsdp=True`, `static_micro_batch_len` set): traces the micro-batch forward, fused LM-head log-prob, dual-clip PPO loss and backward once with TorchTitan's `TpuGraphTrainer` (`aot_fx_trace`) and compiles it as one PJRT executable instead of per-block `torch.compile` |
 | `graph_trainer: <dict>` | Optional compiler configuration passed straight to TorchTitan's `TpuGraphTrainerCompileConfig(**cfg)` (e.g. `memory_policy`, `save_regions`, `fsdp_barrier_policy`, `graph_split`); ignored when `trainer_mode` is not `graph_trainer` |
 

@@ -213,7 +213,8 @@ class TPUEngineOptions:
             "attention.inner_attention")`` benchmark memory policy).
         static_micro_batch_len: Pad every packed micro-batch to at least this many tokens (rounded up to the
             sequence bucket), e.g. the ``use_dynamic_bsz`` token budget, so the trainer compiles one sequence shape
-            instead of one per length bucket it meets (default: unset, off).
+            instead of one per length bucket it meets (default: unset, off). When ``gdn_auto_row_slot_len`` is set,
+            must be ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
@@ -230,24 +231,30 @@ class TPUEngineOptions:
             the installed torchtitan lacks ``cp_full_positions`` or on 3-D MRoPE / multimodal batches.
         gdn_auto_row_slot_len: Dynamic per-micro-batch row-slot length (e.g. ``32768``) for models whose ``forward``
             accepts ``gated_delta_document_resets`` (``google-pytorch/torchtitan#216``). Micro-batches whose single-doc
-            sequences fit ``gdn_auto_row_slot_len`` rows are permuted into slots and run unsegmented
-            (``set_unflatten_seq_len(slot_len)``, ``gated_delta_document_resets=False``); single-document micro-batches
-            run unsegmented at ``padded_len``; multi-document micro-batches run segmented. Ranks agree via bitwise-AND
-            all-reduce so SPMD collectives share one compiled shape. Mutually exclusive with ``gdn_row_slot_len``;
-            requires ``use_fused_linear_cross_entropy``, no TP, and contiguous CP layout (no ``headtail`` balancer).
+            sequences start at position ``0`` and fit ``gdn_auto_row_slot_len`` rows are permuted into slots and run
+            unsegmented (``set_unflatten_seq_len(slot_len)``, ``gated_delta_document_resets=False``); single-document
+            micro-batches starting at position ``0`` run unsegmented at ``padded_len``; multi-document or continuation
+            micro-batches run segmented. Ranks agree via bitwise-AND all-reduce so SPMD collectives share one compiled
+            shape. Mutually exclusive with ``gdn_row_slot_len``; requires ``use_fused_linear_cross_entropy``,
+            ``tensor_parallel_size == 1``, contiguous CP layout (no ``headtail`` balancer), and any configured
+            ``static_micro_batch_len`` / ``static_log_prob_micro_batch_len`` to be ``>= gdn_auto_row_slot_len`` and
+            divisible by ``gdn_auto_row_slot_len``.
         fuse_gdn_projections: Set ``fuse_input_projections=True`` on every GatedDeltaNet config in ``model_spec.model``
             before build (``google-pytorch/torchtitan#216``), fusing the six bias-free input projections into one
-            matmul (default: unset, off). Fails loudly if no module config declares ``fuse_input_projections``.
+            matmul (default: unset, off). Requires ``tensor_parallel_size == 1`` (``TP == 1``) and fails loudly if TP is
+            enabled or if no module config declares ``fuse_input_projections``.
         sort_micro_batches_by_slot: Order each mini-batch's micro-batches by ``(slot_category, -total_tokens, idx)``
             using the shared slot classifier so micro-batches compiling to the same slot / segmentation program run
             back to back (default: unset, off).
         static_log_prob_micro_batch_len: Static packed micro-batch length in tokens for forward-only
             (old / reference log-prob) passes, overriding ``static_micro_batch_len`` when ``forward_only=True``
-            (default: unset, off).
+            (default: unset, off). When ``gdn_auto_row_slot_len`` is set, must be ``>= gdn_auto_row_slot_len`` and
+            divisible by ``gdn_auto_row_slot_len``.
         gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
             and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
             packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
-            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+            length, ``static_micro_batch_len`` = sequences per micro-batch x this, and ``context_parallel_size == 1``
+            (use ``gdn_auto_row_slot_len`` with ``context_parallel_strategy='ulysses'`` under CP).
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
@@ -424,6 +431,15 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.gdn_auto_row_slot_len and gdn_row_slot_len are mutually exclusive"
         )
+    auto_slot_len = values.get("gdn_auto_row_slot_len")
+    if auto_slot_len:
+        for static_key in ("static_micro_batch_len", "static_log_prob_micro_batch_len"):
+            static_val = values.get(static_key)
+            if static_val is not None and (static_val < auto_slot_len or static_val % auto_slot_len != 0):
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{static_key} ({static_val}) must be >= "
+                    f"gdn_auto_row_slot_len ({auto_slot_len}) and divisible by gdn_auto_row_slot_len"
+                )
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"

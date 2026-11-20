@@ -43,16 +43,40 @@ _MASK_ROW_SLOT = 1
 _MASK_SINGLE_DOC = 2
 
 
+def unflatten_seq_len_context(seq_len: Optional[int]) -> Any:
+    """Sets ``torchtitan``'s TPU unflatten row length across ``components.unflatten_shim`` and legacy layouts."""
+    try:
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+    except ImportError:
+        try:
+            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+        except ImportError as exc:
+            raise RuntimeError(
+                "GDN row-slot scheduling requires 'set_unflatten_seq_len' from google-pytorch/torchtitan "
+                "(torchtitan.experiments.tpu.components.unflatten_shim or "
+                "torchtitan.experiments.tpu.unflatten_shim)"
+            ) from exc
+    return set_unflatten_seq_len(seq_len)
+
+
 def forward_accepts_kwarg(module: Any, name: str) -> bool:
-    """True when ``module.forward`` accepts keyword argument ``name`` (explicitly or via ``**kwargs``)."""
-    fwd = getattr(module, "forward", None)
+    """True when ``module.forward`` explicitly declares keyword argument ``name`` (unwrapping compiled/parallelized)."""
+    seen: set[int] = set()
+    while getattr(module, "_orig_mod", None) is not None and id(module) not in seen:
+        seen.add(id(module))
+        module = module._orig_mod
+    fwd = getattr(module, "_orig_forward", None) or getattr(module, "forward", None)
+    if callable(fwd) and getattr(fwd, "__name__", "") == "forward_with_redistribution":
+        cls_fwd = getattr(type(module), "forward", None)
+        if callable(cls_fwd):
+            fwd = cls_fwd
     if not callable(fwd):
         return False
     try:
         params = inspect.signature(fwd).parameters
     except (TypeError, ValueError):
         return False
-    return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return name in params
 
 
 def validate_model_cp_slot_support(
@@ -150,6 +174,8 @@ def has_internal_document_resets(position_values_1d: torch.Tensor, cu_seqlens: t
 
 def _extract_1d_packed_positions(mb: TensorDict, expected_tokens: int) -> Optional[torch.Tensor]:
     """Returns 1-D CPU packed positions when ``mb['position_ids']`` is 1-D text positions; ``None`` for 3-D MRoPE."""
+    if "position_ids" not in mb.keys():
+        return None
     if "multi_modal_inputs" in mb.keys() and extract_multi_modal_inputs(mb.get("multi_modal_inputs", [])):
         return None
     pos = mb["position_ids"]
@@ -162,6 +188,31 @@ def _extract_1d_packed_positions(mb: TensorDict, expected_tokens: int) -> Option
     if int(vals.numel()) != expected_tokens:
         return None
     return vals.detach().cpu()
+
+
+def segmented_document_count(mb: TensorDict) -> int:
+    """Document count of a segmented micro-batch, accounting for interior ``position == 0`` resets."""
+    batch_seqs = int(mb.batch_size[0]) if len(mb.batch_size) > 0 else 0
+    if "input_ids" not in mb.keys() or "position_ids" not in mb.keys():
+        return batch_seqs
+    ids = mb["input_ids"]
+    use_rmpad = bool(unwrap_metadata(tu.get_non_tensor_data(data=mb, key="use_remove_padding", default=True)))
+    if not use_rmpad:
+        return batch_seqs
+    total_tokens = int(ids.values().numel()) if getattr(ids, "is_nested", False) else int(ids.numel())
+    pos_1d = _extract_1d_packed_positions(mb, total_tokens)
+    zero_resets = int((pos_1d == 0).sum().item()) if pos_1d is not None and pos_1d.numel() > 0 else 0
+    return max(batch_seqs, zero_resets)
+
+
+def sync_max_segmented_documents(local_max_docs: int) -> int:
+    """Synchronizes the maximum segmented document count across all SPMD ranks via CPU ``MAX`` all-reduce."""
+    max_docs = int(local_max_docs)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        doc_t = torch.tensor([max_docs], dtype=torch.int64)
+        dist.all_reduce(doc_t, op=dist.ReduceOp.MAX)
+        max_docs = int(doc_t.item())
+    return max_docs
 
 
 def classify_gdn_micro_batch(
@@ -190,17 +241,19 @@ def classify_gdn_micro_batch(
     total_tokens = offs[-1] if offs else 0
     n_seqs = len(seq_lens)
     max_seq = max(seq_lens, default=0)
-    if padded_len <= 0 or n_seqs == 0:
+    if padded_len <= 0 or n_seqs == 0 or min(seq_lens) <= 0:
         return 0, SLOT_CAT_SEGMENTED, total_tokens
 
     pos_1d = _extract_1d_packed_positions(mb, total_tokens)
     if pos_1d is None or has_internal_document_resets(pos_1d, offs_t):
         return 0, SLOT_CAT_SEGMENTED, total_tokens
 
+    starts_at_zero = all(int(pos_1d[s].item()) == 0 for s in offs[:-1])
     calc_ent = bool(unwrap_metadata(tu.get_non_tensor_data(data=mb, key="calculate_entropy", default=False)))
     mask = 0
     if (
         allow_row_slot
+        and starts_at_zero
         and auto_slot_len > 0
         and (not calc_ent or forward_only)
         and padded_len >= auto_slot_len
@@ -209,7 +262,7 @@ def classify_gdn_micro_batch(
         and max_seq <= auto_slot_len
     ):
         mask |= _MASK_ROW_SLOT
-    if allow_single_doc and n_seqs == 1 and max_seq <= padded_len:
+    if allow_single_doc and n_seqs == 1 and int(pos_1d[0].item()) == 0 and max_seq <= padded_len:
         mask |= _MASK_SINGLE_DOC
 
     if mask & _MASK_ROW_SLOT:
@@ -305,22 +358,21 @@ def build_cp_full_positions(
     micro_batch: TensorDict,
     padded_seq_len: int,
     *,
-    unsegmented: bool,
+    unsegmented: bool = False,
     slot_src_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Builds the 1-D unsharded ``cp_full_positions`` tensor (length ``padded_seq_len``) on CPU.
 
-    - When ``slot_src_cpu`` is given (row-slot layout): zero-pads ``orig_pos`` to ``padded_seq_len`` and permutes by
-      ``slot_src_cpu``. Each padding token has position ``0``, so ``segment_ids_from_positions`` isolates every
-      sequence's real tokens from trailing padding and from other rows.
-    - When ``unsegmented`` is True without permutation (1-document micro-batch): zero-pads ``orig_pos`` so trailing
-      padding starts new segments that earlier causal tokens never attend to, while GatedDeltaNet runs with
-      ``gated_delta_document_resets=False``.
-    - When ``unsegmented`` is False (segmented multi-document micro-batch): extends the padding tail monotonically
-      (``last_pos + 1, ...``) so padding does not spawn ``pad_len`` synthetic 1-token segments in GatedDeltaNet.
+    Zero-pads trailing padding tokens (``value=0``) across both segmented and unsegmented micro-batches (and permutes
+    by ``slot_src_cpu`` when row-slotted), matching ``pad_packed_inputs_for_tpu`` and
+    ``TpuQwen35Model.preprocess_inputs`` in ``google-pytorch/torchtitan#216``. Each padding token has position ``0``,
+    so ``segment_ids_from_positions`` isolates every sequence's real tokens from trailing padding, preserves Splash
+    Attention block skipping on trailing padding tiles under CP, and keeps ``cp_full_positions=True`` numerically
+    identical to ``cp_full_positions=False``.
 
     Raises ``ValueError`` if ``micro_batch`` has multimodal inputs or non-1D MRoPE positions.
     """
+    del unsegmented
     ids = micro_batch["input_ids"]
     total_tokens = int(ids.values().numel()) if getattr(ids, "is_nested", False) else int(ids.numel())
     orig_pos_cpu = _extract_1d_packed_positions(micro_batch, total_tokens)
@@ -334,14 +386,10 @@ def build_cp_full_positions(
         raise ValueError(
             f"cp_full_positions: position_ids has {orig_pos_cpu.numel()} tokens > padded_seq_len={padded_seq_len}"
         )
+    padded_zero = torch.nn.functional.pad(orig_pos_cpu, (0, pad_len), value=0)
     if slot_src_cpu is not None:
-        padded_zero = torch.nn.functional.pad(orig_pos_cpu, (0, pad_len), value=0)
         return padded_zero[slot_src_cpu].contiguous()
-    if unsegmented or pad_len == 0:
-        return torch.nn.functional.pad(orig_pos_cpu, (0, pad_len), value=0).contiguous()
-    last_pos = int(orig_pos_cpu[-1].item()) if orig_pos_cpu.numel() > 0 else 0
-    mono_tail = torch.arange(1, pad_len + 1, dtype=orig_pos_cpu.dtype) + last_pos
-    return torch.cat((orig_pos_cpu, mono_tail), dim=0).contiguous()
+    return padded_zero.contiguous()
 
 
 def permute_packed_for_row_slots(

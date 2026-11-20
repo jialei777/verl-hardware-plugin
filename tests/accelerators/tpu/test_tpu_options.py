@@ -322,3 +322,26 @@ def test_cp_gdn_slot_and_static_logprob_options():
         tpu_options.get_tpu_engine_options(
             SimpleNamespace(engine_kwargs={"tpu": {"gdn_auto_row_slot_len": 16384, "gdn_row_slot_len": 16384}})
         )
+
+    for bad_static_cfg in (
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 49152},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 40000},
+    ):
+        with pytest.raises(ValueError, match="divisible by gdn_auto_row_slot_len"):
+            tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": bad_static_cfg}))
+
+    valid_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(
+            engine_kwargs={
+                "tpu": {
+                    "gdn_auto_row_slot_len": 32768,
+                    "static_micro_batch_len": 32768,
+                    "static_log_prob_micro_batch_len": 98304,
+                }
+            }
+        )
+    )
+    assert valid_static.static_micro_batch_len == 32768
+    assert valid_static.static_log_prob_micro_batch_len == 98304

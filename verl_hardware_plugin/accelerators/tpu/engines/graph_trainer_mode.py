@@ -297,9 +297,9 @@ def _packed_stream_as_one_row() -> Any:
     micro-batch is one row and the state resets only at document boundaries, as in the eager engine. The value is read
     while tracing, so the traced graph keeps it.
     """
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from verl_hardware_plugin.accelerators.tpu.engines.gdn_slot_schedule import unflatten_seq_len_context
 
-    return set_unflatten_seq_len(None)
+    return unflatten_seq_len_context(None)
 
 
 def build_rl_graph_trainer(config: Any) -> Any:

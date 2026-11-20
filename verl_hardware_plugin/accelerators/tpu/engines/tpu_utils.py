@@ -1258,9 +1258,12 @@ class TPUVarlenAttention(torch.nn.Module):
 def _is_kv_all_gather_cp(inner: torch.nn.Module) -> bool:
     """Whether ``inner`` is a torchtitan KV all-gather CP inner attention (Q shorter than K/V)."""
     try:
-        from torchtitan.experiments.tpu.cp_attention import KVAllGatherCPInnerAttention
+        from torchtitan.experiments.tpu.distributed.cp_attention import KVAllGatherCPInnerAttention
     except ImportError:
-        return False
+        try:
+            from torchtitan.experiments.tpu.cp_attention import KVAllGatherCPInnerAttention
+        except ImportError:
+            return False
     return isinstance(inner, KVAllGatherCPInnerAttention)
 
 

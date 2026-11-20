@@ -161,6 +161,20 @@ def model_registry_kwargs(kernels: frozenset[str]) -> dict[str, Any]:
     return {"converters": list(_qwen3_5_config_registry()._TPU_MOE_CONVERTERS)}
 
 
+def _tpu_grouped_experts_module() -> Any:
+    try:
+        return importlib.import_module("torchtitan.experiments.tpu.components.grouped_experts")
+    except ImportError:
+        return importlib.import_module("torchtitan.experiments.tpu.grouped_experts")
+
+
+def _tpu_token_dispatcher_module() -> Any:
+    try:
+        return importlib.import_module("torchtitan.experiments.tpu.components.token_dispatcher")
+    except ImportError:
+        return importlib.import_module("torchtitan.experiments.tpu.token_dispatcher")
+
+
 def configure_model_spec(
     model_spec: Any,
     kernels: frozenset[str],
@@ -176,7 +190,7 @@ def configure_model_spec(
     """
     if "moe" not in kernels:
         return
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+    TpuGroupedExperts = _tpu_grouped_experts_module().TpuGroupedExperts
 
     _qwen3_5_config_registry()._use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
     paired_under_ep = expert_parallel_degree > 1 and configure_qwen3_5_expert_parallel(
@@ -280,8 +294,8 @@ def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
 
     Same order as torchtitan's Qwen3-30B-A3B TPU recipe. The default dispatcher's backward is ~5x slower on TPU.
     """
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
-    from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+    TpuGroupedExpertsConverter = _tpu_grouped_experts_module().TpuGroupedExpertsConverter
+    TpuTokenDispatcherConverter = _tpu_token_dispatcher_module().TpuTokenDispatcherConverter
 
     return {"converters": [TpuTokenDispatcherConverter.Config(), TpuGroupedExpertsConverter.Config()]}
 
@@ -312,8 +326,9 @@ def configure_qwen3_moe(
         ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
             256-row tile.
     """
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
     from torchtitan.models.common.moe import MoE
+
+    TpuGroupedExperts = _tpu_grouped_experts_module().TpuGroupedExperts
 
     if expert_parallel_size > 1:
         raise ValueError(
@@ -515,6 +530,7 @@ _DYNAMO_CACHE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta", ("_tpu_generation", "_import_kda")),
     ("torchtitan.experiments.tpu.kernels.ragged_gather_tc", ("_tpu_generation",)),
     ("torchtitan.experiments.tpu.kernels.causal_conv1d", ("_tpu_generation",)),
+    ("torchtitan.experiments.tpu.kernels.pallas_vmem", ("tpu_generation",)),
 )
 
 

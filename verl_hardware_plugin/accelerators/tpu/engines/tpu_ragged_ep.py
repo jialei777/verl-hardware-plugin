@@ -37,15 +37,23 @@ except ImportError:
     _maybe_set_sparse_mesh = None  # type: ignore[assignment]
 
 try:
-    from torchtitan.experiments.tpu.token_dispatcher import (
+    from torchtitan.experiments.tpu.components.token_dispatcher import (
         scale_route_weights as _tt_scale_route_weights,
     )
-    from torchtitan.experiments.tpu.token_dispatcher import (
+    from torchtitan.experiments.tpu.components.token_dispatcher import (
         stable_grouped_reduce as _tt_stable_grouped_reduce,
     )
 except ImportError:
-    _tt_scale_route_weights = None  # type: ignore[assignment]
-    _tt_stable_grouped_reduce = None  # type: ignore[assignment]
+    try:
+        from torchtitan.experiments.tpu.token_dispatcher import (
+            scale_route_weights as _tt_scale_route_weights,
+        )
+        from torchtitan.experiments.tpu.token_dispatcher import (
+            stable_grouped_reduce as _tt_stable_grouped_reduce,
+        )
+    except ImportError:
+        _tt_scale_route_weights = None  # type: ignore[assignment]
+        _tt_stable_grouped_reduce = None  # type: ignore[assignment]
 
 
 def has_tpu_ragged_all_to_all() -> bool:

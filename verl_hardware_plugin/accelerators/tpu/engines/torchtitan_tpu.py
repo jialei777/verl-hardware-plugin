@@ -75,7 +75,12 @@ from verl.workers.engine.utils import (
 )
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    gdn_slot_schedule,
+    graph_trainer_mode,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -118,334 +123,6 @@ from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-_FAST_CP_GDN_PATCHED = False
-
-
-def _install_fast_cp_gdn_patches() -> None:
-    """Eliminate per-layer ``all_gather(positions)`` under Qwen3.5 Ulysses CP and use unsegmented GDN on 1-doc rows."""
-    global _FAST_CP_GDN_PATCHED
-    if _FAST_CP_GDN_PATCHED:
-        return
-    import spmd_types as spmd
-    import torch.distributed._functional_collectives as funcol
-    import torch.nn.functional as F
-    from torchtitan.distributed.parallel_dims import MeshAxisName
-    from torchtitan.distributed.spmd_types import spmd_mesh_group
-    from torchtitan.experiments.tpu.cp_attention import (
-        _HEAD_DIM,
-        _TOKEN_DIM,
-        UlyssesCPInnerAttention,
-        _all_to_all,
-        _AllGatherKV,
-        _full_sequence_segment_ids,
-        _repeat_kv_heads,
-        _type_checking,
-        _wait,
-    )
-    from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import (
-        _CHANNEL_DIM,
-        CPTpuInnerGatedDeltaNet,
-        _headtail_to_sequence_order,
-        _local_heads,
-        _sequence_to_headtail_order,
-        cp_all_gather,
-        cp_all_to_all,
-        cp_rank_tensor,
-    )
-    from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
-        TpuGatedDeltaNet,
-        TpuInnerGatedDeltaNet,
-        rms_norm_gated,
-    )
-    from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
-    from torchtitan.models.common.attention import VarlenInnerAttention
-
-    class _ReduceScatterOut(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x: torch.Tensor, group: Any, seq_dim: int) -> torch.Tensor:
-            ctx.group = group
-            ctx.seq_dim = seq_dim
-            return _wait(funcol.reduce_scatter_tensor(x, "sum", seq_dim, group))
-
-        @staticmethod
-        def backward(ctx, grad_out: torch.Tensor):
-            return _wait(funcol.all_gather_tensor(grad_out, ctx.seq_dim, ctx.group)), None, None
-
-    def _local_cols(w: torch.Tensor, rank: torch.Tensor, cp: int) -> torch.Tensor:
-        local = w.shape[1] // cp
-        return w.reshape(w.shape[0], cp, local).index_select(1, rank).reshape(w.shape[0], local)
-
-    def _patched_block_forward(self, x_TD, attention_masks, positions=None):
-        if isinstance(attention_masks, dict) and "_tpu_full_seg_ids" in attention_masks:
-            h_TD = self.attention_norm(x_TD)
-            if isinstance(self.attn, TpuQwen35Attention):
-                h_TD = self.attn(h_TD, attention_masks["_tpu_full_seg_ids"], positions)
-            else:
-                h_TD = self.attn(h_TD, None, attention_masks.get("_tpu_gdn_full_pos"))
-            x_TD = x_TD + h_TD
-            h_TD = self.ffn_norm(x_TD)
-            x_TD = x_TD + (self.moe(h_TD) if self.moe_enabled else self.feed_forward(h_TD))
-            return x_TD
-        layer_mask = attention_masks[self.attn_mask_key] if attention_masks is not None else None
-        h_TD = self.attention_norm(x_TD)
-        h_TD = self.attn(h_TD, layer_mask, positions)
-        x_TD = x_TD + h_TD
-        h_TD = self.ffn_norm(x_TD)
-        x_TD = x_TD + (self.moe(h_TD) if self.moe_enabled else self.feed_forward(h_TD))
-        return x_TD
-
-    def _patched_ulysses_forward(self, q_THK, k_THK, v_THV, **kwargs):
-        if kwargs.get("out_transform") is not None and (
-            self._local_attn_override is not None or not isinstance(self, VarlenInnerAttention)
-        ):
-            raise NotImplementedError("Ulysses CP out_transform unsupported with kernel override.")
-        group = spmd_mesh_group(MeshAxisName.CP)
-        if group is None:
-            raise RuntimeError("CP attention requires an active CP mesh axis.")
-        cp = group.size()
-        k_THK, v_THV = _repeat_kv_heads(k_THK, cp), _repeat_kv_heads(v_THV, cp)
-        q_THK, k_THK, v_THV = (
-            _all_to_all(x, group, src_dim=_TOKEN_DIM, dst_dim=_HEAD_DIM) for x in (q_THK, k_THK, v_THV)
-        )
-        if "enable_gqa" in kwargs:
-            kwargs["enable_gqa"] = q_THK.shape[_HEAD_DIM] != k_THK.shape[_HEAD_DIM]
-        positions = kwargs.pop("positions", None)
-        attn_masks = kwargs.get("attention_masks")
-        if isinstance(attn_masks, torch.Tensor) and attn_masks.dim() == 1:
-            kwargs.pop("attention_masks", None)
-            kwargs["segment_ids"] = attn_masks
-        seg = kwargs.get("segment_ids")
-        if seg is None or seg.shape[_TOKEN_DIM] != q_THK.shape[_TOKEN_DIM]:
-            full_seg = getattr(positions, "_cp_full_segment_ids", None)
-            if full_seg is not None:
-                kwargs["segment_ids"] = full_seg
-            elif positions is not None:
-                kwargs["segment_ids"] = _full_sequence_segment_ids(positions, group)
-        local_attn = self._local_attn_override or self.local_forward
-        type_check = _type_checking()
-        if type_check:
-            q_type = spmd.get_local_type(q_THK), spmd.get_partition_spec(q_THK)
-        with spmd.no_typecheck():
-            out_THV = local_attn(q_THK, k_THK, v_THV, **kwargs)
-        if type_check and not spmd.has_local_type(out_THV):
-            spmd.assert_type(out_THV, *q_type)
-        return _all_to_all(out_THV, group, src_dim=_HEAD_DIM, dst_dim=_TOKEN_DIM)
-
-    orig_gdn_fwd = CPTpuInnerGatedDeltaNet.forward
-
-    def _patched_cp_gdn_forward(
-        self,
-        query_TC,
-        key_TC,
-        value_TC,
-        a_TH,
-        b_TH,
-        conv_q_weight_C1W,
-        conv_k_weight_C1W,
-        conv_v_weight_C1W,
-        A_log_H,
-        dt_bias_H,
-        cu_seqlens,
-        *,
-        key_head_dim,
-        value_head_dim,
-        positions=None,
-    ):
-        group = spmd_mesh_group(MeshAxisName.CP)
-        if group is None:
-            return orig_gdn_fwd(
-                self,
-                query_TC,
-                key_TC,
-                value_TC,
-                a_TH,
-                b_TH,
-                conv_q_weight_C1W,
-                conv_k_weight_C1W,
-                conv_v_weight_C1W,
-                A_log_H,
-                dt_bias_H,
-                cu_seqlens,
-                key_head_dim=key_head_dim,
-                value_head_dim=value_head_dim,
-                positions=positions,
-            )
-        cp = group.size()
-        headtail = self.load_balancer == "headtail"
-        rank = cp_rank_tensor(query_TC.device, group)
-        query_TC, key_TC, value_TC, a_TH, b_TH = (
-            cp_all_to_all(x, group, src_dim=_TOKEN_DIM, dst_dim=_CHANNEL_DIM)
-            for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
-        )
-        type_check = spmd.is_type_checking()
-        if type_check:
-            out_type = (spmd.get_local_type(value_TC), spmd.get_partition_spec(value_TC))
-        with spmd.no_typecheck():
-            full_positions = None
-            if positions is not None:
-                if positions.numel() == query_TC.shape[0]:
-                    full_positions = positions.reshape(-1)
-                else:
-                    full_positions = cp_all_gather(positions.reshape(-1), group)
-            if headtail:
-                query_TC, key_TC, value_TC, a_TH, b_TH = (
-                    _headtail_to_sequence_order(x, cp) for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
-                )
-                if full_positions is not None:
-                    full_positions = _headtail_to_sequence_order(full_positions, cp)
-            out_THV = super(CPTpuInnerGatedDeltaNet, self).forward(
-                query_TC,
-                key_TC,
-                value_TC,
-                a_TH,
-                b_TH,
-                _local_heads(conv_q_weight_C1W, rank, cp),
-                _local_heads(conv_k_weight_C1W, rank, cp),
-                _local_heads(conv_v_weight_C1W, rank, cp),
-                _local_heads(A_log_H, rank, cp),
-                _local_heads(dt_bias_H, rank, cp),
-                cu_seqlens,
-                key_head_dim=key_head_dim,
-                value_head_dim=value_head_dim,
-                positions=full_positions,
-            )
-            out_TC = out_THV.reshape(out_THV.shape[0], -1)
-            if headtail:
-                out_TC = _sequence_to_headtail_order(out_TC, cp)
-        if type_check and not spmd.has_local_type(out_TC):
-            spmd.assert_type(out_TC, *out_type)
-        out_TC = cp_all_to_all(out_TC, group, src_dim=_CHANNEL_DIM, dst_dim=_TOKEN_DIM)
-        return out_TC.unflatten(-1, (-1, value_head_dim))
-
-    TpuQwen35TransformerBlock.forward = _patched_block_forward
-    UlyssesCPInnerAttention.forward = _patched_ulysses_forward
-    CPTpuInnerGatedDeltaNet.forward = _patched_cp_gdn_forward
-    if os.environ.get("VERL_TPU_GDN_AG_RS_CP2") == "1":
-        orig_tpu_gdn_fwd = TpuGatedDeltaNet.forward
-
-        def _patched_tpu_gdn_ag_rs_forward(self, x_TD, attention_masks=None, positions=None):
-            group = spmd_mesh_group(MeshAxisName.CP)
-            if (
-                group is None
-                or group.size() != 2
-                or getattr(self.inner_gated_delta_net, "load_balancer", None) is not None
-            ):
-                return orig_tpu_gdn_fwd(self, x_TD, attention_masks, positions)
-            cp = 2
-            type_check = spmd.is_type_checking()
-            if type_check:
-                x_spmd_type = (spmd.get_local_type(x_TD), spmd.get_partition_spec(x_TD))
-            wq, bq = self.in_proj_q.weight, self.in_proj_q.bias
-            wk, bk = self.in_proj_k.weight, self.in_proj_k.bias
-            wv, bv = self.in_proj_v.weight, self.in_proj_v.bias
-            wz, bz = self.in_proj_z.weight, self.in_proj_z.bias
-            wa, ba = self.in_proj_a.weight, self.in_proj_a.bias
-            wb, bb = self.in_proj_b.weight, self.in_proj_b.bias
-            cw_q = self.conv_q.weight
-            cw_k = self.conv_k.weight
-            cw_v = self.conv_v.weight
-            a_log = self.A_log
-            dt_bias = self.dt_bias
-            norm_w = self.norm.weight
-            w_out, b_out = self.out_proj.weight, self.out_proj.bias
-            rank = cp_rank_tensor(x_TD.device, group)
-            reduce_dtype = x_TD.dtype if x_TD.dtype in (torch.bfloat16, torch.float64) else torch.float32
-            fuse_proj = os.environ.get("VERL_TPU_FUSE_GDN_PROJ") == "1" and all(
-                b is None for b in (bq, bk, bv, bz, ba, bb)
-            )
-            with spmd.no_typecheck():
-                x_full = _AllGatherKV.apply(x_TD, group, _TOKEN_DIM, reduce_dtype)
-                full_tokens = x_full.shape[0]
-                if fuse_proj:
-                    wq_l = _local_heads(wq, rank, cp)
-                    wk_l = _local_heads(wk, rank, cp)
-                    wv_l = _local_heads(wv, rank, cp)
-                    wz_l = _local_heads(wz, rank, cp)
-                    wa_l = _local_heads(wa, rank, cp)
-                    wb_l = _local_heads(wb, rank, cp)
-                    qkvzab = F.linear(x_full, torch.cat((wq_l, wk_l, wv_l, wz_l, wa_l, wb_l), dim=0))
-                    query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = torch.split(
-                        qkvzab,
-                        [
-                            wq_l.shape[0],
-                            wk_l.shape[0],
-                            wv_l.shape[0],
-                            wz_l.shape[0],
-                            wa_l.shape[0],
-                            wb_l.shape[0],
-                        ],
-                        dim=-1,
-                    )
-                else:
-                    query_TC = F.linear(
-                        x_full, _local_heads(wq, rank, cp), _local_heads(bq, rank, cp) if bq is not None else None
-                    )
-                    key_TC = F.linear(
-                        x_full, _local_heads(wk, rank, cp), _local_heads(bk, rank, cp) if bk is not None else None
-                    )
-                    value_TC = F.linear(
-                        x_full, _local_heads(wv, rank, cp), _local_heads(bv, rank, cp) if bv is not None else None
-                    )
-                    gate_TC = F.linear(
-                        x_full, _local_heads(wz, rank, cp), _local_heads(bz, rank, cp) if bz is not None else None
-                    )
-                    a_TH = F.linear(
-                        x_full, _local_heads(wa, rank, cp), _local_heads(ba, rank, cp) if ba is not None else None
-                    )
-                    b_TH = F.linear(
-                        x_full, _local_heads(wb, rank, cp), _local_heads(bb, rank, cp) if bb is not None else None
-                    )
-                full_positions = None
-                if self.reset_at_documents and positions is not None:
-                    if positions.numel() == full_tokens:
-                        full_positions = positions.reshape(-1)
-                    else:
-                        full_positions = cp_all_gather(positions.reshape(-1), group)
-                cu_seqlens = (
-                    attention_masks.cu_seq_q
-                    if attention_masks is not None
-                    else torch.arange(0, full_tokens + 1, full_tokens, dtype=torch.int32, device=x_TD.device)
-                )
-                output_THV = TpuInnerGatedDeltaNet.forward(
-                    self.inner_gated_delta_net,
-                    query_TC,
-                    key_TC,
-                    value_TC,
-                    a_TH,
-                    b_TH,
-                    _local_heads(cw_q, rank, cp),
-                    _local_heads(cw_k, rank, cp),
-                    _local_heads(cw_v, rank, cp),
-                    _local_heads(a_log, rank, cp),
-                    _local_heads(dt_bias, rank, cp),
-                    cu_seqlens,
-                    key_head_dim=self.key_head_dim,
-                    value_head_dim=self.value_head_dim,
-                    positions=full_positions,
-                )
-                gate_THV = gate_TC.view(full_tokens, -1, self.value_head_dim)
-                if rms_norm_gated is not None and rms_norm_gated.supports(output_THV, gate_THV, norm_w):
-                    output_THV = rms_norm_gated.rms_norm_gated(output_THV, gate_THV, norm_w, self.norm.eps)
-                else:
-                    in_dtype = output_THV.dtype
-                    xf = output_THV.to(torch.float32)
-                    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.norm.eps)
-                    xf = norm_w * xf.to(in_dtype)
-                    output_THV = (xf.float() * F.silu(gate_THV.float())).to(in_dtype)
-                partial_out_TD = F.linear(output_THV.reshape(full_tokens, -1), _local_cols(w_out, rank, cp))
-                out_TD = _ReduceScatterOut.apply(partial_out_TD, group, _TOKEN_DIM)
-                if b_out is not None:
-                    out_TD = out_TD + b_out
-            if type_check and not spmd.has_local_type(out_TD):
-                spmd.assert_type(out_TD, *x_spmd_type)
-            return out_TD
-
-        TpuGatedDeltaNet.forward = _patched_tpu_gdn_ag_rs_forward
-        logger.warning("Installed VERL_TPU_GDN_AG_RS_CP2 patch (AG(x_TD) + head-sliced GDN + RS(out_TD) at cp=2)")
-    _FAST_CP_GDN_PATCHED = True
-    logger.warning("Installed VERL_TPU_FAST_CP_GDN patches (precomputed full segment_ids + 1-doc unsegmented GDN)")
 
 
 def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
@@ -1577,6 +1254,25 @@ class TorchTitanTPUEngine(BaseEngine):
             self.config.override.imports.append(
                 ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
             )
+        self._cp_full_positions = bool(tpu_options.cp_full_positions)
+        self._gdn_auto_row_slot_len = int(tpu_options.gdn_auto_row_slot_len or 0)
+        self._sort_micro_batches_by_slot = bool(tpu_options.sort_micro_batches_by_slot)
+        if self._gdn_auto_row_slot_len:
+            if not isinstance(self, TorchTitanTPUEngineWithLMHead) or not self._use_fused_linear_cross_entropy:
+                raise ValueError(
+                    "gdn_auto_row_slot_len requires TorchTitanTPUEngineWithLMHead with use_fused_linear_cross_entropy"
+                )
+            if self._graph_trainer_mode:
+                raise ValueError("gdn_auto_row_slot_len is not supported with trainer_mode='graph_trainer'")
+            if parallelism.tensor_parallel_degree > 1:
+                raise ValueError("gdn_auto_row_slot_len does not support tensor parallelism")
+            if parallelism.context_parallel_degree > 1 and parallelism.context_parallel_load_balancer is not None:
+                raise ValueError(
+                    "gdn_auto_row_slot_len under context parallelism requires contiguous token sharding "
+                    "(context_parallel_strategy='ulysses', load_balancer=None)"
+                )
+        if tpu_options.fuse_gdn_projections:
+            gdn_slot_schedule.enable_fused_gdn_projections(self.config.model_spec.model)
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1596,6 +1292,11 @@ class TorchTitanTPUEngine(BaseEngine):
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         model_parts = self.trainer.model_parts
+        gdn_slot_schedule.validate_model_cp_slot_support(
+            model_parts,
+            need_cp_full_positions=self._cp_full_positions and self.parallel_dims.cp_enabled,
+            need_document_resets_override=bool(self._gdn_auto_row_slot_len),
+        )
         if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
             for model_part in model_parts:
@@ -1737,8 +1438,6 @@ class TorchTitanTPUEngine(BaseEngine):
         validate_tpu_context_parallel(model, parallelism)
         # Runtime FSDP workaround for torch without spmd_types FSDP (see install_tpu_cp_patches).
         install_tpu_cp_patches()
-        if os.environ.get("VERL_TPU_FAST_CP_GDN") == "1" and strategy == "ulysses":
-            _install_fast_cp_gdn_patches()
 
     def _cp_attention_owner(self) -> Any:
         """Return the CP inner-attention class whose ``cp_shard`` shards model inputs.
@@ -1938,107 +1637,70 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
-        if forward_only and os.environ.get("VERL_TPU_STATIC_LOGPROB_LEN"):
-            static_len = int(os.environ["VERL_TPU_STATIC_LOGPROB_LEN"])
+        if forward_only and tpu_options.static_log_prob_micro_batch_len:
+            static_len = int(tpu_options.static_log_prob_micro_batch_len)
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
+        auto_slot_len = int(getattr(self, "_gdn_auto_row_slot_len", 0) or 0)
+        bucket_sz = get_tpu_seq_bucket_size(self.engine_config)
+        allow_auto_row_slot = (
+            auto_slot_len > 0
+            and not slot_len
+            and not graph_mode
+            and isinstance(self, TorchTitanTPUEngineWithLMHead)
+            and self._use_fused_linear_cross_entropy
+            and not self.parallel_dims.tp_enabled
+            and (
+                not self.parallel_dims.cp_enabled
+                or self.trainer.config.parallelism.context_parallel_load_balancer is None
+            )
+        )
         if (
-            os.environ.get("VERL_TPU_SORT_CP_SLOTS") == "1"
+            getattr(self, "_sort_micro_batches_by_slot", False)
             and indices is not None
             and len(micro_batches) > 1
-            and self.parallel_dims.cp_enabled
             and not slot_len
         ):
-            max_slots_32k = max(1, (static_len or 65536) // 32768)
-
-            def _cp_slot_sort_key(idx: int) -> tuple[int, int, int]:
-                mb = micro_batches[idx]
-                ids = mb["input_ids"]
-                if not getattr(ids, "is_nested", False):
-                    return (2, 0, idx)
-                offs = ids.offsets().tolist()
-                seq_lens = [b - a for a, b in zip(offs[:-1], offs[1:], strict=True)]
-                n_seqs = len(seq_lens)
-                max_seq = max(seq_lens, default=0)
-                pos_vals = mb["position_ids"].values().detach().cpu().reshape(-1)
-                n_resets = int((pos_vals == 0).sum().item())
-                if n_seqs <= max_slots_32k and max_seq <= 32768 and n_resets <= n_seqs:
-                    cat = 0
-                elif n_seqs <= 1 and n_resets <= 1:
-                    cat = 1
-                else:
-                    cat = 2
-                return (cat, -sum(seq_lens), idx)
-
-            order = sorted(range(len(micro_batches)), key=_cp_slot_sort_key)
-            micro_batches = [micro_batches[k] for k in order]
-            indices = [indices[k] for k in order]
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
+            micro_batches, indices = gdn_slot_schedule.sort_micro_batches_for_slots(
+                micro_batches,
+                indices,
+                auto_slot_len=auto_slot_len,
+                static_len=static_len,
+                bucket_size=bucket_sz,
+                forward_only=forward_only,
+                allow_row_slot=allow_auto_row_slot,
+            )
+        if (
+            self._use_simple_fsdp
+            or self.parallel_dims.cp_enabled
+            or static_len
+            or static_response_len
+            or slot_len
+            or allow_auto_row_slot
+        ):
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
-                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                bucket_size=bucket_sz,
                 static_len=static_len,
                 static_response_len=static_response_len,
                 gdn_row_slot_len=slot_len,
             )
-
-        if (
-            os.environ.get("VERL_TPU_FAST_CP_GDN") == "1"
-            and self.parallel_dims.cp_enabled
-            and not slot_len
-            and self.trainer.config.parallelism.context_parallel_load_balancer is None
-            and self.config.model_spec.name == "qwen3_5"
-        ):
-            use_cp_row_slot = (
-                os.environ.get("VERL_TPU_CP_ROW_SLOT") == "1"
-                and self._use_fused_linear_cross_entropy
-                and not self.parallel_dims.tp_enabled
+        if allow_auto_row_slot:
+            gdn_slot_schedule.plan_micro_batch_gdn_slots(
+                micro_batches,
+                auto_slot_len=auto_slot_len,
+                forward_only=forward_only,
+                allow_row_slot=True,
+                allow_single_doc=True,
             )
-            slot_masks: list[int] = []
-            for mb in micro_batches:
-                use_rmpad = unwrap_metadata(tu.get_non_tensor_data(data=mb, key="use_remove_padding", default=True))
-                calc_ent = unwrap_metadata(tu.get_non_tensor_data(data=mb, key="calculate_entropy", default=False))
-                ids = mb["input_ids"]
-                padded_len = int(tu.get_non_tensor_data(data=mb, key="tpu_padded_seq_len", default=0) or 0)
-                mask = 0
-                if use_rmpad and getattr(ids, "is_nested", False) and padded_len > 0:
-                    offs = ids.offsets().tolist()
-                    seq_lens = [b - a for a, b in zip(offs[:-1], offs[1:], strict=True)]
-                    n_seqs = len(seq_lens)
-                    max_seq = max(seq_lens, default=0)
-                    pos_vals = mb["position_ids"].values().detach().cpu().reshape(-1)
-                    n_resets = int((pos_vals == 0).sum().item())
-                    if (
-                        use_cp_row_slot
-                        and (not calc_ent or forward_only)
-                        and padded_len >= 32768
-                        and padded_len % 32768 == 0
-                        and n_seqs <= padded_len // 32768
-                        and max_seq <= 32768
-                        and n_resets <= n_seqs
-                    ):
-                        mask |= 1
-                    if n_seqs <= 1 and n_resets <= 1 and max_seq <= padded_len:
-                        mask |= 2
-                slot_masks.append(mask)
-            if slot_masks:
-                mask_t = torch.tensor(slot_masks, dtype=torch.int64)
-                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                    torch.distributed.all_reduce(mask_t, op=torch.distributed.ReduceOp.BAND)
-                for mb, m in zip(micro_batches, mask_t.tolist(), strict=True):
-                    padded_len = int(tu.get_non_tensor_data(data=mb, key="tpu_padded_seq_len", default=0) or 0)
-                    resolved_slot = 32768 if (m & 1) else (padded_len if (m & 2) else 0)
-                    if resolved_slot > 0:
-                        tu.assign_non_tensor_data(mb, "tpu_cp_slot_len", resolved_slot)
 
         if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
-            # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
-            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
-            # varying sequence counts do not recompile the kernels (see packed_document_budget).
+            # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): count only micro-batches that
+            # still run segmented (without an auto row-slot assignment).
             segmented_mbs = [
                 mb
                 for mb in micro_batches
-                if int(tu.get_non_tensor_data(data=mb, key="tpu_cp_slot_len", default=0) or 0) == 0
+                if int(tu.get_non_tensor_data(data=mb, key=gdn_slot_schedule.MB_SLOT_LEN_KEY, default=0) or 0) == 0
             ]
             if segmented_mbs:
                 budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in segmented_mbs))
@@ -2071,11 +1733,13 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = nullcontext()
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                mb_cp_slot_len = int(tu.get_non_tensor_data(data=micro_batch, key="tpu_cp_slot_len", default=0) or 0)
-                if mb_cp_slot_len > 0:
+                mb_slot_len = int(
+                    tu.get_non_tensor_data(data=micro_batch, key=gdn_slot_schedule.MB_SLOT_LEN_KEY, default=0) or 0
+                )
+                if mb_slot_len > 0:
                     from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 
-                    mb_row_ctx = set_unflatten_seq_len(mb_cp_slot_len)
+                    mb_row_ctx: Any = set_unflatten_seq_len(mb_slot_len)
                 else:
                     mb_row_ctx = nullcontext()
                 with (
@@ -2914,50 +2578,39 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             output_args["batch_size"] = batch_size
             output_args["max_seq_len"] = max_seq_len
 
-        output_args["padded_seq_len"] = int(input_ids.shape[-1])
+        padded_seq_len = int(input_ids.shape[-1])
+        output_args["padded_seq_len"] = padded_seq_len
         extra_kwargs: dict[str, Any] = {}
-        if self.parallel_dims.cp_enabled:
-            fast_cp_masks: dict[str, Any] | None = None
-            if (
-                os.environ.get("VERL_TPU_FAST_CP_GDN") == "1"
-                and use_remove_padding
-                and not getattr(self, "_gdn_row_slot_len", 0)
-                and self.trainer.config.parallelism.context_parallel_load_balancer is None
-                and self.config.model_spec.name == "qwen3_5"
-            ):
-                from torchtitan.models.common.attention import segment_ids_from_positions
+        slot_src_cpu: Optional[torch.Tensor] = None
+        mb_slot_len = int(
+            tu.get_non_tensor_data(data=micro_batch, key=gdn_slot_schedule.MB_SLOT_LEN_KEY, default=0) or 0
+        )
+        calculate_entropy = bool(
+            unwrap_metadata(tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False))
+        )
+        if mb_slot_len > 0 and mb_slot_len < padded_seq_len and calculate_entropy and torch.is_grad_enabled():
+            mb_slot_len = 0
+        if mb_slot_len > 0 and use_remove_padding:
+            if mb_slot_len < padded_seq_len:
+                input_ids, position_ids, labels, slot_src_cpu, contig_src_dev = (
+                    gdn_slot_schedule.permute_packed_for_row_slots(
+                        cu_seqlens, padded_seq_len, mb_slot_len, input_ids, position_ids, labels
+                    )
+                )
+                output_args[gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY] = contig_src_dev
+            extra_kwargs["gated_delta_document_resets"] = False
 
-                orig_pos_cpu = micro_batch["position_ids"].values().detach().cpu().reshape(-1)
-                padded_seq_len = int(input_ids.shape[-1])
-                pad_len = padded_seq_len - int(orig_pos_cpu.numel())
-                full_pos_zero = torch.nn.functional.pad(orig_pos_cpu, (0, max(0, pad_len)), value=0)
-                mb_cp_slot_len = int(tu.get_non_tensor_data(data=micro_batch, key="tpu_cp_slot_len", default=0) or 0)
-                if mb_cp_slot_len > 0:
-                    if mb_cp_slot_len < padded_seq_len:
-                        slot_src_cpu, contig_src_cpu = row_slot_permutation(cu_seqlens, padded_seq_len, mb_cp_slot_len)
-                        full_pos_zero = full_pos_zero[slot_src_cpu]
-                        slot_src_dev = slot_src_cpu.to(input_ids.device)
-                        input_ids = input_ids[..., slot_src_dev]
-                        position_ids = position_ids[..., slot_src_dev]
-                        labels = labels[..., slot_src_dev]
-                        output_args["gdn_contig_src_cp"] = contig_src_cpu.to(input_ids.device)
-                    full_seg_cpu = segment_ids_from_positions(full_pos_zero).reshape(-1)
-                    full_seg_tpu = full_seg_cpu.to(device=input_ids.device).contiguous()
-                    tpu_synchronize(full_seg_tpu, wait=False)
-                    gdn_full_pos_tpu = None
-                else:
-                    full_seg_cpu = segment_ids_from_positions(full_pos_zero).reshape(-1)
-                    full_seg_tpu = full_seg_cpu.to(device=input_ids.device).contiguous()
-                    tpu_synchronize(full_seg_tpu, wait=False)
-                    if pad_len > 0:
-                        last_pos = int(orig_pos_cpu[-1].item()) if orig_pos_cpu.numel() > 0 else 0
-                        mono_tail = torch.arange(1, pad_len + 1, dtype=orig_pos_cpu.dtype) + last_pos
-                        gdn_pos_cpu = torch.cat((orig_pos_cpu, mono_tail), dim=0)
-                    else:
-                        gdn_pos_cpu = orig_pos_cpu
-                    gdn_full_pos_tpu = gdn_pos_cpu.to(device=input_ids.device).contiguous()
-                    tpu_synchronize(gdn_full_pos_tpu, wait=False)
-                fast_cp_masks = {"_tpu_full_seg_ids": full_seg_tpu, "_tpu_gdn_full_pos": gdn_full_pos_tpu}
+        cp_full_pos_dev: Optional[torch.Tensor] = None
+        if self.parallel_dims.cp_enabled:
+            if getattr(self, "_cp_full_positions", False):
+                if use_remove_padding:
+                    unseg = mb_slot_len > 0 or bool(getattr(self, "_gdn_row_slot_len", 0))
+                    full_pos_cpu = gdn_slot_schedule.build_cp_full_positions(
+                        micro_batch, padded_seq_len, unsegmented=unseg, slot_src_cpu=slot_src_cpu
+                    )
+                    cp_full_pos_dev = full_pos_cpu.to(device=input_ids.device).contiguous()
+                elif not multi_modal_inputs and position_ids.ndim == 1:
+                    cp_full_pos_dev = position_ids.contiguous()
             cp_batch: dict[str, Any] = {"input": input_ids, "positions": position_ids}
             if use_remove_padding:
                 cp_batch["labels"] = labels
@@ -2975,11 +2628,11 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             if use_remove_padding:
                 labels = cp_batch.pop("labels")
             extra_kwargs.update(cp_batch)
-            if fast_cp_masks is not None:
-                extra_kwargs["attention_masks"] = fast_cp_masks
 
         # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
         extra_inputs = {"positions": position_ids, **multi_modal_inputs}
+        if cp_full_pos_dev is not None:
+            extra_inputs["cp_full_positions"] = cp_full_pos_dev
         extra_inputs = {
             k: v if not isinstance(v, torch.Tensor) or v.is_contiguous() else v.contiguous()
             for k, v in extra_inputs.items()
@@ -2988,13 +2641,21 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids = input_ids.contiguous()
 
         if getattr(self.trainer.config.parallelism, "spmd_backend", None) == "spmd_types":
+            import spmd_types as spmd
             from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-            from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+            from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType, decoder_input_sharding
 
+            sharding = dict(decoder_input_sharding())
             spmd_inputs: dict[str, Any] = {"input": input_ids, "positions": extra_inputs["positions"]}
             if use_remove_padding:
                 spmd_inputs["labels"] = labels
-            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, decoder_input_sharding())
+            if "cp_full_positions" in extra_inputs:
+                spmd_inputs["cp_full_positions"] = extra_inputs["cp_full_positions"]
+                sharding["cp_full_positions"] = SpmdType(
+                    {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+                    partition_spec=spmd.PartitionSpec(DP),
+                )
+            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, sharding)
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
@@ -3073,12 +2734,13 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         vocab_size=int(lm_head_weight_t.shape[1]),
                     ),
                 )
+                post_gather_src = output_args.get(gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY)
                 if calculate_entropy and not torch.is_grad_enabled():
                     # Entropy without gradient (old log-probs): one chunk of logits at a time, never all of them.
                     entropy_rmpad = chunked_entropy_from_hidden_tpu(hidden_rmpad, lm_head_weight_t, temperature)
                     gathered_entropy = self._maybe_gather_context_parallel(entropy_rmpad, output_args)
-                    if "gdn_contig_src_cp" in output_args:
-                        gathered_entropy = gathered_entropy.index_select(0, output_args["gdn_contig_src_cp"])
+                    if post_gather_src is not None:
+                        gathered_entropy = gathered_entropy.index_select(0, post_gather_src)
                     model_output["entropy"] = _to_jagged(
                         gathered_entropy,
                         cu_seqlens,
@@ -3086,10 +2748,13 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     )
                 if not calculate_entropy or not torch.is_grad_enabled():
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
-                    if "gdn_contig_src_cp" in output_args:
-                        fused_log_probs = fused_log_probs.index_select(0, output_args["gdn_contig_src_cp"])
+                    if post_gather_src is not None:
+                        fused_log_probs = fused_log_probs.index_select(0, post_gather_src)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
+            assert gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY not in output_args, (
+                "CP row-slot permutation must not enter the differentiated-entropy logits path"
+            )
             # A differentiated entropy (entropy loss) needs the logits. The log-probs still come from the fused kernel,
             # so the reference, old-log-prob and update passes all compute them the same way (an on-policy PPO ratio
             # is exactly 1).

@@ -45,6 +45,11 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | Option | Effect |
 |---|---|
 | `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
+| `static_log_prob_micro_batch_len: <tokens>` | Static packed micro-batch length for forward-only (old/reference log-prob) passes, overriding `static_micro_batch_len` when `forward_only=True` |
+| `cp_full_positions: true` | Pass pre-`cp_shard` unsharded 1-D `positions` to `model.forward(cp_full_positions=...)` (`google-pytorch/torchtitan#216`), removing per-layer `all_gather(positions)` under Ulysses and KV all-gather CP |
+| `gdn_auto_row_slot_len: <tokens>` | Dynamic per-micro-batch row-slot planner (e.g. `32768`, `google-pytorch/torchtitan#216`): permutes eligible single-doc sequences into slots with `set_unflatten_seq_len(slot_len)` and `gated_delta_document_resets=False`, runs 1-doc micro-batches unsegmented at `padded_len`, and keeps multi-doc micro-batches segmented (cross-rank `BAND` agreement; works with Ulysses CP and non-CP) |
+| `fuse_gdn_projections: true` | Set `fuse_input_projections=True` on GatedDeltaNet configs (`google-pytorch/torchtitan#216`), fusing the six bias-free input projections into one matmul |
+| `sort_micro_batches_by_slot: true` | Order micro-batches by `(slot_category, -total_tokens, idx)` so identical slot/segmentation shapes execute consecutively |
 | `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |

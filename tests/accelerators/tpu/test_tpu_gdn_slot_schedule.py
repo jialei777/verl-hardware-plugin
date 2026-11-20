@@ -577,7 +577,7 @@ def test_static_gdn_row_slot_len_rejected_under_cp_in_prepare_model_inputs():
     mb = _make_packed_mb([[0, 1, 2], [0, 1, 2, 3]], padded_seq_len=16)
     with (
         mock.patch.object(torchtitan_tpu, "get_device_id", return_value=torch.device("cpu")),
-        pytest.raises(ValueError, match="gdn_row_slot_len is not supported with context parallelism"),
+        pytest.raises(ValueError, match="gdn_row_slot_len is not supported with context"),
     ):
         eng.prepare_model_inputs(mb)
 
@@ -1035,7 +1035,7 @@ def test_engine_init_dual_torchtitan_compatibility_and_validation_guards(caplog)
     assert "gdn_auto_row_slot_len=1024 is set without static_micro_batch_len" in caplog.text
 
     # 4. CRITICAL-1: static gdn_row_slot_len + CP > 1 raises ValueError in __init__.
-    with pytest.raises(ValueError, match="gdn_row_slot_len is not supported with context parallelism"):
+    with pytest.raises(ValueError, match="gdn_row_slot_len is not supported with context"):
         _build_engine(
             {"gdn_row_slot_len": 512, "context_parallel_strategy": "ulysses"},
             layout="priv",
